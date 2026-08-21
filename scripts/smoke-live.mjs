@@ -1,18 +1,19 @@
 import { spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const publishRoot = join(root, 'artifacts', 'publish');
 const candidates = [];
 for (const entry of readdirSync(publishRoot, { withFileTypes: true })) {
+  if (!/^\d{8}-\d{6}$/.test(entry.name)) continue;
   const candidate = entry.isDirectory() ? join(publishRoot, entry.name, 'CubaseCompleteMcp.Server.exe') : null;
   if (candidate) {
-    try { candidates.push({ path: candidate, modified: statSync(candidate).mtimeMs }); } catch { /* incomplete publish */ }
+    if (existsSync(candidate)) candidates.push({ path: candidate, release: entry.name });
   }
 }
-const server = candidates.sort((a, b) => b.modified - a.modified)[0]?.path;
+const server = candidates.sort((a, b) => b.release.localeCompare(a.release))[0]?.path;
 if (!server) throw new Error('No published CubaseCompleteMcp.Server.exe was found.');
 
 const child = spawn(server, [], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -59,7 +60,7 @@ const timeout = setTimeout(() => {
   process.stderr.write('Live MCP smoke test timed out.\n');
   child.kill();
   process.exit(3);
-}, 20000);
+}, 60000);
 
 try {
   await request('initialize', {
@@ -99,7 +100,65 @@ try {
     if (response.status !== 'Ok') throw new Error(`${label} read failed: ${JSON.stringify(response)}`);
   }
 
-  const keyArguments = { action: 'key', snapshot_id: ui.data?.snapshot_id, key: 'ESCAPE' };
+  const smokeTrackName = `SMK-${Date.now().toString(36).slice(-7)}`;
+  const midiDocument = envelope(await request('tools/call', {
+    name: 'cubase_midi', arguments: {
+      action: 'create_document', name: 'Cubase Live Composition Smoke',
+      options: { ppq: 480, tempo_bpm: 124 }
+    }
+  }));
+  const midiDocumentId = midiDocument.data?.summary?.id;
+  if (midiDocument.status !== 'Ok' || !midiDocumentId) throw new Error(`MIDI document creation failed: ${JSON.stringify(midiDocument)}`);
+  const midiTrack = envelope(await request('tools/call', {
+    name: 'cubase_midi', arguments: {
+      action: 'add_track', document_id: midiDocumentId, name: smokeTrackName,
+      options: { channel: 0 }
+    }
+  }));
+  const midiTrackId = midiTrack.data?.target_id;
+  if (midiTrack.status !== 'Ok' || !midiTrackId) throw new Error(`MIDI track creation failed: ${JSON.stringify(midiTrack)}`);
+  const midiNotes = envelope(await request('tools/call', {
+    name: 'cubase_midi', arguments: { action: 'add_chords', document_id: midiDocumentId, track_id: midiTrackId,
+      options: { events: [
+          { tick: 0, duration_ticks: 480, notes: [60, 64, 67], velocity: 96 },
+          { tick: 480, duration_ticks: 480, notes: [62, 65, 69], velocity: 92 }
+        ] }
+    }
+  }));
+  if (midiNotes.status !== 'Ok' || midiNotes.data?.affected_events !== 6) throw new Error(`MIDI chord generation failed: ${JSON.stringify(midiNotes)}`);
+  const midiRender = envelope(await request('tools/call', {
+    name: 'cubase_midi', arguments: { action: 'render_file', document_id: midiDocumentId }
+  }));
+  if (midiRender.status !== 'Ok' || midiRender.data?.verified !== true) throw new Error(`MIDI render failed: ${JSON.stringify(midiRender)}`);
+  let midiImport = null;
+  if (process.env.CBMCP_TEST_MIDI_IMPORT === '1') {
+    midiImport = envelope(await request('tools/call', {
+      name: 'cubase_midi', arguments: {
+        action: 'import_to_cubase', document_id: midiDocumentId,
+        options: { accept_import_options: true }
+      }
+    }));
+    if (!['Ok', 'Unverified'].includes(midiImport.status) || midiImport.data?.import_submitted !== true) {
+      throw new Error(`MIDI Cubase import failed: ${JSON.stringify(midiImport)}`);
+    }
+    const observedNames = midiImport.data?.observed_track_names ?? [];
+    const postconditionObserved = observedNames.includes(smokeTrackName) || (midiImport.data?.direct_node_delta ?? 0) > 0;
+    if (midiImport.status !== 'Ok' || midiImport.metadata?.verified !== true || !postconditionObserved) {
+      throw new Error(`MIDI Cubase track postcondition failed for '${smokeTrackName}': ${JSON.stringify(midiImport)}`);
+    }
+  }
+
+  // MIDI import can replace or temporarily disable Cubase windows. Never reuse the
+  // pre-import snapshot token for the generic UI action contract check.
+  const uiForKey = process.env.CBMCP_TEST_MIDI_IMPORT === '1'
+    ? envelope(await request('tools/call', {
+        name: 'cubase_ui_inspect', arguments: { max_depth: 1, max_elements: 20, include_screenshot: false }
+      }))
+    : ui;
+  if (uiForKey.status !== 'Ok' || !uiForKey.data?.snapshot_id) {
+    throw new Error(`Fresh UI snapshot failed: ${JSON.stringify(uiForKey)}`);
+  }
+  const keyArguments = { action: 'key', snapshot_id: uiForKey.data.snapshot_id, key: 'ESCAPE' };
   const keyProposal = envelope(await request('tools/call', {
     name: 'cubase_ui_invoke', arguments: keyArguments
   }));
@@ -168,6 +227,12 @@ try {
     project_read: project.status,
     plugin_nodes: plugins.data?.nodes?.length ?? null,
     direct_nodes: direct.data?.nodes?.length ?? null,
+    midi_document: midiDocument.status,
+    midi_notes: midiNotes.data?.affected_events,
+    midi_rendered_path: midiRender.data?.path,
+    midi_import: midiImport?.status ?? 'skipped',
+    midi_import_track: midiImport ? smokeTrackName : null,
+    midi_import_verification: midiImport?.data?.verification_method ?? null,
     ui_windows: ui.data?.windows?.length ?? null,
     ui_key_confirmation: keyProposal.status,
     ui_key_commit: keyCommit.status,

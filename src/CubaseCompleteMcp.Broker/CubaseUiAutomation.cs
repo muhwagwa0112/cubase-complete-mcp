@@ -5,6 +5,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Windows.Automation;
+using System.Text;
 using System.Text.Json.Nodes;
 using CubaseCompleteMcp.Core;
 using Windows.Graphics.Imaging;
@@ -17,6 +18,265 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
 {
     private readonly ConcurrentDictionary<string, UiToken> _tokens = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, UiSnapshot> _snapshots = new(StringComparer.Ordinal);
+
+    public bool HasOpenFileDialog()
+    {
+        var process = processInspector.Inspect();
+        if (!process.Running || process.ProcessId is null) return false;
+        try { return FindFileDialog(process.ProcessId.Value) is not null; }
+        catch (Exception ex) when (IsUnavailableElement(ex)) { return false; }
+    }
+
+    public async Task<JsonObject> ObserveProjectTextAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var process = processInspector.Inspect();
+        if (!process.Running || process.ProcessId is null)
+            throw new InvalidOperationException("Cubase is not running.");
+        var projectWindow = FindProjectWindow(process.ProcessId.Value)
+            ?? throw new InvalidOperationException("Cubase did not expose a visible project window for verification.");
+        var handle = new IntPtr(projectWindow.Current.NativeWindowHandle);
+        if (handle == IntPtr.Zero) throw new InvalidOperationException("The Cubase project window has no native handle.");
+        var snapshotId = Convert.ToHexString(RandomNumberGenerator.GetBytes(12)).ToLowerInvariant();
+        var screenshotPath = CaptureWindow(handle, snapshotId)
+            ?? throw new InvalidOperationException("The Cubase project window could not be captured for verification.");
+        var lines = await RecognizeTextAsync(screenshotPath).ConfigureAwait(false);
+        var joined = string.Join("\n", lines.OfType<JsonObject>()
+            .Select(line => line["text"]?.GetValue<string>()).Where(text => !string.IsNullOrWhiteSpace(text)));
+        return new JsonObject
+        {
+            ["snapshot_id"] = snapshotId, ["window_title"] = projectWindow.Current.Name,
+            ["capture_method"] = "PrintWindow.PW_RENDERFULLCONTENT+Windows.Media.Ocr",
+            ["screenshot_path"] = screenshotPath, ["text"] = joined, ["lines"] = lines
+        };
+    }
+
+    public async Task<JsonObject> OpenMidiImportDialogViaMenuAsync(CancellationToken cancellationToken)
+    {
+        var process = processInspector.Inspect();
+        if (!process.Running || process.ProcessId is null)
+            throw new InvalidOperationException("Cubase is not running.");
+        var processId = process.ProcessId.Value;
+        if (HasOpenFileDialog())
+            return new JsonObject { ["opened"] = true, ["already_open"] = true, ["path"] = "existing_file_dialog" };
+        if (FindMidiImportProjectChoice(processId) is not null)
+            return new JsonObject { ["opened"] = true, ["already_open"] = true, ["path"] = "existing_project_choice" };
+
+        var projectWindow = FindProjectWindow(processId)
+            ?? throw new InvalidOperationException("Cubase did not expose a visible project window for MIDI import.");
+        var handle = new IntPtr(projectWindow.Current.NativeWindowHandle);
+        if (handle != IntPtr.Zero) _ = SetForegroundWindow(handle);
+
+        var file = FindMenuItem(processId, projectWindow, ["file", "파일"])
+            ?? throw new InvalidOperationException("Cubase did not expose the File menu through UI Automation.");
+        var fileAction = InvokeMenuItem(file);
+        await Task.Delay(120, cancellationToken).ConfigureAwait(false);
+
+        var import = await WaitForMenuItemAsync(processId, projectWindow, ["import", "가져오기"], cancellationToken)
+            .ConfigureAwait(false)
+            ?? throw new InvalidOperationException("Cubase did not expose File > Import through UI Automation.");
+        var importAction = InvokeMenuItem(import);
+        await Task.Delay(120, cancellationToken).ConfigureAwait(false);
+
+        var midiFile = await WaitForMenuItemAsync(processId, projectWindow,
+                ["midi file", "midi 파일"], cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("Cubase did not expose File > Import > MIDI File through UI Automation.");
+        var midiAction = InvokeMenuItem(midiFile);
+
+        for (var attempt = 0; attempt < 40; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (FindFileDialog(processId) is not null || FindMidiImportProjectChoice(processId) is not null)
+            {
+                return new JsonObject
+                {
+                    ["opened"] = true, ["already_open"] = false, ["path"] = "file_import_midi_menu",
+                    ["file_action"] = fileAction, ["import_action"] = importAction, ["midi_file_action"] = midiAction
+                };
+            }
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        throw new InvalidOperationException("Cubase did not show a MIDI import dialog after invoking File > Import > MIDI File.");
+    }
+
+    public async Task<JsonObject?> DismissProjectFolderDialogAsync(CancellationToken cancellationToken)
+    {
+        var process = processInspector.Inspect();
+        if (!process.Running || process.ProcessId is null) return null;
+        var nativeDialog = FindContainedDialogWindow(process.ProcessId.Value,
+            ["Set Project Folder", "프로젝트 폴더"]);
+        if (nativeDialog != IntPtr.Zero)
+        {
+            if (!PostMessage(nativeDialog, 0x0010, IntPtr.Zero, IntPtr.Zero)) // WM_CLOSE
+                throw new InvalidOperationException("The stale Cubase project-folder dialog could not be closed.");
+            await Task.Delay(150, cancellationToken).ConfigureAwait(false);
+            return new JsonObject
+            {
+                ["dialog_title"] = "Set Project Folder", ["button"] = "WM_CLOSE", ["dismissed"] = !IsWindow(nativeDialog)
+            };
+        }
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            foreach (var window in FindProcessWindowCandidates(process.ProcessId.Value))
+            {
+                try
+                {
+                    var title = window.Current.Name;
+                    var cancel = FindButton(window, ["cancel", "취소"]);
+                    var selectFolder = FindButton(window, ["select folder", "폴더 선택"]);
+                    if (cancel is null || (selectFolder is null
+                        && !title.Contains("Set Project Folder", StringComparison.OrdinalIgnoreCase)
+                        && !title.Contains("프로젝트 폴더", StringComparison.OrdinalIgnoreCase))) continue;
+                    var name = cancel.Current.Name;
+                    var rectangle = cancel.Current.BoundingRectangle;
+                    if (!rectangle.IsEmpty && rectangle.Width > 0 && rectangle.Height > 0)
+                        ClickScreenPoint((int)(rectangle.X + rectangle.Width / 2),
+                            (int)(rectangle.Y + rectangle.Height / 2));
+                    else
+                        InvokeButton(cancel);
+                    return new JsonObject { ["dialog_title"] = title, ["button"] = name, ["dismissed"] = true };
+                }
+                catch (Exception ex) when (IsUnavailableElement(ex)) { }
+            }
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        return null;
+    }
+
+    public async Task<JsonObject> SubmitFileDialogAsync(string absolutePath, CancellationToken cancellationToken)
+    {
+        if (!Path.IsPathFullyQualified(absolutePath)) throw new ArgumentException("File-dialog path must be absolute.");
+        var process = processInspector.Inspect();
+        if (!process.Running || process.ProcessId is null) throw new InvalidOperationException("Cubase is not running.");
+        Exception? unavailable = null;
+        for (var attempt = 0; attempt < 40; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var dialog = FindFileDialog(process.ProcessId.Value);
+            if (dialog is not null)
+            {
+                var submissionAttempted = false;
+                var title = "Import MIDI File";
+                var buttonName = "Open";
+                try
+                {
+                    var edit = FindFileNameEdit(dialog)
+                        ?? throw new InvalidOperationException("The Cubase file dialog did not expose a writable file-name field.");
+                    title = dialog.Current.Name;
+                    ((ValuePattern)edit.GetCurrentPattern(ValuePattern.Pattern)).SetValue(Path.GetFullPath(absolutePath));
+                    var button = FindAcceptButton(dialog)
+                        ?? throw new InvalidOperationException("The Cubase file dialog did not expose an Open/Import button.");
+                    buttonName = button.Current.Name;
+                    submissionAttempted = true;
+                    InvokeButton(button);
+
+                    var closed = false;
+                    for (var closeAttempt = 0; closeAttempt < 30; closeAttempt++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        try { _ = dialog.Current.Name; }
+                        catch (Exception ex) when (IsUnavailableElement(ex)) { closed = true; break; }
+                        await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                    }
+                    if (!closed)
+                        throw new InvalidOperationException("Cubase kept the file dialog open after the Open/Import action.");
+                    return new JsonObject
+                    {
+                        ["dialog_title"] = title, ["button"] = buttonName, ["path"] = Path.GetFullPath(absolutePath),
+                        ["submitted"] = true, ["dialog_closed"] = closed
+                    };
+                }
+                catch (Exception ex) when (IsUnavailableElement(ex))
+                {
+                    unavailable = ex;
+                    if (submissionAttempted)
+                    {
+                        await Task.Delay(150, cancellationToken).ConfigureAwait(false);
+                        try
+                        {
+                            if (FindFileDialog(process.ProcessId.Value) is null)
+                            {
+                                return new JsonObject
+                                {
+                                    ["dialog_title"] = title, ["button"] = buttonName,
+                                    ["path"] = Path.GetFullPath(absolutePath), ["submitted"] = true,
+                                    ["dialog_closed"] = true, ["fallback"] = "uia_invoke_dialog_replaced"
+                                };
+                            }
+                        }
+                        catch (Exception replacementError) when (IsUnavailableElement(replacementError))
+                        {
+                            return new JsonObject
+                            {
+                                ["dialog_title"] = title, ["button"] = buttonName,
+                                ["path"] = Path.GetFullPath(absolutePath), ["submitted"] = true,
+                                ["dialog_closed"] = true, ["fallback"] = "uia_invoke_dialog_replaced"
+                            };
+                        }
+                    }
+                    var keyboardResult = await TrySubmitFileDialogByKeyboardAsync(
+                        process.ProcessId.Value, absolutePath, cancellationToken).ConfigureAwait(false);
+                    if (keyboardResult is not null) return keyboardResult;
+                }
+            }
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        throw new InvalidOperationException(unavailable is null
+            ? "Cubase did not open a targetable file dialog."
+            : "Cubase file-dialog elements remained unavailable while the window was changing.", unavailable);
+    }
+
+    public async Task<JsonObject?> ChooseExistingProjectForMidiImportAsync(CancellationToken cancellationToken)
+    {
+        var process = processInspector.Inspect();
+        if (!process.Running || process.ProcessId is null) return null;
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var window = FindMidiImportProjectChoice(process.ProcessId.Value);
+            if (window is not null)
+            {
+                try
+                {
+                    var existing = FindButton(window, ["no", "아니요"])
+                        ?? throw new InvalidOperationException("The MIDI import project-choice dialog did not expose its No button.");
+                    var title = window.Current.Name;
+                    var name = existing.Current.Name;
+                    InvokeButton(existing);
+                    return new JsonObject
+                    {
+                        ["dialog_title"] = title, ["button"] = name, ["existing_project_selected"] = true
+                    };
+                }
+                catch (Exception ex) when (IsUnavailableElement(ex)) { }
+            }
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        return null;
+    }
+
+    public async Task<JsonObject?> AcceptImportOptionsAsync(CancellationToken cancellationToken)
+    {
+        var process = processInspector.Inspect();
+        if (!process.Running || process.ProcessId is null) return null;
+        for (var attempt = 0; attempt < 30; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var dialog = FindModalDialog(process.ProcessId.Value, ["import", "midi", "가져오기"]);
+            if (dialog is not null)
+            {
+                var button = FindButton(dialog, ["ok", "확인", "import", "가져오기"]);
+                if (button is null) return null;
+                var title = dialog.Current.Name;
+                var name = button.Current.Name;
+                InvokeButton(button);
+                return new JsonObject { ["dialog_title"] = title, ["button"] = name, ["accepted"] = true };
+            }
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        return null;
+    }
 
     public async Task<JsonObject> InspectAsync(JsonObject? arguments, string clientSessionId)
     {
@@ -94,6 +354,372 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
             ["windows"] = windowNodes
         };
     }
+
+    private static AutomationElement? FindFileDialog(int processId)
+    {
+        foreach (var window in FindProcessWindowCandidates(processId).Reverse())
+        {
+            try
+            {
+                if (FindFileNameEdit(window) is not null && FindAcceptButton(window) is not null) return window;
+            }
+            catch (Exception ex) when (IsUnavailableElement(ex)) { }
+        }
+        return null;
+    }
+
+    private static AutomationElement? FindFileNameEdit(AutomationElement dialog)
+    {
+        var edits = dialog.FindAll(TreeScope.Descendants,
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit)).Cast<AutomationElement>()
+            .Where(element => element.TryGetCurrentPattern(ValuePattern.Pattern, out _)).ToArray();
+        return edits.OrderByDescending(element =>
+        {
+            var name = element.Current.Name;
+            var automationId = element.Current.AutomationId;
+            return automationId == "1148" ? 100
+                : name.Contains("file name", StringComparison.OrdinalIgnoreCase) || name.Contains("파일 이름", StringComparison.OrdinalIgnoreCase) ? 50
+                : name.Contains("search", StringComparison.OrdinalIgnoreCase) || name.Contains("검색", StringComparison.OrdinalIgnoreCase) ? -50 : 0;
+        }).FirstOrDefault();
+    }
+
+    private static AutomationElement? FindAcceptButton(AutomationElement dialog) =>
+        FindButton(dialog, ["open", "열기", "import", "가져오기", "save", "저장"]);
+
+    private static async Task<JsonObject?> TrySubmitFileDialogByKeyboardAsync(
+        int processId, string absolutePath, CancellationToken cancellationToken)
+    {
+        AutomationElement? dialog;
+        try { dialog = FindFileDialog(processId); }
+        catch (Exception ex) when (IsUnavailableElement(ex)) { return null; }
+        if (dialog is null) return null;
+
+        IntPtr handle;
+        AutomationElement? edit;
+        AutomationElement? button;
+        string title;
+        try
+        {
+            handle = new IntPtr(dialog.Current.NativeWindowHandle);
+            title = dialog.Current.Name;
+            edit = FindFileNameEdit(dialog);
+            button = FindAcceptButton(dialog);
+        }
+        catch (Exception ex) when (IsUnavailableElement(ex)) { return null; }
+
+        if (edit is not null && button is not null)
+        {
+            try
+            {
+                var editHandle = new IntPtr(edit.Current.NativeWindowHandle);
+                var buttonHandle = new IntPtr(button.Current.NativeWindowHandle);
+                var nativeRoot = editHandle != IntPtr.Zero ? GetAncestor(editHandle, 2)
+                    : buttonHandle != IntPtr.Zero ? GetAncestor(buttonHandle, 2) : IntPtr.Zero;
+                if (nativeRoot != IntPtr.Zero) handle = nativeRoot;
+                if (editHandle != IntPtr.Zero && buttonHandle != IntPtr.Zero)
+                {
+                    _ = SendMessage(editHandle, 0x000C, IntPtr.Zero, Path.GetFullPath(absolutePath)); // WM_SETTEXT
+                    _ = SendMessage(buttonHandle, 0x00F5, IntPtr.Zero, IntPtr.Zero); // BM_CLICK
+                    if (await WaitForFileDialogToCloseAsync(processId, handle, dialog, title, cancellationToken).ConfigureAwait(false))
+                    {
+                        return new JsonObject
+                        {
+                            ["dialog_title"] = title, ["button"] = button.Current.Name,
+                            ["path"] = Path.GetFullPath(absolutePath), ["submitted"] = true,
+                            ["dialog_closed"] = true, ["fallback"] = "common_file_dialog_win32"
+                        };
+                    }
+                }
+
+                var editRectangle = edit.Current.BoundingRectangle;
+                var buttonRectangle = button.Current.BoundingRectangle;
+                if (!editRectangle.IsEmpty && editRectangle.Width > 0 && editRectangle.Height > 0
+                    && !buttonRectangle.IsEmpty && buttonRectangle.Width > 0 && buttonRectangle.Height > 0)
+                {
+                    if (handle != IntPtr.Zero) _ = SetForegroundWindow(handle);
+                    ClickScreenPoint((int)(editRectangle.X + editRectangle.Width / 2),
+                        (int)(editRectangle.Y + editRectangle.Height / 2));
+                    await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                    SendKeyChord("CTRL+A");
+                    SendUnicodeText(Path.GetFullPath(absolutePath));
+                    await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                    ClickScreenPoint((int)(buttonRectangle.X + buttonRectangle.Width / 2),
+                        (int)(buttonRectangle.Y + buttonRectangle.Height / 2));
+                    // Return control immediately: Cubase can replace the file picker with
+                    // its "create a new project?" prompt. The controller must choose No
+                    // before any further keyboard fallback can activate the default button.
+                    await Task.Delay(150, cancellationToken).ConfigureAwait(false);
+                    return new JsonObject
+                    {
+                        ["dialog_title"] = title, ["button"] = button.Current.Name,
+                        ["path"] = Path.GetFullPath(absolutePath), ["submitted"] = true,
+                        ["dialog_closed"] = false, ["fallback"] = "common_file_dialog_bounded_click",
+                        ["requires_post_submit_verification"] = true
+                    };
+                }
+            }
+            catch (Exception ex) when (IsUnavailableElement(ex)) { }
+        }
+
+        if (handle == IntPtr.Zero || !IsWindow(handle) || !SetForegroundWindow(handle) || GetForegroundWindow() != handle)
+            return null;
+
+        // Windows' common file dialog exposes Alt+N for the File name field even when
+        // transient UIA descendants become stale while Cubase is creating the dialog.
+        SendKeyChord("ALT+N");
+        await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        SendKeyChord("CTRL+A");
+        SendUnicodeText(Path.GetFullPath(absolutePath));
+        SendKeyChord("ENTER");
+
+        var closed = await WaitForFileDialogToCloseAsync(processId, handle, dialog, title, cancellationToken).ConfigureAwait(false);
+        if (!closed) return null;
+        return new JsonObject
+        {
+            ["dialog_title"] = title, ["button"] = "keyboard:Alt+N/Enter",
+            ["path"] = Path.GetFullPath(absolutePath), ["submitted"] = true,
+            ["dialog_closed"] = closed, ["fallback"] = "common_file_dialog_keyboard"
+        };
+    }
+
+    private static async Task<bool> WaitForFileDialogToCloseAsync(
+        int processId, IntPtr dialogHandle, AutomationElement dialog, string originalTitle,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < 30; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (dialogHandle != IntPtr.Zero && !IsWindow(dialogHandle)) return true;
+            try
+            {
+                if (!dialog.Current.Name.Equals(originalTitle, StringComparison.Ordinal)) return true;
+            }
+            catch (Exception ex) when (IsUnavailableElement(ex)) { return true; }
+            try { if (FindFileDialog(processId) is null) return true; }
+            catch (Exception ex) when (IsUnavailableElement(ex)) { return true; }
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        return false;
+    }
+
+    private static AutomationElement? FindModalDialog(int processId, string[] titleFragments)
+    {
+        return FindProcessWindowCandidates(processId).FirstOrDefault(window => titleFragments.Any(fragment =>
+            window.Current.Name.Contains(fragment, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static AutomationElement? FindMidiImportProjectChoice(int processId)
+    {
+        foreach (var window in FindProcessWindowCandidates(processId))
+        {
+            try
+            {
+                if (FindButton(window, ["create", "생성"]) is not null
+                    && FindButton(window, ["cancel", "취소"]) is not null
+                    && FindButton(window, ["no", "아니요"]) is not null)
+                    return window;
+            }
+            catch (Exception ex) when (IsUnavailableElement(ex)) { }
+        }
+        return null;
+    }
+
+    private static AutomationElement? FindProjectWindow(int processId)
+    {
+        var condition = new PropertyCondition(AutomationElement.ProcessIdProperty, processId);
+        return AutomationElement.RootElement.FindAll(TreeScope.Children, condition).Cast<AutomationElement>()
+            .Where(window =>
+            {
+                try
+                {
+                    var rectangle = window.Current.BoundingRectangle;
+                    return !window.Current.IsOffscreen && !rectangle.IsEmpty && rectangle.Width > 0 && rectangle.Height > 0
+                        && (window.Current.Name.Contains("Cubase Pro Project", StringComparison.OrdinalIgnoreCase)
+                            || window.Current.Name.Contains("Cubase 프로젝트", StringComparison.OrdinalIgnoreCase));
+                }
+                catch (Exception ex) when (IsUnavailableElement(ex)) { return false; }
+            })
+            .OrderByDescending(window => window.Current.BoundingRectangle.Width * window.Current.BoundingRectangle.Height)
+            .FirstOrDefault();
+    }
+
+    private static async Task<AutomationElement?> WaitForMenuItemAsync(
+        int processId, AutomationElement projectWindow, string[] names, CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var item = FindMenuItem(processId, projectWindow, names);
+            if (item is not null) return item;
+            await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+        }
+        return null;
+    }
+
+    private static AutomationElement? FindMenuItem(int processId, AutomationElement projectWindow, string[] names)
+    {
+        var menuCondition = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem);
+        var candidates = new List<AutomationElement>();
+        try { candidates.AddRange(projectWindow.FindAll(TreeScope.Descendants, menuCondition).Cast<AutomationElement>()); }
+        catch (Exception ex) when (IsUnavailableElement(ex)) { }
+        try
+        {
+            var condition = new AndCondition(menuCondition,
+                new PropertyCondition(AutomationElement.ProcessIdProperty, processId));
+            candidates.AddRange(AutomationElement.RootElement.FindAll(TreeScope.Descendants, condition)
+                .Cast<AutomationElement>());
+        }
+        catch (Exception ex) when (IsUnavailableElement(ex)) { }
+        return candidates.FirstOrDefault(item =>
+        {
+            try
+            {
+                if (item.Current.IsOffscreen) return false;
+                var actual = NormalizeMenuName(item.Current.Name);
+                return names.Any(name => actual.Equals(NormalizeMenuName(name), StringComparison.OrdinalIgnoreCase));
+            }
+            catch (Exception ex) when (IsUnavailableElement(ex)) { return false; }
+        });
+    }
+
+    private static string InvokeMenuItem(AutomationElement item)
+    {
+        if (item.TryGetCurrentPattern(InvokePattern.Pattern, out var invoke))
+        {
+            ((InvokePattern)invoke).Invoke();
+            return "invoke";
+        }
+        if (item.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var expand))
+        {
+            ((ExpandCollapsePattern)expand).Expand();
+            return "expand";
+        }
+        var rectangle = item.Current.BoundingRectangle;
+        if (!rectangle.IsEmpty && rectangle.Width > 0 && rectangle.Height > 0)
+        {
+            ClickScreenPoint((int)(rectangle.X + rectangle.Width / 2), (int)(rectangle.Y + rectangle.Height / 2));
+            return "bounded_click";
+        }
+        throw new InvalidOperationException($"Menu item '{item.Current.Name}' exposes no usable action.");
+    }
+
+    private static string NormalizeMenuName(string value) => value.Replace("&", "", StringComparison.Ordinal)
+        .Replace("_", "", StringComparison.Ordinal).Trim().TrimEnd('.', '\u2026');
+
+    private static IReadOnlyList<AutomationElement> FindProcessWindowCandidates(int processId)
+    {
+        var condition = new PropertyCondition(AutomationElement.ProcessIdProperty, processId);
+        var topLevel = AutomationElement.RootElement.FindAll(TreeScope.Children, condition)
+            .Cast<AutomationElement>().ToArray();
+        var candidates = new List<AutomationElement>(topLevel);
+        var cubaseHandles = topLevel.Select(window => new IntPtr(window.Current.NativeWindowHandle))
+            .Where(handle => handle != IntPtr.Zero).ToHashSet();
+        var cubaseRectangles = topLevel.Select(window => window.Current.BoundingRectangle)
+            .Where(rectangle => !rectangle.IsEmpty && rectangle.Width > 0 && rectangle.Height > 0).ToArray();
+        var rootWindows = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition)
+            .Cast<AutomationElement>();
+        foreach (var window in rootWindows)
+        {
+            try
+            {
+                var handle = new IntPtr(window.Current.NativeWindowHandle);
+                if (handle != IntPtr.Zero && !cubaseHandles.Contains(handle)
+                    && (IsOwnedBy(handle, cubaseHandles) || IsRecognizedContainedCubaseDialog(window, cubaseRectangles)))
+                    candidates.Add(window);
+            }
+            catch (Exception ex) when (IsUnavailableElement(ex)) { }
+        }
+        return candidates;
+    }
+
+    private static bool IsRecognizedContainedCubaseDialog(
+        AutomationElement window, IReadOnlyList<System.Windows.Rect> cubaseRectangles)
+    {
+        var title = window.Current.Name;
+        var recognizedTitle = title.Contains("Import MIDI File", StringComparison.OrdinalIgnoreCase)
+            || title.Contains("Set Project Folder", StringComparison.OrdinalIgnoreCase)
+            || title.Contains("MIDI 파일", StringComparison.OrdinalIgnoreCase)
+            || title.Contains("프로젝트 폴더", StringComparison.OrdinalIgnoreCase);
+        if (!recognizedTitle) return false;
+        var rectangle = window.Current.BoundingRectangle;
+        if (rectangle.IsEmpty || rectangle.Width <= 0 || rectangle.Height <= 0) return false;
+        var centerX = rectangle.X + rectangle.Width / 2;
+        var centerY = rectangle.Y + rectangle.Height / 2;
+        return cubaseRectangles.Any(owner => centerX >= owner.X && centerX <= owner.X + owner.Width
+            && centerY >= owner.Y && centerY <= owner.Y + owner.Height);
+    }
+
+    private static IntPtr FindContainedDialogWindow(int cubaseProcessId, string[] titleFragments)
+    {
+        var owners = new List<NativeRect>();
+        _ = EnumWindows((handle, parameter) =>
+        {
+            _ = GetWindowThreadProcessId(handle, out var processId);
+            if (processId == cubaseProcessId && GetWindowRect(handle, out var rectangle)
+                && rectangle.Right > rectangle.Left && rectangle.Bottom > rectangle.Top)
+                owners.Add(rectangle);
+            return true;
+        }, IntPtr.Zero);
+        if (owners.Count == 0) return IntPtr.Zero;
+
+        var match = IntPtr.Zero;
+        _ = EnumWindows((handle, parameter) =>
+        {
+            if (!IsWindowVisible(handle)) return true;
+            var length = GetWindowTextLength(handle);
+            if (length <= 0) return true;
+            var title = new StringBuilder(length + 1);
+            _ = GetWindowText(handle, title, title.Capacity);
+            if (!titleFragments.Any(fragment => title.ToString().Contains(fragment, StringComparison.OrdinalIgnoreCase)))
+                return true;
+            if (!GetWindowRect(handle, out var rectangle)) return true;
+            var centerX = rectangle.Left + (rectangle.Right - rectangle.Left) / 2;
+            var centerY = rectangle.Top + (rectangle.Bottom - rectangle.Top) / 2;
+            if (!owners.Any(owner => centerX >= owner.Left && centerX <= owner.Right
+                && centerY >= owner.Top && centerY <= owner.Bottom)) return true;
+            match = handle;
+            return false;
+        }, IntPtr.Zero);
+        return match;
+    }
+
+    private static bool IsOwnedBy(IntPtr handle, HashSet<IntPtr> owners)
+    {
+        for (var depth = 0; depth < 8 && handle != IntPtr.Zero; depth++)
+        {
+            handle = GetWindow(handle, 4); // GW_OWNER
+            if (owners.Contains(handle)) return true;
+        }
+        return false;
+    }
+
+    private static AutomationElement? FindButton(AutomationElement dialog, string[] names)
+    {
+        var buttons = dialog.FindAll(TreeScope.Descendants,
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button)).Cast<AutomationElement>();
+        return buttons.FirstOrDefault(button =>
+        {
+            var actual = NormalizeButtonName(button.Current.Name);
+            return names.Any(name => actual.Equals(NormalizeButtonName(name), StringComparison.OrdinalIgnoreCase)
+                || actual.StartsWith(NormalizeButtonName(name) + " ", StringComparison.OrdinalIgnoreCase));
+        });
+    }
+
+    private static void InvokeButton(AutomationElement button)
+    {
+        if (button.TryGetCurrentPattern(InvokePattern.Pattern, out var invoke))
+        {
+            ((InvokePattern)invoke).Invoke();
+            return;
+        }
+        throw new InvalidOperationException($"Button '{button.Current.Name}' does not expose an invokable accessibility pattern.");
+    }
+
+    private static string NormalizeButtonName(string value) => value.Replace("&", "", StringComparison.Ordinal)
+        .Replace("_", "", StringComparison.Ordinal).Trim().TrimEnd('.');
+
+    private static bool IsUnavailableElement(Exception exception) => exception is ElementNotAvailableException
+        or InvalidOperationException or COMException;
 
     private static async Task<JsonArray> RecognizeTextAsync(string path)
     {
@@ -216,9 +842,9 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                 RequireCoordinate(arguments["x2"]?.GetValue<double>(), "x2"), RequireCoordinate(arguments["y2"]?.GetValue<double>(), "y2")); break;
             case "scroll": MouseScroll(snapshot, RequireCoordinate(x, "x"), RequireCoordinate(y, "y"),
                 Math.Clamp(arguments["delta"]?.GetValue<int>() ?? 120, -12000, 12000)); break;
-            case "key": SendKeyChord(snapshot, arguments["key"]?.GetValue<string>()
+            case "key": SendKeyChord(arguments["key"]?.GetValue<string>()
                 ?? throw new ArgumentException("key is required.")); break;
-            case "text": SendUnicodeText(snapshot, arguments["value"]?.GetValue<string>()
+            case "text": SendUnicodeText(arguments["value"]?.GetValue<string>()
                 ?? throw new ArgumentException("value is required.")); break;
             default: throw new ArgumentOutOfRangeException(nameof(arguments), action,
                 "Snapshot actions are click, double_click, right_click, drag, scroll, key, and text.");
@@ -454,7 +1080,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         }
     }
 
-    private static void SendKeyChord(UiSnapshot snapshot, string chord)
+    private static void SendKeyChord(string chord)
     {
         if (string.IsNullOrWhiteSpace(chord)) throw new ArgumentException("key must not be empty.");
         var tokens = chord.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -480,7 +1106,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         SendAll(inputs.ToArray(), "keyboard chord");
     }
 
-    private static void SendUnicodeText(UiSnapshot snapshot, string value)
+    private static void SendUnicodeText(string value)
     {
         if (value.Length > 4096) throw new ArgumentOutOfRangeException(nameof(value), "Text input is limited to 4096 UTF-16 code units.");
         var inputs = new List<Input>(value.Length * 2);
@@ -509,6 +1135,20 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
 
     private static Input MouseInputEvent(uint flags) =>
         new() { Type = 0, Union = new InputUnion { Mouse = new MouseInput { Flags = flags } } };
+
+    private static void ClickScreenPoint(int x, int y)
+    {
+        _ = GetCursorPos(out var original);
+        try
+        {
+            if (!SetCursorPos(x, y)) throw new InvalidOperationException("Could not position the pointer on the Cubase dialog.");
+            SendAll([MouseInputEvent(0x0002), MouseInputEvent(0x0004)], "bounded dialog click");
+        }
+        finally
+        {
+            _ = SetCursorPos(original.X, original.Y);
+        }
+    }
 
     private static Input KeyboardInputEvent(ushort virtualKey, bool keyUp) =>
         new() { Type = 1, Union = new InputUnion { Keyboard = new KeyboardInput { VirtualKey = virtualKey, Flags = keyUp ? 0x0002u : 0 } } };
@@ -584,6 +1224,19 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     [DllImport("user32.dll")]
     private static extern bool GetWindowRect(IntPtr handle, out NativeRect rectangle);
     [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr handle, uint command);
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr handle, uint flags);
+    private delegate bool EnumWindowsCallback(IntPtr handle, IntPtr parameter);
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr handle, StringBuilder text, int maxCount);
+    [DllImport("user32.dll")]
+    private static extern int GetWindowTextLength(IntPtr handle);
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr handle);
+    [DllImport("user32.dll")]
     private static extern bool PrintWindow(IntPtr handle, IntPtr targetDeviceContext, uint flags);
     [DllImport("user32.dll")]
     private static extern bool SetForegroundWindow(IntPtr handle);
@@ -599,4 +1252,10 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     private static extern bool GetCursorPos(out Point point);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint SendInput(uint inputCount, Input[] inputs, int inputSize);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr SendMessage(IntPtr handle, uint message, IntPtr wParam, string lParam);
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr handle, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(IntPtr handle, uint message, IntPtr wParam, IntPtr lParam);
 }

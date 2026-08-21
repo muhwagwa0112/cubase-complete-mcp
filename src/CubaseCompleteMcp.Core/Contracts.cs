@@ -107,6 +107,14 @@ public sealed record UiActionDescriptor(
     string[] RequiredArguments,
     string VerificationContract);
 
+public sealed record MidiCompositionActionDescriptor(
+    string Action,
+    string Category,
+    RiskLevel Risk,
+    string SupportLevel,
+    string[] RequiredArguments,
+    string Description);
+
 public sealed record CubaseStatusSnapshot(
     bool CubaseRunning,
     string? CubaseVersion,

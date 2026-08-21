@@ -66,6 +66,15 @@ public sealed class CubaseTools(BrokerClient broker)
             ("parameter_tag", parameter_tag), ("process_value", process_value), ("plain_value", plain_value),
             ("display_value", display_value)), null, cancellationToken);
 
+    [McpServerTool(Name = "cubase_midi", ReadOnly = false, Destructive = true, OpenWorld = false)]
+    [Description("Create and edit session-scoped MIDI compositions with tracks, parts, notes, chords, drums, CC, pitch bend, pressure, program/tempo/signature/text events, transforms, SMF import/export, and Cubase import.")]
+    public Task<JsonNode> Midi(string action = "list_documents", string? document_id = null,
+        string? track_id = null, string? part_id = null, string? name = null, string? path = null,
+        string? confirmation_id = null, JsonElement? options = null, CancellationToken cancellationToken = default) =>
+        SendAsync("midi.compose", Merge(options, ("action", action), ("document_id", document_id),
+            ("track_id", track_id), ("part_id", part_id), ("name", name), ("path", path)),
+            confirmation_id, cancellationToken);
+
     [McpServerTool(Name = "cubase_project", ReadOnly = false, Destructive = true, OpenWorld = false)]
     [Description("Create, open, save, close, import, export and render Cubase projects through command or verified UI fallback paths.")]
     public Task<JsonNode> Project(string action = "get", string? path = null, bool? overwrite = null,

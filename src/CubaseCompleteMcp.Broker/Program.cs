@@ -19,6 +19,8 @@ builder.Services.AddSingleton<CubaseProcessInspector>();
 builder.Services.AddSingleton<WinMmMidiTransport>();
 builder.Services.AddSingleton<CubaseMidiSession>();
 builder.Services.AddSingleton<CubaseUiAutomation>();
+builder.Services.AddSingleton(provider => new MidiCompositionService(
+    provider.GetRequiredService<CubasePaths>().LocalStateRoot));
 builder.Services.AddSingleton<CubaseController>();
 builder.Services.AddHostedService<BrokerPipeService>();
 

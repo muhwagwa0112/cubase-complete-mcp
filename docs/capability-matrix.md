@@ -11,6 +11,13 @@
 | EQ, filters, sends, channel strip, automation | DirectAccess parameters | Dynamic | Read-back process/display values |
 | Plugin parameter enumeration/write | DirectAccess | Generic for exposed parameters | Read-back value, unit and metadata |
 | Arbitrary DirectAccess tree/parameter | `cubase_direct` | Dynamic across selected track, mixer, Control Room and focused Quick Controls | Fresh traversal plus process/display/plain-value read-back |
+| MIDI composition document | `cubase_midi` | Full, session-isolated | Persisted JSON validation and event/count summary |
+| Notes, chords, drum patterns | `cubase_midi` generators | Full | Structured event read-back plus SMF round-trip |
+| CC, pitch bend, pressure, program changes | `cubase_midi` events | Full | Range validation plus SMF round-trip |
+| Tempo/time/key maps, markers, lyrics, SysEx | `cubase_midi` meta events | Full | Standards-compliant SMF encoding/decoding |
+| Quantize, transpose, humanize, range replacement | `cubase_midi` transforms | Full | Deterministic mutation summary; replacement requires confirmation |
+| MIDI file import/export | SMF format 0/1 | Full for PPQ files | Header/track/event validation, SHA-256 and decode round-trip |
+| Generated MIDI import into Cubase | Command Binding plus owned file dialog | Command/UI hybrid | Rendered file hash, dialog submission and before/after mixer traversal |
 | Plugin slot assignment | API v1.3 plugin manager | Feature-detected | API return plus refreshed slot traversal |
 | Control Room / Quick Controls | DirectAccess roots | Dynamic | Fresh traversal/read-back |
 | Save, new, open, close, import/export | Key Command then UI | Mixed | File/window/project postcondition required |
@@ -20,3 +27,5 @@
 | Windows Graphics Capture | None | Not implemented | PrintWindow is used instead |
 
 “Dynamic” means the server supports whatever the current Cubase object tree exposes rather than maintaining a hard-coded plugin-specific schema. `cubase://capabilities` is the machine-readable coverage ledger and reports zero unclassified Key Commands. A third-party plugin can still expose zero automatable parameters, fail to load, or render a control whose state cannot be observed; those cases remain `best_effort` rather than being mislabeled as fully verified.
+
+MIDI composition uses PPQ Standard MIDI Files rather than editing `.cpr` binaries. Format 0 and 1 files are supported. SMPTE-division files, VST Note Expression, Expression Maps, Chord Track voicings and other Cubase-proprietary event types remain accessible through Cubase commands/UI but are not serialized as native structured `cubase_midi` events.

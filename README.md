@@ -11,6 +11,7 @@
 - Generated ES5 MIDI Remote driver with the locally extracted 69 categories / 2,777 Key Commands.
 - DirectAccess traversal and parameter writes, v1.3 feature detection for parameter metadata, command `canPerform`, and plugin slot assignment.
 - Complete capability registry that classifies every extracted command plus all DirectAccess roots and UI input actions.
+- Session-isolated structured MIDI composition documents with deterministic Standard MIDI File generation and Cubase import.
 - Cubase-PID-scoped UI Automation, OCR-backed snapshot coordinates, guarded click/drag/scroll/key/text `SendInput`, single-use session tokens, and post-action reinspection contract.
 - Manifest-backed backup/restore, setup, diagnostics, driver generation and Codex registration CLI.
 
@@ -26,6 +27,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\publish.ps1
 node .\scripts\smoke-mcp.mjs
 # With Cubase open on a disposable project:
 node .\scripts\smoke-live.mjs
+# Include composition rendering and a real File > Import > MIDI File round trip:
+$env:CBMCP_TEST_MIDI_IMPORT = '1'; node .\scripts\smoke-live.mjs
 ```
 
 ## Safe installation order
@@ -43,10 +46,12 @@ node .\scripts\smoke-live.mjs
 
 ## MCP tools and resources
 
-Tools: `cubase_status`, `cubase_capability_search`, `cubase_command`, `cubase_transport`, `cubase_track`, `cubase_mixer`, `cubase_plugin`, `cubase_direct`, `cubase_project`, `cubase_ui_inspect`, `cubase_ui_invoke`, `cubase_batch`, and `cubase_diagnostics`.
+Tools: `cubase_status`, `cubase_capability_search`, `cubase_command`, `cubase_transport`, `cubase_track`, `cubase_mixer`, `cubase_plugin`, `cubase_direct`, `cubase_midi`, `cubase_project`, `cubase_ui_inspect`, `cubase_ui_invoke`, `cubase_batch`, and `cubase_diagnostics`.
 
 Resources: `cubase://state`, `cubase://capabilities`, `cubase://commands`, and `cubase://events`.
 
-Destructive commands and all arbitrary UI inputs return `RequiresConfirmation` and a short-lived `confirmation_id`. Re-submit the exact same operation and arguments with that ID to commit it. IDs and UI snapshots are session-bound and single-use. `cubase://capabilities` contains every classified command, the four DirectAccess roots, and the complete UI action vocabulary; `unclassified_commands` must remain zero.
+`cubase_midi` creates tracks/parts, notes, chords, drum patterns, CC, pitch bend, channel/poly pressure, program changes, tempo/time/key signatures, markers, lyrics, raw meta/SysEx, quantize, transpose, deterministic humanize, range replacement, SMF import/export, and `import_to_cubase`. See [MIDI composition](docs/midi-composition.md) for schemas and examples.
+
+Destructive commands and all arbitrary UI inputs return `RequiresConfirmation` and a short-lived `confirmation_id`. Re-submit the exact same operation and arguments with that ID to commit it. IDs and UI snapshots are session-bound and single-use. MIDI document/track/part deletion, range replacement, and explicit file overwrite use the same confirmation flow. `cubase://capabilities` contains every classified command, the four DirectAccess roots, the complete UI action vocabulary, and all MIDI composition actions; `unclassified_commands` must remain zero.
 
 See [architecture](docs/architecture.md) and the [capability matrix](docs/capability-matrix.md).
