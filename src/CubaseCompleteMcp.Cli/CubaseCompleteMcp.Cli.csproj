@@ -1,0 +1,12 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <Description>Setup, diagnostics, backup, restore, and Codex registration CLI.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CubaseCompleteMcp.Core\CubaseCompleteMcp.Core.csproj" />
+  </ItemGroup>
+
+</Project>

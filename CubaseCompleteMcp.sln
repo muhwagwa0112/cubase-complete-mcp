@@ -1,0 +1,57 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{41FC1AB9-7B9A-48EB-8A6A-8E482B492D82}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CubaseCompleteMcp.Core", "src\CubaseCompleteMcp.Core\CubaseCompleteMcp.Core.csproj", "{89968A03-F615-4C1C-9C35-B10B50BE5CEA}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CubaseCompleteMcp.Broker", "src\CubaseCompleteMcp.Broker\CubaseCompleteMcp.Broker.csproj", "{3C1F205F-4153-4A27-895C-FF51C06B5943}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CubaseCompleteMcp.Server", "src\CubaseCompleteMcp.Server\CubaseCompleteMcp.Server.csproj", "{C6B35D32-E738-4817-B9C0-943BC82C8D99}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CubaseCompleteMcp.Cli", "src\CubaseCompleteMcp.Cli\CubaseCompleteMcp.Cli.csproj", "{0058895A-2A16-44D1-B687-78EFE3C42E64}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{888116E6-9A6C-4A04-9C80-3F91FC10E622}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CubaseCompleteMcp.Tests", "tests\CubaseCompleteMcp.Tests\CubaseCompleteMcp.Tests.csproj", "{8004E755-5AF0-4B14-BA93-0A002BDB90FF}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{89968A03-F615-4C1C-9C35-B10B50BE5CEA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{89968A03-F615-4C1C-9C35-B10B50BE5CEA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{89968A03-F615-4C1C-9C35-B10B50BE5CEA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{89968A03-F615-4C1C-9C35-B10B50BE5CEA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3C1F205F-4153-4A27-895C-FF51C06B5943}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3C1F205F-4153-4A27-895C-FF51C06B5943}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3C1F205F-4153-4A27-895C-FF51C06B5943}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3C1F205F-4153-4A27-895C-FF51C06B5943}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C6B35D32-E738-4817-B9C0-943BC82C8D99}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C6B35D32-E738-4817-B9C0-943BC82C8D99}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C6B35D32-E738-4817-B9C0-943BC82C8D99}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C6B35D32-E738-4817-B9C0-943BC82C8D99}.Release|Any CPU.Build.0 = Release|Any CPU
+		{0058895A-2A16-44D1-B687-78EFE3C42E64}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0058895A-2A16-44D1-B687-78EFE3C42E64}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0058895A-2A16-44D1-B687-78EFE3C42E64}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0058895A-2A16-44D1-B687-78EFE3C42E64}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8004E755-5AF0-4B14-BA93-0A002BDB90FF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8004E755-5AF0-4B14-BA93-0A002BDB90FF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8004E755-5AF0-4B14-BA93-0A002BDB90FF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8004E755-5AF0-4B14-BA93-0A002BDB90FF}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{89968A03-F615-4C1C-9C35-B10B50BE5CEA} = {41FC1AB9-7B9A-48EB-8A6A-8E482B492D82}
+		{3C1F205F-4153-4A27-895C-FF51C06B5943} = {41FC1AB9-7B9A-48EB-8A6A-8E482B492D82}
+		{C6B35D32-E738-4817-B9C0-943BC82C8D99} = {41FC1AB9-7B9A-48EB-8A6A-8E482B492D82}
+		{0058895A-2A16-44D1-B687-78EFE3C42E64} = {41FC1AB9-7B9A-48EB-8A6A-8E482B492D82}
+		{8004E755-5AF0-4B14-BA93-0A002BDB90FF} = {888116E6-9A6C-4A04-9C80-3F91FC10E622}
+	EndGlobalSection
+EndGlobal

@@ -1,0 +1,7 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Shared contracts, protocol, capability catalog, safety policy, and Cubase driver generation.</Description>
+  </PropertyGroup>
+
+</Project>
