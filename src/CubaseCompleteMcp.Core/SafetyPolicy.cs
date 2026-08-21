@@ -33,7 +33,7 @@ public static class SafetyPolicy
         }
 
         return normalized.EndsWith(".get", StringComparison.Ordinal)
-            || normalized is "status" or "diagnostics" or "capabilities.search"
+            || normalized is "status" or "diagnostics" or "capabilities.search" or "commands.list"
             ? RiskLevel.None
             : RiskLevel.Low;
     }
@@ -47,20 +47,20 @@ public static class SafetyPolicy
 
 public sealed class ConfirmationStore(TimeSpan? lifetime = null)
 {
-    private readonly ConcurrentDictionary<string, ConfirmationProposal> _items = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, StoredConfirmation> _items = new(StringComparer.Ordinal);
     private readonly TimeSpan _lifetime = lifetime ?? TimeSpan.FromMinutes(5);
 
-    public ConfirmationProposal Prepare(string operation, JsonObject? arguments, string summary)
+    public ConfirmationProposal Prepare(string clientSessionId, string operation, JsonObject? arguments, string summary)
     {
         Prune();
         var id = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
         var item = new ConfirmationProposal(id, operation, RiskLevel.Confirm, summary,
             DateTimeOffset.UtcNow + _lifetime, SafetyPolicy.HashArguments(operation, arguments));
-        _items[id] = item;
+        _items[id] = new StoredConfirmation(clientSessionId, item);
         return item;
     }
 
-    public bool Consume(string id, string operation, JsonObject? arguments)
+    public bool Consume(string id, string clientSessionId, string operation, JsonObject? arguments)
     {
         Prune();
         if (!_items.TryRemove(id, out var item))
@@ -68,10 +68,11 @@ public sealed class ConfirmationStore(TimeSpan? lifetime = null)
             return false;
         }
 
-        return item.ExpiresAt >= DateTimeOffset.UtcNow
-            && item.Operation.Equals(operation, StringComparison.Ordinal)
+        return item.Proposal.ExpiresAt >= DateTimeOffset.UtcNow
+            && item.ClientSessionId.Equals(clientSessionId, StringComparison.Ordinal)
+            && item.Proposal.Operation.Equals(operation, StringComparison.Ordinal)
             && CryptographicOperations.FixedTimeEquals(
-                Encoding.ASCII.GetBytes(item.ArgumentsHash),
+                Encoding.ASCII.GetBytes(item.Proposal.ArgumentsHash),
                 Encoding.ASCII.GetBytes(SafetyPolicy.HashArguments(operation, arguments)));
     }
 
@@ -80,11 +81,12 @@ public sealed class ConfirmationStore(TimeSpan? lifetime = null)
         var now = DateTimeOffset.UtcNow;
         foreach (var pair in _items)
         {
-            if (pair.Value.ExpiresAt < now)
+            if (pair.Value.Proposal.ExpiresAt < now)
             {
                 _items.TryRemove(pair.Key, out _);
             }
         }
     }
-}
 
+    private sealed record StoredConfirmation(string ClientSessionId, ConfirmationProposal Proposal);
+}

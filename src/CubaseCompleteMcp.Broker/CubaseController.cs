@@ -47,13 +47,14 @@ public sealed class CubaseController
         try
         {
             var operation = request.Operation.Trim().ToLowerInvariant();
+            var clientSessionId = request.ClientSessionId ?? "unscoped";
             var effectiveRisk = Classify(operation, request.Arguments);
             if (!parentConfirmed && effectiveRisk == RiskLevel.Confirm)
             {
                 if (string.IsNullOrWhiteSpace(request.ConfirmationId)
-                    || !_confirmations.Consume(request.ConfirmationId, operation, request.Arguments))
+                    || !_confirmations.Consume(request.ConfirmationId, clientSessionId, operation, request.Arguments))
                 {
-                    var proposal = _confirmations.Prepare(operation, request.Arguments,
+                    var proposal = _confirmations.Prepare(clientSessionId, operation, request.Arguments,
                         DescribeImpact(operation, request.Arguments));
                     return new BrokerResponse(request.Id, ResultStatus.RequiresConfirmation,
                         JsonSerializer.SerializeToNode(proposal, PipeProtocol.JsonOptions), null,
@@ -68,6 +69,7 @@ public sealed class CubaseController
             {
                 "status" => await StatusAsync(request.Id, cancellationToken).ConfigureAwait(false),
                 "capabilities.search" => Capabilities(request),
+                "commands.list" => Commands(request),
                 "command" => await CommandAsync(request, cancellationToken).ConfigureAwait(false),
                 "transport" => await DriverAsync(request, MapReadWrite("transport", request.Arguments), cancellationToken).ConfigureAwait(false),
                 "track" => await TrackAsync(request, cancellationToken).ConfigureAwait(false),
@@ -135,6 +137,16 @@ public sealed class CubaseController
             ["category_total"] = _commands?.CategoryCount ?? 0
         };
         return BrokerResponse.Success(request.Id, data, "catalog", true, sessionRevision: _session.Revision);
+    }
+
+    private BrokerResponse Commands(BrokerRequest request)
+    {
+        if (_commands is null)
+            return BrokerResponse.Failure(request.Id, ResultStatus.Error, "COMMAND_CATALOG_UNAVAILABLE",
+                CommandCatalogWarning ?? "Key Commands.xml is unavailable.");
+        return BrokerResponse.Success(request.Id,
+            JsonSerializer.SerializeToNode(_commands.Commands, PipeProtocol.JsonOptions), "command_catalog", true,
+            sessionRevision: _session.Revision);
     }
 
     private async Task<BrokerResponse> CommandAsync(BrokerRequest request, CancellationToken cancellationToken)
@@ -235,7 +247,7 @@ public sealed class CubaseController
 
     private async Task<BrokerResponse> UiInspectAsync(BrokerRequest request)
     {
-        var data = await _ui.InspectAsync(request.Arguments).ConfigureAwait(false);
+        var data = await _ui.InspectAsync(request.Arguments, request.ClientSessionId ?? "unscoped").ConfigureAwait(false);
         return BrokerResponse.Success(request.Id, data, "ui_automation+print_window+windows_ocr", true,
             warnings: ["Custom-rendered plugin controls may not expose stable UI Automation elements; OCR coordinates must be refreshed after every input."],
             sessionRevision: _session.Revision);
@@ -243,7 +255,8 @@ public sealed class CubaseController
 
     private BrokerResponse UiInvoke(BrokerRequest request)
     {
-        var data = _ui.Invoke(request.Arguments ?? throw new ArgumentException("UI arguments are required."));
+        var data = _ui.Invoke(request.Arguments ?? throw new ArgumentException("UI arguments are required."),
+            request.ClientSessionId ?? "unscoped");
         return BrokerResponse.Success(request.Id, data, "ui_automation_or_send_input", false,
             warnings: ["Call cubase_ui_inspect after every UI action to verify the postcondition."],
             sessionRevision: _session.Revision);
@@ -260,7 +273,7 @@ public sealed class CubaseController
             if (node is not JsonObject item) throw new ArgumentException("Every batch item must be an object.");
             var child = new BrokerRequest($"{request.Id}:{responses.Count}",
                 item["operation"]?.GetValue<string>() ?? throw new ArgumentException("Batch item operation is required."),
-                item["arguments"] as JsonObject, null);
+                item["arguments"] as JsonObject, null, request.ClientSessionId);
             var response = await HandleCoreAsync(child, parentConfirmed, cancellationToken).ConfigureAwait(false);
             responses.Add(JsonSerializer.SerializeToNode(response, PipeProtocol.JsonOptions));
             if (response.Status is not ResultStatus.Ok and not ResultStatus.Unverified) break;
@@ -290,6 +303,9 @@ public sealed class CubaseController
     private async Task<BrokerResponse> DriverAsync(BrokerRequest request, string driverOperation,
         CancellationToken cancellationToken, JsonObject? driverArguments = null)
     {
+        var isWrite = driverOperation.EndsWith(".set", StringComparison.Ordinal)
+            || driverOperation.Equals("command.execute", StringComparison.Ordinal);
+        JsonNode? before = isWrite ? _session.EventState : null;
         var reply = await _session.SendAsync(driverOperation, driverArguments ?? request.Arguments,
             cancellationToken: cancellationToken).ConfigureAwait(false);
         if (!reply.Ok)
@@ -300,7 +316,10 @@ public sealed class CubaseController
                 reply.Error?.Details, "midi_remote");
         }
 
+        var replyBefore = reply.Data?["before"]?.DeepClone() ?? before;
+        var replyAfter = reply.Data?["after"]?.DeepClone() ?? (isWrite ? _session.EventState : null);
         return BrokerResponse.Success(request.Id, reply.Data, "midi_remote", reply.Verified,
+            before: replyBefore, after: replyAfter,
             warnings: reply.Verified ? [] : ["The driver accepted the operation but did not observe a conclusive postcondition."],
             sessionRevision: reply.Revision);
     }
@@ -311,19 +330,38 @@ public sealed class CubaseController
         return action is "get" or "list" or "inspect" or "status" ? family + ".get" : family + ".set";
     }
 
-    private static RiskLevel Classify(string operation, JsonObject? arguments)
+    private RiskLevel Classify(string operation, JsonObject? arguments)
     {
         var action = arguments?["action"]?.GetValue<string>()?.ToLowerInvariant();
         if (operation == "track" && action == "delete") return RiskLevel.Confirm;
         if (operation == "transport" && action == "record" && arguments?["enabled"]?.GetValue<bool>() != false) return RiskLevel.Confirm;
         if (operation == "project" && action is "overwrite" or "close_unsaved") return RiskLevel.Confirm;
+        if (operation == "project" && action is "close" or "new" or "revert") return RiskLevel.Confirm;
         if (operation == "plugin" && action == "bulk_replace") return RiskLevel.Confirm;
+        if (operation == "ui.invoke" && action is "invoke" or "click" or "toggle") return RiskLevel.Confirm;
+        if (operation == "command" && action == "execute")
+        {
+            KeyCommandDescriptor? command = null;
+            if (arguments?["id"]?.GetValue<string>() is { Length: > 0 } id) command = _commands?.FindById(id);
+            if (command is null && arguments?["category"]?.GetValue<string>() is { Length: > 0 } category
+                && arguments?["name"]?.GetValue<string>() is { Length: > 0 } name)
+                command = _commands?.Find(category, name);
+            if (command is not null && IsConfirmationCommand(command)) return RiskLevel.Confirm;
+        }
         if (operation == "batch" && arguments?["operations"] is JsonArray batch
             && batch.Any(item => item is JsonObject child && Classify(
                 child["operation"]?.GetValue<string>() ?? string.Empty, child["arguments"] as JsonObject) == RiskLevel.Confirm))
             return RiskLevel.Confirm;
         return SafetyPolicy.Classify(operation, arguments);
     }
+
+    private static bool IsConfirmationCommand(KeyCommandDescriptor command) =>
+        command.Category.Equals("File", StringComparison.OrdinalIgnoreCase)
+            && command.Name is "Close" or "Quit" or "New" or "Revert"
+        || command.Category.Equals("Project", StringComparison.OrdinalIgnoreCase)
+            && command.Name.Equals("Remove Selected Tracks", StringComparison.OrdinalIgnoreCase)
+        || command.Category.Equals("Transport", StringComparison.OrdinalIgnoreCase)
+            && command.Name.Contains("Record", StringComparison.OrdinalIgnoreCase);
 
     private static string DescribeImpact(string operation, JsonObject? arguments) =>
         operation switch

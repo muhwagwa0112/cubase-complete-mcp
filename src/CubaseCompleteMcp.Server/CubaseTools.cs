@@ -22,8 +22,8 @@ public sealed class CubaseTools(BrokerClient broker)
     [McpServerTool(Name = "cubase_command", ReadOnly = false, Destructive = true, OpenWorld = false)]
     [Description("Resolve an exact Cubase Key Command, test canPerform, or execute it. Prefer can_perform before execute.")]
     public Task<JsonNode> Command(string? category = null, string? name = null, string? id = null,
-        string action = "can_perform", CancellationToken cancellationToken = default) =>
-        SendAsync("command", Args(("category", category), ("name", name), ("id", id), ("action", action)), null, cancellationToken);
+        string action = "can_perform", string? confirmation_id = null, CancellationToken cancellationToken = default) =>
+        SendAsync("command", Args(("category", category), ("name", name), ("id", id), ("action", action)), confirmation_id, cancellationToken);
 
     [McpServerTool(Name = "cubase_transport", ReadOnly = false, Destructive = true, OpenWorld = false)]
     [Description("Read or control playback, record, position, locators, cycle, metronome and tempo.")]

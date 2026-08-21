@@ -39,7 +39,8 @@ public sealed record BrokerRequest(
     string Id,
     string Operation,
     JsonObject? Arguments = null,
-    string? ConfirmationId = null);
+    string? ConfirmationId = null,
+    string? ClientSessionId = null);
 
 public sealed record BrokerResponse(
     string Id,
@@ -104,4 +105,3 @@ public sealed record ConfirmationProposal(
     string Summary,
     DateTimeOffset ExpiresAt,
     string ArgumentsHash);
-

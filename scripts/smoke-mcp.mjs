@@ -42,12 +42,22 @@ child.stdout.on('data', chunk => {
       send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
       send({ jsonrpc: '2.0', id: 3, method: 'resources/list', params: {} });
       send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'cubase_status', arguments: {} } });
+      send({ jsonrpc: '2.0', id: 5, method: 'resources/read', params: { uri: 'cubase://commands' } });
+      send({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'cubase_command', arguments: { category: 'File', name: 'Close', action: 'execute' } } });
     }
-    if (message.id === 4 && responses.has(2) && responses.has(3)) {
+    if (responses.has(2) && responses.has(3) && responses.has(4) && responses.has(5) && responses.has(6)) {
       const tools = responses.get(2).result.tools;
       const resources = responses.get(3).result.resources;
-      if (tools.length !== 12 || resources.length !== 4 || message.result.isError) finish(2, { tools, resources, status: message });
-      else finish(0, { tool_count: tools.length, tool_names: tools.map(tool => tool.name).sort(), resource_uris: resources.map(resource => resource.uri).sort(), status: message.result });
+      const status = responses.get(4).result;
+      const commandsEnvelope = JSON.parse(responses.get(5).result.contents[0].text);
+      const safetyEnvelope = JSON.parse(responses.get(6).result.content[0].text);
+      const commandCount = Array.isArray(commandsEnvelope.data) ? commandsEnvelope.data.length : -1;
+      const safe = tools.length === 12 && resources.length === 4 && !status.isError
+        && commandCount === 2777 && safetyEnvelope.status === 'RequiresConfirmation';
+      const output = { tool_count: tools.length, tool_names: tools.map(tool => tool.name).sort(),
+        resource_uris: resources.map(resource => resource.uri).sort(), command_resource_count: commandCount,
+        dangerous_command_status: safetyEnvelope.status, status };
+      finish(safe ? 0 : 2, output);
     }
   }
 });

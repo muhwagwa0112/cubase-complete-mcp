@@ -62,7 +62,7 @@ object Setup(string[] input)
     var generated = Generate(staging);
     try
     {
-        BackupService.CopyDirectory(staging, paths.ActiveDriverDirectory, overwrite: true);
+        new BackupService(paths).InstallActiveDriver(staging);
         string? disabledLegacy = null;
         if (input.Contains("--deactivate-legacy", StringComparer.OrdinalIgnoreCase))
         {

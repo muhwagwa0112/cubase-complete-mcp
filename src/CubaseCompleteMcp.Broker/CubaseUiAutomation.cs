@@ -17,7 +17,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
 {
     private readonly ConcurrentDictionary<string, UiToken> _tokens = new(StringComparer.Ordinal);
 
-    public async Task<JsonObject> InspectAsync(JsonObject? arguments)
+    public async Task<JsonObject> InspectAsync(JsonObject? arguments, string clientSessionId)
     {
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null)
@@ -53,7 +53,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                 break;
             }
 
-            windowNodes.Add(BuildElement(window, process.ProcessId.Value, snapshotId, 0, maxDepth, ref remaining));
+            windowNodes.Add(BuildElement(window, process.ProcessId.Value, snapshotId, clientSessionId, 0, maxDepth, ref remaining));
         }
 
         string? screenshotPath = null;
@@ -118,13 +118,14 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         return output;
     }
 
-    public JsonObject Invoke(JsonObject arguments)
+    public JsonObject Invoke(JsonObject arguments, string clientSessionId)
     {
         var tokenValue = arguments["element_token"]?.GetValue<string>()
             ?? throw new ArgumentException("element_token is required.");
         var action = arguments["action"]?.GetValue<string>()?.ToLowerInvariant()
             ?? throw new ArgumentException("action is required.");
-        if (!_tokens.TryRemove(tokenValue, out var token) || token.ExpiresAt < DateTimeOffset.UtcNow)
+        if (!_tokens.TryRemove(tokenValue, out var token) || token.ExpiresAt < DateTimeOffset.UtcNow
+            || !token.ClientSessionId.Equals(clientSessionId, StringComparison.Ordinal))
         {
             throw new InvalidOperationException("The UI element token is unknown or expired. Inspect the window again.");
         }
@@ -181,12 +182,12 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         };
     }
 
-    private JsonObject BuildElement(AutomationElement element, int processId, string snapshotId,
+    private JsonObject BuildElement(AutomationElement element, int processId, string snapshotId, string clientSessionId,
         int depth, int maxDepth, ref int remaining)
     {
         remaining--;
         var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
-        _tokens[token] = new UiToken(element, processId, snapshotId, DateTimeOffset.UtcNow.AddSeconds(30));
+        _tokens[token] = new UiToken(element, processId, snapshotId, clientSessionId, DateTimeOffset.UtcNow.AddSeconds(30));
         var rectangle = element.Current.BoundingRectangle;
         var patterns = new JsonArray();
         AddPattern(element, patterns, InvokePattern.Pattern, "invoke");
@@ -201,7 +202,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
             var child = TreeWalker.ControlViewWalker.GetFirstChild(element);
             while (child is not null && remaining > 0)
             {
-                children.Add(BuildElement(child, processId, snapshotId, depth + 1, maxDepth, ref remaining));
+                children.Add(BuildElement(child, processId, snapshotId, clientSessionId, depth + 1, maxDepth, ref remaining));
                 child = TreeWalker.ControlViewWalker.GetNextSibling(child);
             }
         }
@@ -349,7 +350,8 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         }
     }
 
-    private sealed record UiToken(AutomationElement Element, int ProcessId, string SnapshotId, DateTimeOffset ExpiresAt);
+    private sealed record UiToken(AutomationElement Element, int ProcessId, string SnapshotId,
+        string ClientSessionId, DateTimeOffset ExpiresAt);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeRect { public int Left; public int Top; public int Right; public int Bottom; }

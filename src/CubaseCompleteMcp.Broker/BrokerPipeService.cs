@@ -49,6 +49,7 @@ public sealed class BrokerPipeService(
 
     private async Task HandleClientAsync(NamedPipeServerStream pipe, CancellationToken stoppingToken)
     {
+        var clientSessionId = Guid.NewGuid().ToString("N");
         await using (pipe.ConfigureAwait(false))
         {
             try
@@ -60,6 +61,7 @@ public sealed class BrokerPipeService(
                     {
                         return;
                     }
+                    request = request with { ClientSessionId = clientSessionId };
 
                     MarkActivity();
 

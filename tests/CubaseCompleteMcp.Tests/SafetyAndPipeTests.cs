@@ -12,12 +12,14 @@ public sealed class SafetyAndPipeTests
     {
         var store = new ConfirmationStore(TimeSpan.FromMinutes(1));
         var arguments = new JsonObject { ["action"] = "delete", ["track_id"] = "track-1" };
-        var proposal = store.Prepare("track", arguments, "delete track");
-        Assert.False(store.Consume(proposal.ConfirmationId, "track", new JsonObject { ["action"] = "delete", ["track_id"] = "track-2" }));
-        Assert.False(store.Consume(proposal.ConfirmationId, "track", arguments));
-        var second = store.Prepare("track", arguments, "delete track");
-        Assert.True(store.Consume(second.ConfirmationId, "track", arguments));
-        Assert.False(store.Consume(second.ConfirmationId, "track", arguments));
+        var proposal = store.Prepare("session-a", "track", arguments, "delete track");
+        Assert.False(store.Consume(proposal.ConfirmationId, "session-a", "track", new JsonObject { ["action"] = "delete", ["track_id"] = "track-2" }));
+        Assert.False(store.Consume(proposal.ConfirmationId, "session-a", "track", arguments));
+        var second = store.Prepare("session-a", "track", arguments, "delete track");
+        Assert.False(store.Consume(second.ConfirmationId, "session-b", "track", arguments));
+        var third = store.Prepare("session-a", "track", arguments, "delete track");
+        Assert.True(store.Consume(third.ConfirmationId, "session-a", "track", arguments));
+        Assert.False(store.Consume(third.ConfirmationId, "session-a", "track", arguments));
     }
 
     [Theory]

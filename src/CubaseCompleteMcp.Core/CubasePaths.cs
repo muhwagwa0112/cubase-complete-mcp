@@ -30,9 +30,8 @@ public sealed record CubasePaths(
             midiRoot,
             drivers,
             Path.Combine(drivers, "Local"),
-            Path.Combine(drivers, "Local", CubaseConstants.DeviceVendor, CubaseConstants.DeviceName),
             Path.Combine(midiRoot, "User Settings"),
+            Path.Combine(drivers, "Local", CubaseConstants.DeviceVendor, CubaseConstants.DeviceName),
             Path.Combine(cubasePreferences, "Key Commands.xml"));
     }
 }
-

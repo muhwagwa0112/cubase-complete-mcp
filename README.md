@@ -13,7 +13,7 @@
 - Cubase-PID-scoped UI Automation, single-snapshot element tokens, guarded `SendInput`, and post-action reinspection contract.
 - Manifest-backed backup/restore, setup, diagnostics, driver generation and Codex registration CLI.
 
-Cubase 15.0.20 or later is required for every MIDI Remote API v1.3 feature. On older builds, the status and capability responses report those paths as unavailable. Custom-rendered third-party plugin GUIs remain `best_effort`; the server does not claim that UI as fully supported when neither DirectAccess nor UI Automation exposes it.
+Cubase 15.0.10 is supported through the v1.2 DirectAccess and command-execution baseline. Cubase 15.0.20 or later is required for v1.3 command `canPerform`, extended parameter metadata, and plugin-slot assignment. On older builds those specific paths are feature-detected and reported as unavailable rather than failing driver load. Custom-rendered third-party plugin GUIs remain `best_effort`; the server does not claim that UI as fully supported when neither DirectAccess nor UI Automation exposes it.
 
 ## Build and test
 
@@ -23,18 +23,20 @@ dotnet build CubaseCompleteMcp.sln -c Release --no-restore
 dotnet test CubaseCompleteMcp.sln -c Release --no-build
 powershell -ExecutionPolicy Bypass -File .\scripts\publish.ps1
 node .\scripts\smoke-mcp.mjs
+# With Cubase open on a disposable project:
+node .\scripts\smoke-live.mjs
 ```
 
 ## Safe installation order
 
-1. Run `CubaseCompleteMcp.Cli.exe backup pre-update`.
+1. Run `CubaseCompleteMcp.Cli.exe backup pre-setup`.
 2. Close Cubase.
-3. Update Cubase to 15.0.20 or later with Steinberg Download Assistant.
-4. Start Cubase once, close it, and run `CubaseCompleteMcp.Cli.exe setup` to install the driver alongside the legacy driver.
-5. Start Cubase and add `CBMCP CompleteBridge` using loopMIDI ports `CubaseMCP To Cubase` and `CubaseMCP From Cubase`.
-6. Validate in a disposable project.
-7. Close Cubase and run `CubaseCompleteMcp.Cli.exe setup --deactivate-legacy` only after validation.
-8. Run `CubaseCompleteMcp.Cli.exe register-codex`.
+3. Run `CubaseCompleteMcp.Cli.exe setup` to install the driver alongside the legacy driver.
+4. Start Cubase and open a disposable project so Cubase can instantiate `CBMCP CompleteBridge` on loopMIDI ports `CubaseMCP To Cubase` and `CubaseMCP From Cubase`.
+5. Run `CubaseCompleteMcp.Cli.exe doctor` and `node .\scripts\smoke-live.mjs`.
+6. Run `CubaseCompleteMcp.Cli.exe register-codex`.
+7. Optionally update Cubase to 15.0.20 or later when v1.3-only features are needed. Back up first and rerun the live smoke afterward.
+8. Run `setup --deactivate-legacy` only after separately deciding to retire the legacy driver; it is not required for side-by-side use.
 
 `setup` refuses to touch MIDI Remote files while Cubase is running. It creates a new backup and automatically restores it if installation fails. It never changes VST junctions and never edits `.cpr` files.
 

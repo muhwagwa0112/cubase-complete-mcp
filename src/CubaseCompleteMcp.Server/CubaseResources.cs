@@ -21,7 +21,7 @@ public sealed class CubaseResources(BrokerClient broker)
     [McpServerResource(UriTemplate = "cubase://commands", Name = "cubase-commands", MimeType = "application/json")]
     [Description("Extracted Cubase Key Command catalog.")]
     public Task<string> Commands(CancellationToken cancellationToken = default) =>
-        Read("capabilities.search", new JsonObject { ["limit"] = 500 }, cancellationToken);
+        Read("commands.list", null, cancellationToken);
 
     [McpServerResource(UriTemplate = "cubase://events", Name = "cubase-events", MimeType = "application/json")]
     [Description("Last observed driver state events and session revision.")]
