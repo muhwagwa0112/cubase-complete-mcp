@@ -343,7 +343,7 @@ public sealed class CubaseController
         }
         var before = await _session.SendAsync("direct.get", new JsonObject
         {
-            ["root"] = "mixer", ["include_parameters"] = false, ["max_nodes"] = 512, ["max_depth"] = 4
+            ["root"] = "mixer", ["include_parameters"] = false, ["max_nodes"] = 1024, ["max_depth"] = 4
         }, cancellationToken: cancellationToken).ConfigureAwait(false);
         JsonObject? recoveredProjectFolderDialog;
         try
@@ -353,8 +353,15 @@ public sealed class CubaseController
         catch (Exception error) { throw new InvalidOperationException($"MIDI import dialog recovery failed: {error.Message}", error); }
         DriverReply? commandReply = null;
         bool reusedFileDialog;
-        try { reusedFileDialog = _ui.HasOpenFileDialog(); }
+        bool anyFileDialog;
+        try
+        {
+            reusedFileDialog = _ui.HasOpenMidiImportFileDialog();
+            anyFileDialog = _ui.HasOpenFileDialog();
+        }
         catch (Exception error) { throw new InvalidOperationException($"MIDI import preflight failed: {error.Message}", error); }
+        if (anyFileDialog && !reusedFileDialog)
+            throw new InvalidOperationException("MIDI import preflight failed: a non-MIDI Cubase file dialog is already open.");
         if (!reusedFileDialog)
         {
             commandReply = await _session.SendAsync("command.execute", new JsonObject { ["id"] = command.Id },
@@ -370,7 +377,7 @@ public sealed class CubaseController
         }
         catch (Exception error) { throw new InvalidOperationException($"MIDI import project choice failed: {error.Message}", error); }
         JsonObject? menuFallback = null;
-        if (projectChoiceBefore is null && !_ui.HasOpenFileDialog())
+        if (projectChoiceBefore is null && !_ui.HasOpenMidiImportFileDialog())
         {
             try
             {
@@ -402,15 +409,24 @@ public sealed class CubaseController
         bool fileDialogRemains;
         try { fileDialogRemains = _ui.HasOpenFileDialog(); }
         catch (Exception error) { throw new InvalidOperationException($"MIDI import postcondition failed: {error.Message}", error); }
-        var after = await _session.SendAsync("direct.get", new JsonObject
+        DriverReply after = default!;
+        for (var attempt = 0; attempt < 10; attempt++)
         {
-            ["root"] = "mixer", ["include_parameters"] = false, ["max_nodes"] = 512, ["max_depth"] = 4
-        }, cancellationToken: cancellationToken).ConfigureAwait(false);
+            after = await _session.SendAsync("direct.get", new JsonObject
+            {
+                ["root"] = "mixer", ["include_parameters"] = false, ["max_nodes"] = 1024, ["max_depth"] = 4
+            }, cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (after.Ok && after.Data?["root"]?.GetValue<string>() == "mixer") break;
+            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+        }
         var expectedTrackNames = rendered.Document.Tracks.Skip(1).Select(track => track.Name)
             .Where(name => !string.IsNullOrWhiteSpace(name)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         var beforeNodeCount = before.Data?["nodes"] is JsonArray beforeNodes ? beforeNodes.Count : 0;
         var afterNodeCount = after.Data?["nodes"] is JsonArray afterNodes ? afterNodes.Count : 0;
         var directNodeDelta = afterNodeCount - beforeNodeCount;
+        var beforeObjectIds = DirectObjectIds(before.Data?["nodes"] as JsonArray);
+        var afterObjectIds = DirectObjectIds(after.Data?["nodes"] as JsonArray);
+        var addedObjectIds = afterObjectIds.Except(beforeObjectIds, StringComparer.Ordinal).ToArray();
         var directObservedTrackNames = after.Data?["nodes"] is JsonArray nodes
             ? nodes.OfType<JsonObject>().SelectMany(node => new[]
                 {
@@ -435,7 +451,7 @@ public sealed class CubaseController
             }
         }
         var trackNamesVerified = expectedTrackNames.Length > 0 && expectedTrackNames.All(observedTrackNames.Contains);
-        var graphGrowthVerified = directNodeDelta > 0;
+        var graphGrowthVerified = directNodeDelta > 0 || addedObjectIds.Length > 0;
         var verified = !fileDialogRemains && after.Ok && (trackNamesVerified || graphGrowthVerified);
         var beforeSummary = DirectObservationSummary(before);
         var afterSummary = DirectObservationSummary(after);
@@ -462,8 +478,9 @@ public sealed class CubaseController
             ["observed_track_names"] = new JsonArray(observedTrackNames.Select(name => (JsonNode?)JsonValue.Create(name)).ToArray()),
             ["track_names_verified"] = trackNamesVerified,
             ["direct_node_delta"] = directNodeDelta,
+            ["direct_added_object_count"] = addedObjectIds.Length,
             ["verification_method"] = trackNamesVerified ? "direct_access_or_project_ocr_track_name"
-                : graphGrowthVerified ? "direct_access_mixer_graph_growth" : "none",
+                : graphGrowthVerified ? "direct_access_mixer_graph_change" : "none",
             ["track_postcondition"] = uiPostconditionSummary,
             ["cubase_observation_before"] = beforeSummary.DeepClone(),
             ["cubase_observation_after"] = afterSummary.DeepClone(),
@@ -486,6 +503,11 @@ public sealed class CubaseController
         ["truncated"] = reply.Data?["truncated"]?.DeepClone(),
         ["revision"] = reply.Revision
     };
+
+    private static HashSet<string> DirectObjectIds(JsonArray? nodes) => nodes is null
+        ? new HashSet<string>(StringComparer.Ordinal)
+        : nodes.OfType<JsonObject>().Select(node => node["unique_id"]?.GetValue<string>())
+            .Where(id => !string.IsNullOrWhiteSpace(id)).Cast<string>().ToHashSet(StringComparer.Ordinal);
 
     private async Task<BrokerResponse> UiInspectAsync(BrokerRequest request)
     {

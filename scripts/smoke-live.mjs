@@ -142,7 +142,9 @@ try {
       throw new Error(`MIDI Cubase import failed: ${JSON.stringify(midiImport)}`);
     }
     const observedNames = midiImport.data?.observed_track_names ?? [];
-    const postconditionObserved = observedNames.includes(smokeTrackName) || (midiImport.data?.direct_node_delta ?? 0) > 0;
+    const postconditionObserved = observedNames.includes(smokeTrackName)
+      || (midiImport.data?.direct_node_delta ?? 0) > 0
+      || (midiImport.data?.direct_added_object_count ?? 0) > 0;
     if (midiImport.status !== 'Ok' || midiImport.metadata?.verified !== true || !postconditionObserved) {
       throw new Error(`MIDI Cubase track postcondition failed for '${smokeTrackName}': ${JSON.stringify(midiImport)}`);
     }
@@ -189,29 +191,35 @@ try {
   let restoredReply;
   let restored;
   try {
-    changedReply = envelope(await request('tools/call', {
-      name: 'cubase_transport', arguments: { action: 'metronome', enabled: requested }
-    }));
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      await sleep(100);
-      changed = envelope(await request('tools/call', {
-        name: 'cubase_transport', arguments: { action: 'get' }
+    for (let setAttempt = 0; setAttempt < 3; setAttempt += 1) {
+      changedReply = envelope(await request('tools/call', {
+        name: 'cubase_transport', arguments: { action: 'metronome', enabled: requested }
       }));
-      if (changed.data?.metronome === requested) break;
+      for (let observeAttempt = 0; observeAttempt < 10; observeAttempt += 1) {
+        await sleep(100);
+        changed = envelope(await request('tools/call', {
+          name: 'cubase_transport', arguments: { action: 'get' }
+        }));
+        if (changed.data?.metronome === requested) break;
+      }
+      if (changed?.data?.metronome === requested) break;
     }
     if (changed?.data?.metronome !== requested) {
       throw new Error(`Metronome postcondition failed: ${JSON.stringify(changed)}`);
     }
   } finally {
-    restoredReply = envelope(await request('tools/call', {
-      name: 'cubase_transport', arguments: { action: 'metronome', enabled: original }
-    }));
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      await sleep(100);
-      restored = envelope(await request('tools/call', {
-        name: 'cubase_transport', arguments: { action: 'get' }
+    for (let setAttempt = 0; setAttempt < 3; setAttempt += 1) {
+      restoredReply = envelope(await request('tools/call', {
+        name: 'cubase_transport', arguments: { action: 'metronome', enabled: original }
       }));
-      if (restored.data?.metronome === original) break;
+      for (let observeAttempt = 0; observeAttempt < 10; observeAttempt += 1) {
+        await sleep(100);
+        restored = envelope(await request('tools/call', {
+          name: 'cubase_transport', arguments: { action: 'get' }
+        }));
+        if (restored.data?.metronome === original) break;
+      }
+      if (restored?.data?.metronome === original) break;
     }
     if (restored?.data?.metronome !== original) {
       throw new Error(`Metronome restoration failed: ${JSON.stringify(restored)}`);

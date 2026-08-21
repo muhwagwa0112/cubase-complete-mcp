@@ -159,6 +159,18 @@ public sealed class MidiCompositionTests : IDisposable
     }
 
     [Fact]
+    public void RawMeta_RejectsExplicitEndOfTrack()
+    {
+        const string session = "meta-session";
+        var created = _service.Execute("create_document", new JsonObject { ["name"] = "Meta Guard" }, session);
+        var documentId = created["summary"]!["id"]!.GetValue<string>();
+        var trackId = created["document"]!["tracks"]![0]!["id"]!.GetValue<string>();
+        var error = Assert.Throws<InvalidDataException>(() => AddEvent(documentId, trackId, "add_events",
+            new JsonObject { ["type"] = "meta", ["tick"] = 0, ["meta_type"] = 0x2F, ["data_hex"] = "" }, session));
+        Assert.Contains("End of Track", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void CapabilityRegistry_ListsEveryCompositionAction()
     {
         var actions = CapabilityRegistry.MidiCompositionActions();
