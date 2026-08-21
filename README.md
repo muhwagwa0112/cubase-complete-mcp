@@ -10,7 +10,8 @@
 - WinMM SysEx v2 transport with 7-bit packing, CRC32, chunks, request/session IDs, nonce handshake, bounded retries, duplicate suppression, stale-session rejection and backpressure limits.
 - Generated ES5 MIDI Remote driver with the locally extracted 69 categories / 2,777 Key Commands.
 - DirectAccess traversal and parameter writes, v1.3 feature detection for parameter metadata, command `canPerform`, and plugin slot assignment.
-- Cubase-PID-scoped UI Automation, single-snapshot element tokens, guarded `SendInput`, and post-action reinspection contract.
+- Complete capability registry that classifies every extracted command plus all DirectAccess roots and UI input actions.
+- Cubase-PID-scoped UI Automation, OCR-backed snapshot coordinates, guarded click/drag/scroll/key/text `SendInput`, single-use session tokens, and post-action reinspection contract.
 - Manifest-backed backup/restore, setup, diagnostics, driver generation and Codex registration CLI.
 
 Cubase 15.0.10 is supported through the v1.2 DirectAccess and command-execution baseline. Cubase 15.0.20 or later is required for v1.3 command `canPerform`, extended parameter metadata, and plugin-slot assignment. On older builds those specific paths are feature-detected and reported as unavailable rather than failing driver load. Custom-rendered third-party plugin GUIs remain `best_effort`; the server does not claim that UI as fully supported when neither DirectAccess nor UI Automation exposes it.
@@ -42,10 +43,10 @@ node .\scripts\smoke-live.mjs
 
 ## MCP tools and resources
 
-Tools: `cubase_status`, `cubase_capability_search`, `cubase_command`, `cubase_transport`, `cubase_track`, `cubase_mixer`, `cubase_plugin`, `cubase_project`, `cubase_ui_inspect`, `cubase_ui_invoke`, `cubase_batch`, and `cubase_diagnostics`.
+Tools: `cubase_status`, `cubase_capability_search`, `cubase_command`, `cubase_transport`, `cubase_track`, `cubase_mixer`, `cubase_plugin`, `cubase_direct`, `cubase_project`, `cubase_ui_inspect`, `cubase_ui_invoke`, `cubase_batch`, and `cubase_diagnostics`.
 
 Resources: `cubase://state`, `cubase://capabilities`, `cubase://commands`, and `cubase://events`.
 
-Destructive actions return `RequiresConfirmation` and a short-lived `confirmation_id`. Re-submit the exact same operation and arguments with that ID to commit it. IDs are single-use and are cryptographically bound to the argument payload.
+Destructive commands and all arbitrary UI inputs return `RequiresConfirmation` and a short-lived `confirmation_id`. Re-submit the exact same operation and arguments with that ID to commit it. IDs and UI snapshots are session-bound and single-use. `cubase://capabilities` contains every classified command, the four DirectAccess roots, and the complete UI action vocabulary; `unclassified_commands` must remain zero.
 
 See [architecture](docs/architecture.md) and the [capability matrix](docs/capability-matrix.md).

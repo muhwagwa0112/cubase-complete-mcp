@@ -334,8 +334,10 @@ function directObject(root, objectId, includeParameters, parameterLimit) {
         for (i = 0; i < count; i += 1) {
             tag = root.getParameterTagByIndex(runtime.mapping, objectId, i);
             parameter = {tag: tag, title: root.getParameterTitle(runtime.mapping, objectId, tag, 256), process_value: root.getParameterProcessValue(runtime.mapping, objectId, tag), display_value: root.getParameterDisplayValue(runtime.mapping, objectId, tag), units: root.getParameterDisplayUnits(runtime.mapping, objectId, tag)};
+            if (root.convertParameterProcessValueToPlain) { parameter.plain_value = root.convertParameterProcessValueToPlain(runtime.mapping, objectId, tag, parameter.process_value); }
             if (root.getParameterProcessValueType) { parameter.value_type = root.getParameterProcessValueType(runtime.mapping, objectId, tag); }
             if (root.isParameterAutomatable) { parameter.automatable = root.isParameterAutomatable(runtime.mapping, objectId, tag); }
+            if (root.getParameterEditLockState) { parameter.edit_locked = root.getParameterEditLockState(runtime.mapping, objectId, tag); }
             result.parameters.push(parameter);
         }
     }
@@ -352,14 +354,31 @@ function directSnapshot(args) {
     return {root: args.root || 'selected_track', base_object_id: base, nodes: nodes, truncated: queue.length > 0};
 }
 function directSet(args) {
-    var root = directRoot(args.root), objectId = Number(args.object_id), tag = Number(args.parameter_tag), before, after;
+    var root = directRoot(args.root), objectId = Number(args.object_id), tag = Number(args.parameter_tag), before, beforeDisplay, after, afterDisplay, wasLocked = false, requestedProcess = null, verified = false;
     if (!isFinite(objectId) || !isFinite(tag)) { throw new Error('object_id and parameter_tag are required numbers'); }
     before = root.getParameterProcessValue(runtime.mapping, objectId, tag);
-    if (typeof args.process_value === 'number') { if (!isFinite(args.process_value) || args.process_value < 0 || args.process_value > 1) { throw new Error('process_value must be between 0 and 1'); } root.setParameterProcessValue(runtime.mapping, objectId, tag, args.process_value); }
-    else if (typeof args.display_value === 'string') { root.setParameterDisplayValue(runtime.mapping, objectId, tag, args.display_value); }
-    else { throw new Error('process_value or display_value is required'); }
-    after = root.getParameterProcessValue(runtime.mapping, objectId, tag); runtime.revision += 1;
-    return {before: before, after: after, verified: typeof args.process_value === 'number' ? Math.abs(after - args.process_value) <= 0.0001 : true};
+    beforeDisplay = root.getParameterDisplayValue(runtime.mapping, objectId, tag);
+    if (root.getParameterEditLockState) { wasLocked = root.getParameterEditLockState(runtime.mapping, objectId, tag); }
+    if (root.setParameterEditLockState && !wasLocked) { root.setParameterEditLockState(runtime.mapping, objectId, tag, true); }
+    try {
+        if (typeof args.process_value === 'number') {
+            if (!isFinite(args.process_value) || args.process_value < 0 || args.process_value > 1) { throw new Error('process_value must be between 0 and 1'); }
+            requestedProcess = args.process_value; root.setParameterProcessValue(runtime.mapping, objectId, tag, requestedProcess);
+        }
+        else if (typeof args.plain_value === 'number' && root.convertParameterPlainToProcessValue) {
+            requestedProcess = root.convertParameterPlainToProcessValue(runtime.mapping, objectId, tag, args.plain_value);
+            root.setParameterProcessValue(runtime.mapping, objectId, tag, requestedProcess);
+        }
+        else if (typeof args.display_value === 'string') { root.setParameterDisplayValue(runtime.mapping, objectId, tag, args.display_value); }
+        else { throw new Error('process_value, plain_value, or display_value is required'); }
+    } finally {
+        if (root.setParameterEditLockState && !wasLocked) { root.setParameterEditLockState(runtime.mapping, objectId, tag, false); }
+    }
+    after = root.getParameterProcessValue(runtime.mapping, objectId, tag);
+    afterDisplay = root.getParameterDisplayValue(runtime.mapping, objectId, tag);
+    verified = requestedProcess !== null ? Math.abs(after - requestedProcess) <= 0.0001 : afterDisplay === args.display_value;
+    runtime.revision += 1;
+    return {before: before, before_display: beforeDisplay, after: after, after_display: afterDisplay, verified: verified};
 }
 function commandCapability(args) {
     var index = runtime.commandIndex[args.id], binding;

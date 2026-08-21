@@ -69,12 +69,14 @@ public sealed class CubaseController
             {
                 "status" => await StatusAsync(request.Id, cancellationToken).ConfigureAwait(false),
                 "capabilities.search" => Capabilities(request),
+                "capabilities.list" => AllCapabilities(request),
                 "commands.list" => Commands(request),
                 "command" => await CommandAsync(request, cancellationToken).ConfigureAwait(false),
                 "transport" => await DriverAsync(request, MapReadWrite("transport", request.Arguments), cancellationToken).ConfigureAwait(false),
                 "track" => await TrackAsync(request, cancellationToken).ConfigureAwait(false),
                 "mixer" => await DriverAsync(request, MapReadWrite("mixer", request.Arguments), cancellationToken).ConfigureAwait(false),
                 "plugin" => await DriverAsync(request, MapReadWrite("plugin", request.Arguments), cancellationToken).ConfigureAwait(false),
+                "direct" => await DriverAsync(request, MapReadWrite("direct", request.Arguments), cancellationToken).ConfigureAwait(false),
                 "project" => await ProjectAsync(request, cancellationToken).ConfigureAwait(false),
                 "ui.inspect" => await UiInspectAsync(request).ConfigureAwait(false),
                 "ui.invoke" => UiInvoke(request),
@@ -128,15 +130,61 @@ public sealed class CubaseController
             .Where(item => string.IsNullOrWhiteSpace(category)
                 || item.Category.Contains(category, StringComparison.OrdinalIgnoreCase))
             .Take(Math.Clamp(limit, 1, 500)).ToArray();
-        var commands = _commands?.Search(query, category, limit) ?? [];
+        var api13Available = IsApi13Version(_processes.Inspect().Version);
+        var commands = (_commands?.Search(query, category, limit) ?? [])
+            .Select(command => CapabilityRegistry.DescribeCommand(command, api13Available)).ToArray();
+        var directRoots = CapabilityRegistry.DirectRoots()
+            .Where(item => string.IsNullOrWhiteSpace(query)
+                || item.Id.Contains(query, StringComparison.OrdinalIgnoreCase)
+                || item.Name.Contains(query, StringComparison.OrdinalIgnoreCase))
+            .Where(item => string.IsNullOrWhiteSpace(category)
+                || "direct".Contains(category, StringComparison.OrdinalIgnoreCase))
+            .Take(Math.Clamp(limit, 1, 500)).ToArray();
+        var uiActions = CapabilityRegistry.UiActions()
+            .Where(item => string.IsNullOrWhiteSpace(query)
+                || item.Action.Contains(query, StringComparison.OrdinalIgnoreCase)
+                || item.Target.Contains(query, StringComparison.OrdinalIgnoreCase)
+                || item.SupportLevel.Contains(query, StringComparison.OrdinalIgnoreCase))
+            .Where(item => string.IsNullOrWhiteSpace(category)
+                || "ui".Contains(category, StringComparison.OrdinalIgnoreCase))
+            .Take(Math.Clamp(limit, 1, 500)).ToArray();
         var data = new JsonObject
         {
             ["capabilities"] = JsonSerializer.SerializeToNode(descriptors, PipeProtocol.JsonOptions),
             ["commands"] = JsonSerializer.SerializeToNode(commands, PipeProtocol.JsonOptions),
+            ["direct_roots"] = JsonSerializer.SerializeToNode(directRoots, PipeProtocol.JsonOptions),
+            ["ui_actions"] = JsonSerializer.SerializeToNode(uiActions, PipeProtocol.JsonOptions),
             ["command_total"] = _commands?.Commands.Count ?? 0,
             ["category_total"] = _commands?.CategoryCount ?? 0
         };
         return BrokerResponse.Success(request.Id, data, "catalog", true, sessionRevision: _session.Revision);
+    }
+
+    private BrokerResponse AllCapabilities(BrokerRequest request)
+    {
+        var api13Available = IsApi13Version(_processes.Inspect().Version);
+        var commandCapabilities = _commands?.Commands
+            .Select(command => CapabilityRegistry.DescribeCommand(command, api13Available)).ToArray() ?? [];
+        var data = new JsonObject
+        {
+            ["schema_version"] = 2,
+            ["summary"] = new JsonObject
+            {
+                ["domain_capabilities"] = StaticCapabilities().Length,
+                ["command_capabilities"] = commandCapabilities.Length,
+                ["classified_commands"] = commandCapabilities.Length,
+                ["unclassified_commands"] = 0,
+                ["direct_roots"] = CapabilityRegistry.DirectRoots().Length,
+                ["ui_actions"] = CapabilityRegistry.UiActions().Length,
+                ["api13_available"] = api13Available
+            },
+            ["capabilities"] = JsonSerializer.SerializeToNode(StaticCapabilities(), PipeProtocol.JsonOptions),
+            ["commands"] = JsonSerializer.SerializeToNode(commandCapabilities, PipeProtocol.JsonOptions),
+            ["direct_roots"] = JsonSerializer.SerializeToNode(CapabilityRegistry.DirectRoots(), PipeProtocol.JsonOptions),
+            ["ui_actions"] = JsonSerializer.SerializeToNode(CapabilityRegistry.UiActions(), PipeProtocol.JsonOptions)
+        };
+        return BrokerResponse.Success(request.Id, data, "capability_registry", true,
+            sessionRevision: _session.Revision);
     }
 
     private BrokerResponse Commands(BrokerRequest request)
@@ -335,10 +383,11 @@ public sealed class CubaseController
         var action = arguments?["action"]?.GetValue<string>()?.ToLowerInvariant();
         if (operation == "track" && action == "delete") return RiskLevel.Confirm;
         if (operation == "transport" && action == "record" && arguments?["enabled"]?.GetValue<bool>() != false) return RiskLevel.Confirm;
-        if (operation == "project" && action is "overwrite" or "close_unsaved") return RiskLevel.Confirm;
+        if (operation == "project" && action is "overwrite" or "close_unsaved" or "save") return RiskLevel.Confirm;
+        if (operation == "project" && action == "save_as" && arguments?["overwrite"]?.GetValue<bool>() == true) return RiskLevel.Confirm;
         if (operation == "project" && action is "close" or "new" or "revert") return RiskLevel.Confirm;
         if (operation == "plugin" && action == "bulk_replace") return RiskLevel.Confirm;
-        if (operation == "ui.invoke" && action is "invoke" or "click" or "toggle") return RiskLevel.Confirm;
+        if (operation == "ui.invoke" && action != "focus") return RiskLevel.Confirm;
         if (operation == "command" && action == "execute")
         {
             KeyCommandDescriptor? command = null;
@@ -346,7 +395,7 @@ public sealed class CubaseController
             if (command is null && arguments?["category"]?.GetValue<string>() is { Length: > 0 } category
                 && arguments?["name"]?.GetValue<string>() is { Length: > 0 } name)
                 command = _commands?.Find(category, name);
-            if (command is not null && IsConfirmationCommand(command)) return RiskLevel.Confirm;
+            if (command is not null) return CapabilityRegistry.ClassifyCommand(command);
         }
         if (operation == "batch" && arguments?["operations"] is JsonArray batch
             && batch.Any(item => item is JsonObject child && Classify(
@@ -354,14 +403,6 @@ public sealed class CubaseController
             return RiskLevel.Confirm;
         return SafetyPolicy.Classify(operation, arguments);
     }
-
-    private static bool IsConfirmationCommand(KeyCommandDescriptor command) =>
-        command.Category.Equals("File", StringComparison.OrdinalIgnoreCase)
-            && command.Name is "Close" or "Quit" or "New" or "Revert"
-        || command.Category.Equals("Project", StringComparison.OrdinalIgnoreCase)
-            && command.Name.Equals("Remove Selected Tracks", StringComparison.OrdinalIgnoreCase)
-        || command.Category.Equals("Transport", StringComparison.OrdinalIgnoreCase)
-            && command.Name.Contains("Record", StringComparison.OrdinalIgnoreCase);
 
     private static string DescribeImpact(string operation, JsonObject? arguments) =>
         operation switch
@@ -389,14 +430,15 @@ public sealed class CubaseController
     private static CapabilityDescriptor[] StaticCapabilities() =>
     [
         new("status", "Cubase and bridge status", "system", "broker+winmm", RiskLevel.None, "full", [], true),
-        new("commands", "2,777 Key Command catalog", "commands", "midi_remote", RiskLevel.Low, "generated", ["Cubase 15.0.20+", "CompleteBridge active"], false),
+        new("commands", "Complete generated Key Command catalog", "commands", "midi_remote", RiskLevel.Low, "command_backed", ["CompleteBridge active"], false),
         new("transport", "Transport, locators, cycle, tempo", "transport", "midi_remote", RiskLevel.Low, "full", ["CompleteBridge online"], false),
-        new("track", "Selected track and track commands", "track", "midi_remote", RiskLevel.Low, "partial", ["Project open"], false),
+        new("track", "Selected track, dynamic enumeration and track commands", "track", "midi_remote_or_command", RiskLevel.Low, "dynamic", ["Project open"], false),
         new("mixer", "Mixer bank, EQ, sends and automation", "mixer", "midi_remote", RiskLevel.Low, "dynamic", ["Project open"], false),
-        new("plugin", "DirectAccess plug-in slots and parameters", "plugin", "midi_remote", RiskLevel.Low, "dynamic", ["Cubase 15.0.20+"], false),
-        new("project", "Project file and render workflows", "project", "command_or_ui", RiskLevel.Low, "mixed", ["Cubase running"], false),
+        new("plugin", "DirectAccess plug-in slots and parameters", "plugin", "midi_remote", RiskLevel.Low, "dynamic", ["Project open", "15.0.20+ only for slot assignment"], false),
+        new("direct", "All exposed DirectAccess object trees and parameters", "direct", "midi_remote", RiskLevel.Low, "dynamic", ["MIDI Remote API v1.2+"], false),
+        new("project", "Project file, import, export and render workflows", "project", "command_or_ui", RiskLevel.Low, "command_and_ui", ["Cubase running"], false),
         new("control-room", "Control Room DirectAccess", "mixer", "midi_remote", RiskLevel.Low, "dynamic", ["Control Room configured"], false),
-        new("ui", "Cubase-owned UI Automation and screenshot inspection", "ui", "ui_automation", RiskLevel.Low, "best_effort", ["Visible Cubase window"], false),
+        new("ui", "Cubase-owned UI Automation, OCR and guarded coordinate/keyboard input", "ui", "uia_ocr_send_input", RiskLevel.Confirm, "best_effort", ["Visible Cubase window", "Fresh snapshot"], false),
         new("batch", "Sequential operations with stop-on-failure", "workflow", "broker", RiskLevel.Low, "full", [], true)
     ];
 }

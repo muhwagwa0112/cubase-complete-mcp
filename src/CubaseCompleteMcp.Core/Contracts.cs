@@ -81,6 +81,32 @@ public sealed record CapabilityDescriptor(
     string[] Preconditions,
     bool Verified);
 
+public sealed record CommandCapabilityDescriptor(
+    string Id,
+    string Category,
+    string Name,
+    int Index,
+    string Path,
+    RiskLevel Risk,
+    string SupportLevel,
+    string[] Preconditions,
+    bool CanPerformAvailable,
+    bool Verified);
+
+public sealed record DirectRootDescriptor(
+    string Id,
+    string Name,
+    string SupportLevel,
+    string[] Preconditions);
+
+public sealed record UiActionDescriptor(
+    string Action,
+    string Target,
+    RiskLevel Risk,
+    string SupportLevel,
+    string[] RequiredArguments,
+    string VerificationContract);
+
 public sealed record CubaseStatusSnapshot(
     bool CubaseRunning,
     string? CubaseVersion,

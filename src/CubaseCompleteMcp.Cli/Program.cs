@@ -131,9 +131,10 @@ object RegisterCodex(bool remove)
     {
         var publishRoot = Path.Combine(paths.RepositoryRoot, "artifacts", "publish");
         var publishedExe = Directory.Exists(publishRoot)
-            ? Directory.EnumerateFiles(publishRoot, "CubaseCompleteMcp.Server.exe", SearchOption.AllDirectories)
-                .Select(path => new FileInfo(path)).OrderByDescending(file => file.LastWriteTimeUtc)
-                .Select(file => file.FullName).FirstOrDefault()
+            ? Directory.EnumerateDirectories(publishRoot)
+                .OrderByDescending(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
+                .Select(directory => Path.Combine(directory, "CubaseCompleteMcp.Server.exe"))
+                .FirstOrDefault(File.Exists)
             : null;
         var debugDll = Path.Combine(paths.RepositoryRoot, "src", "CubaseCompleteMcp.Server", "bin", "Debug",
             "net8.0-windows10.0.19041.0", "CubaseCompleteMcp.Server.dll");

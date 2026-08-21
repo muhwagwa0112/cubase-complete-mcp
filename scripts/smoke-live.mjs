@@ -86,12 +86,37 @@ try {
       options: { include_parameters: false, max_nodes: 32, max_depth: 3 }
     }
   }));
+  const direct = envelope(await request('tools/call', {
+    name: 'cubase_direct', arguments: {
+      action: 'list', root: 'selected_track',
+      options: { include_parameters: true, max_parameters: 16, max_nodes: 8, max_depth: 2 }
+    }
+  }));
   const ui = envelope(await request('tools/call', {
     name: 'cubase_ui_inspect', arguments: { max_depth: 2, max_elements: 50, include_screenshot: false }
   }));
-  for (const [label, response] of Object.entries({ tracks, mixer, project, plugins, ui })) {
+  for (const [label, response] of Object.entries({ tracks, mixer, project, plugins, direct, ui })) {
     if (response.status !== 'Ok') throw new Error(`${label} read failed: ${JSON.stringify(response)}`);
   }
+
+  const keyArguments = { action: 'key', snapshot_id: ui.data?.snapshot_id, key: 'ESCAPE' };
+  const keyProposal = envelope(await request('tools/call', {
+    name: 'cubase_ui_invoke', arguments: keyArguments
+  }));
+  if (keyProposal.status !== 'RequiresConfirmation' || !keyProposal.data?.confirmation_id) {
+    throw new Error(`Snapshot key action was not confirmation-gated: ${JSON.stringify(keyProposal)}`);
+  }
+  const keyCommit = envelope(await request('tools/call', {
+    name: 'cubase_ui_invoke',
+    arguments: { ...keyArguments, confirmation_id: keyProposal.data.confirmation_id }
+  }));
+  if (keyCommit.status !== 'Unverified' || keyCommit.data?.invoked !== true) {
+    throw new Error(`Snapshot key action failed: ${JSON.stringify(keyCommit)}`);
+  }
+  const uiAfter = envelope(await request('tools/call', {
+    name: 'cubase_ui_inspect', arguments: { max_depth: 1, max_elements: 20, include_screenshot: false }
+  }));
+  if (uiAfter.status !== 'Ok') throw new Error(`Post-key UI inspection failed: ${JSON.stringify(uiAfter)}`);
 
   const before = envelope(await request('tools/call', {
     name: 'cubase_transport', arguments: { action: 'get' }
@@ -142,7 +167,11 @@ try {
     mixer_read: mixer.status,
     project_read: project.status,
     plugin_nodes: plugins.data?.nodes?.length ?? null,
+    direct_nodes: direct.data?.nodes?.length ?? null,
     ui_windows: ui.data?.windows?.length ?? null,
+    ui_key_confirmation: keyProposal.status,
+    ui_key_commit: keyCommit.status,
+    ui_post_inspect: uiAfter.status,
     before: original,
     changed: changed.data.metronome,
     restored: restored.data.metronome,

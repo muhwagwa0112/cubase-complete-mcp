@@ -64,6 +64,42 @@ public sealed class CatalogAndGeneratorTests : IDisposable
         Assert.Equal(a.CatalogSha256, b.CatalogSha256);
     }
 
+    [Fact]
+    public void CapabilityRegistry_ClassifiesEveryCommand()
+    {
+        var catalog = LoadCatalog();
+        var capabilities = catalog.Commands.Select(command => CapabilityRegistry.DescribeCommand(command, false)).ToArray();
+        Assert.Equal(catalog.Commands.Count, capabilities.Length);
+        Assert.All(capabilities, capability =>
+        {
+            Assert.Equal("command_backed", capability.SupportLevel);
+            Assert.Equal("midi_remote.command_binding", capability.Path);
+            Assert.False(capability.CanPerformAvailable);
+            Assert.False(capability.Verified);
+            Assert.NotEmpty(capability.Preconditions);
+        });
+    }
+
+    [Theory]
+    [InlineData("File", "Save", RiskLevel.Confirm)]
+    [InlineData("Project", "Remove Selected Tracks", RiskLevel.Confirm)]
+    [InlineData("Transport", "Record", RiskLevel.Confirm)]
+    [InlineData("Transport", "Start", RiskLevel.Low)]
+    public void CapabilityRegistry_ClassifiesCommandRisk(string category, string name, RiskLevel expected) =>
+        Assert.Equal(expected, CapabilityRegistry.ClassifyCommand(
+            new KeyCommandDescriptor(KeyCommandCatalog.CreateStableId(category, name), category, name, 0)));
+
+    [Fact]
+    public void CapabilityRegistry_ExposesAllGenericControlSurfaces()
+    {
+        Assert.Equal(4, CapabilityRegistry.DirectRoots().Select(root => root.Id).Distinct().Count());
+        var ui = CapabilityRegistry.UiActions();
+        Assert.Contains(ui, action => action.Action == "drag" && action.Target == "snapshot_coordinate");
+        Assert.Contains(ui, action => action.Action == "key" && action.Target == "snapshot_window");
+        Assert.Contains(ui, action => action.Action == "text" && action.Target == "snapshot_window");
+        Assert.All(ui.Where(action => action.Action != "focus"), action => Assert.Equal(RiskLevel.Confirm, action.Risk));
+    }
+
     private KeyCommandCatalog LoadCatalog() => KeyCommandCatalog.Load(WriteXml(
         "<item><string name=\"Name\" value=\"Transport\"/><list name=\"Commands\"><item><string name=\"Name\" value=\"Start\"/></item><item><string name=\"Name\" value=\"Stop\"/></item></list></item>" +
         "<item><string name=\"Name\" value=\"File\"/><list name=\"Commands\"><item><string name=\"Name\" value=\"Save\"/></item></list></item>"));

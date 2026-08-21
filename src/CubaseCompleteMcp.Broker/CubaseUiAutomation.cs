@@ -16,6 +16,7 @@ namespace CubaseCompleteMcp.Broker;
 public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, CubasePaths paths)
 {
     private readonly ConcurrentDictionary<string, UiToken> _tokens = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, UiSnapshot> _snapshots = new(StringComparer.Ordinal);
 
     public async Task<JsonObject> InspectAsync(JsonObject? arguments, string clientSessionId)
     {
@@ -57,19 +58,25 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         }
 
         string? screenshotPath = null;
-        if (includeScreenshot)
+        var captureHandle = new IntPtr(windows[0].Current.NativeWindowHandle);
+        NativeRect captureRectangle = default;
+        var hasCaptureTarget = captureHandle != IntPtr.Zero && GetWindowRect(captureHandle, out captureRectangle)
+            && captureRectangle.Right > captureRectangle.Left && captureRectangle.Bottom > captureRectangle.Top;
+        if (hasCaptureTarget)
         {
-            var handle = new IntPtr(windows[0].Current.NativeWindowHandle);
-            if (handle != IntPtr.Zero)
-            {
-                screenshotPath = CaptureWindow(handle, snapshotId);
-            }
+            _snapshots[snapshotId] = new UiSnapshot(process.ProcessId.Value, snapshotId, clientSessionId,
+                captureHandle, captureRectangle, windows[0].Current.Name, DateTimeOffset.UtcNow.AddSeconds(30));
+        }
+        if (includeScreenshot && hasCaptureTarget)
+        {
+            screenshotPath = CaptureWindow(captureHandle, snapshotId);
         }
 
         var ocr = screenshotPath is null ? new JsonArray() : await RecognizeTextAsync(screenshotPath).ConfigureAwait(false);
         return new JsonObject
         {
             ["snapshot_id"] = snapshotId,
+            ["snapshot_expires_at"] = hasCaptureTarget ? DateTimeOffset.UtcNow.AddSeconds(30) : null,
             ["process_id"] = process.ProcessId,
             ["window_count"] = windows.Length,
             ["elements_truncated"] = remaining <= 0,
@@ -77,6 +84,13 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
             ["ocr_available"] = OcrEngine.TryCreateFromUserProfileLanguages() is not null,
             ["ocr_lines"] = ocr,
             ["screenshot_path"] = screenshotPath,
+            ["capture_window"] = hasCaptureTarget ? new JsonObject
+            {
+                ["title"] = windows[0].Current.Name,
+                ["width"] = captureRectangle.Right - captureRectangle.Left,
+                ["height"] = captureRectangle.Bottom - captureRectangle.Top,
+                ["coordinate_space"] = "window_snapshot"
+            } : null,
             ["windows"] = windowNodes
         };
     }
@@ -120,66 +134,95 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
 
     public JsonObject Invoke(JsonObject arguments, string clientSessionId)
     {
-        var tokenValue = arguments["element_token"]?.GetValue<string>()
-            ?? throw new ArgumentException("element_token is required.");
         var action = arguments["action"]?.GetValue<string>()?.ToLowerInvariant()
             ?? throw new ArgumentException("action is required.");
-        if (!_tokens.TryRemove(tokenValue, out var token) || token.ExpiresAt < DateTimeOffset.UtcNow
-            || !token.ClientSessionId.Equals(clientSessionId, StringComparison.Ordinal))
+        var tokenValue = arguments["element_token"]?.GetValue<string>();
+        var snapshotValue = arguments["snapshot_id"]?.GetValue<string>();
+        string snapshotId;
+        string target;
+        if (!string.IsNullOrWhiteSpace(tokenValue))
         {
-            throw new InvalidOperationException("The UI element token is unknown or expired. Inspect the window again.");
+            if (!_tokens.TryRemove(tokenValue, out var token) || token.ExpiresAt < DateTimeOffset.UtcNow
+                || !token.ClientSessionId.Equals(clientSessionId, StringComparison.Ordinal))
+                throw new InvalidOperationException("The UI element token is unknown, expired, or belongs to another client session. Inspect the window again.");
+            InvokeElement(token, arguments, action);
+            snapshotId = token.SnapshotId;
+            target = "uia_element";
+        }
+        else if (!string.IsNullOrWhiteSpace(snapshotValue))
+        {
+            if (!_snapshots.TryRemove(snapshotValue, out var snapshot) || snapshot.ExpiresAt < DateTimeOffset.UtcNow
+                || !snapshot.ClientSessionId.Equals(clientSessionId, StringComparison.Ordinal))
+                throw new InvalidOperationException("The UI snapshot is unknown, expired, already used, or belongs to another client session. Inspect the window again.");
+            InvokeSnapshot(snapshot, arguments, action);
+            snapshotId = snapshot.SnapshotId;
+            target = "snapshot_window";
+        }
+        else
+        {
+            throw new ArgumentException("element_token or snapshot_id is required.");
         }
 
-        var process = processInspector.Inspect();
-        if (!process.Running || process.ProcessId != token.ProcessId)
-        {
-            throw new InvalidOperationException("Cubase restarted after this UI token was issued.");
-        }
-
-        var element = token.Element;
-        switch (action)
-        {
-            case "invoke":
-                ((InvokePattern)element.GetCurrentPattern(InvokePattern.Pattern)).Invoke();
-                break;
-            case "toggle":
-                ((TogglePattern)element.GetCurrentPattern(TogglePattern.Pattern)).Toggle();
-                break;
-            case "select":
-                ((SelectionItemPattern)element.GetCurrentPattern(SelectionItemPattern.Pattern)).Select();
-                break;
-            case "expand":
-                ((ExpandCollapsePattern)element.GetCurrentPattern(ExpandCollapsePattern.Pattern)).Expand();
-                break;
-            case "collapse":
-                ((ExpandCollapsePattern)element.GetCurrentPattern(ExpandCollapsePattern.Pattern)).Collapse();
-                break;
-            case "set_value":
-                ((ValuePattern)element.GetCurrentPattern(ValuePattern.Pattern)).SetValue(
-                    arguments["value"]?.GetValue<string>() ?? string.Empty);
-                break;
-            case "focus":
-                element.SetFocus();
-                break;
-            case "click":
-                ClickElement(element, token.ProcessId);
-                break;
-            default:
-                throw new ArgumentOutOfRangeException(nameof(arguments), action, "Unsupported UI action.");
-        }
-
-        foreach (var pair in _tokens.Where(pair => pair.Value.SnapshotId == token.SnapshotId).ToArray())
+        foreach (var pair in _tokens.Where(pair => pair.Value.SnapshotId == snapshotId).ToArray())
         {
             _tokens.TryRemove(pair.Key, out _);
         }
+        _snapshots.TryRemove(snapshotId, out _);
 
         return new JsonObject
         {
             ["action"] = action,
+            ["target"] = target,
+            ["snapshot_id_consumed"] = snapshotId,
             ["invoked"] = true,
             ["verified"] = false,
             ["next_step"] = "Call cubase_ui_inspect to verify the resulting window state."
         };
+    }
+
+    private void InvokeElement(UiToken token, JsonObject arguments, string action)
+    {
+        var process = processInspector.Inspect();
+        if (!process.Running || process.ProcessId != token.ProcessId)
+            throw new InvalidOperationException("Cubase restarted after this UI token was issued.");
+        var element = token.Element;
+        switch (action)
+        {
+            case "invoke": ((InvokePattern)element.GetCurrentPattern(InvokePattern.Pattern)).Invoke(); break;
+            case "toggle": ((TogglePattern)element.GetCurrentPattern(TogglePattern.Pattern)).Toggle(); break;
+            case "select": ((SelectionItemPattern)element.GetCurrentPattern(SelectionItemPattern.Pattern)).Select(); break;
+            case "expand": ((ExpandCollapsePattern)element.GetCurrentPattern(ExpandCollapsePattern.Pattern)).Expand(); break;
+            case "collapse": ((ExpandCollapsePattern)element.GetCurrentPattern(ExpandCollapsePattern.Pattern)).Collapse(); break;
+            case "set_value": ((ValuePattern)element.GetCurrentPattern(ValuePattern.Pattern)).SetValue(
+                arguments["value"]?.GetValue<string>() ?? string.Empty); break;
+            case "focus": element.SetFocus(); break;
+            case "click": ClickElement(element, token.ProcessId); break;
+            default: throw new ArgumentOutOfRangeException(nameof(arguments), action,
+                "This action requires a snapshot_id or is unsupported.");
+        }
+    }
+
+    private void InvokeSnapshot(UiSnapshot snapshot, JsonObject arguments, string action)
+    {
+        ValidateSnapshotWindow(snapshot);
+        var x = arguments["x"]?.GetValue<double>();
+        var y = arguments["y"]?.GetValue<double>();
+        switch (action)
+        {
+            case "click": MouseClick(snapshot, RequireCoordinate(x, "x"), RequireCoordinate(y, "y"), false, false); break;
+            case "double_click": MouseClick(snapshot, RequireCoordinate(x, "x"), RequireCoordinate(y, "y"), true, false); break;
+            case "right_click": MouseClick(snapshot, RequireCoordinate(x, "x"), RequireCoordinate(y, "y"), false, true); break;
+            case "drag": MouseDrag(snapshot, RequireCoordinate(x, "x"), RequireCoordinate(y, "y"),
+                RequireCoordinate(arguments["x2"]?.GetValue<double>(), "x2"), RequireCoordinate(arguments["y2"]?.GetValue<double>(), "y2")); break;
+            case "scroll": MouseScroll(snapshot, RequireCoordinate(x, "x"), RequireCoordinate(y, "y"),
+                Math.Clamp(arguments["delta"]?.GetValue<int>() ?? 120, -12000, 12000)); break;
+            case "key": SendKeyChord(snapshot, arguments["key"]?.GetValue<string>()
+                ?? throw new ArgumentException("key is required.")); break;
+            case "text": SendUnicodeText(snapshot, arguments["value"]?.GetValue<string>()
+                ?? throw new ArgumentException("value is required.")); break;
+            default: throw new ArgumentOutOfRangeException(nameof(arguments), action,
+                "Snapshot actions are click, double_click, right_click, drag, scroll, key, and text.");
+        }
     }
 
     private JsonObject BuildElement(AutomationElement element, int processId, string snapshotId, string clientSessionId,
@@ -321,6 +364,162 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         }
     }
 
+    private void ValidateSnapshotWindow(UiSnapshot snapshot)
+    {
+        var process = processInspector.Inspect();
+        if (!process.Running || process.ProcessId != snapshot.ProcessId || !IsWindow(snapshot.WindowHandle))
+            throw new InvalidOperationException("Cubase or the captured window changed after this snapshot was issued.");
+        _ = GetWindowThreadProcessId(snapshot.WindowHandle, out var owner);
+        if (owner != snapshot.ProcessId || !SetForegroundWindow(snapshot.WindowHandle)
+            || GetForegroundWindow() != snapshot.WindowHandle)
+            throw new InvalidOperationException("Could not safely activate the captured Cubase window.");
+    }
+
+    private static double RequireCoordinate(double? value, string name) =>
+        value is { } number && double.IsFinite(number) ? number : throw new ArgumentException($"{name} is required and must be finite.");
+
+    private static Point SnapshotPoint(UiSnapshot snapshot, double x, double y)
+    {
+        var width = snapshot.Rectangle.Right - snapshot.Rectangle.Left;
+        var height = snapshot.Rectangle.Bottom - snapshot.Rectangle.Top;
+        if (x < 0 || y < 0 || x >= width || y >= height)
+            throw new ArgumentOutOfRangeException(nameof(x), $"Coordinates must be inside the {width}x{height} snapshot.");
+        return new Point { X = snapshot.Rectangle.Left + (int)Math.Round(x), Y = snapshot.Rectangle.Top + (int)Math.Round(y) };
+    }
+
+    private static void MouseClick(UiSnapshot snapshot, double x, double y, bool doubleClick, bool rightClick)
+    {
+        var point = SnapshotPoint(snapshot, x, y);
+        _ = GetCursorPos(out var original);
+        try
+        {
+            _ = SetCursorPos(point.X, point.Y);
+            var down = rightClick ? 0x0008u : 0x0002u;
+            var up = rightClick ? 0x0010u : 0x0004u;
+            var clicks = doubleClick ? 2 : 1;
+            var inputs = Enumerable.Range(0, clicks).SelectMany(_ => new[]
+            {
+                MouseInputEvent(down), MouseInputEvent(up)
+            }).ToArray();
+            SendAll(inputs, "mouse click");
+        }
+        finally
+        {
+            _ = SetCursorPos(original.X, original.Y);
+        }
+    }
+
+    private static void MouseDrag(UiSnapshot snapshot, double x, double y, double x2, double y2)
+    {
+        var start = SnapshotPoint(snapshot, x, y);
+        var end = SnapshotPoint(snapshot, x2, y2);
+        _ = GetCursorPos(out var original);
+        var buttonDown = false;
+        try
+        {
+            _ = SetCursorPos(start.X, start.Y);
+            SendAll([MouseInputEvent(0x0002)], "mouse down");
+            buttonDown = true;
+            _ = SetCursorPos(end.X, end.Y);
+            SendAll([MouseInputEvent(0x0004)], "mouse up");
+            buttonDown = false;
+        }
+        finally
+        {
+            if (buttonDown)
+            {
+                try { SendAll([MouseInputEvent(0x0004)], "mouse up recovery"); }
+                catch { /* Preserve the original failure after a best-effort release. */ }
+            }
+            _ = SetCursorPos(original.X, original.Y);
+        }
+    }
+
+    private static void MouseScroll(UiSnapshot snapshot, double x, double y, int delta)
+    {
+        var point = SnapshotPoint(snapshot, x, y);
+        _ = GetCursorPos(out var original);
+        try
+        {
+            _ = SetCursorPos(point.X, point.Y);
+            SendAll([new Input
+            {
+                Type = 0,
+                Union = new InputUnion { Mouse = new MouseInput { MouseData = unchecked((uint)delta), Flags = 0x0800 } }
+            }], "mouse wheel");
+        }
+        finally
+        {
+            _ = SetCursorPos(original.X, original.Y);
+        }
+    }
+
+    private static void SendKeyChord(UiSnapshot snapshot, string chord)
+    {
+        if (string.IsNullOrWhiteSpace(chord)) throw new ArgumentException("key must not be empty.");
+        var tokens = chord.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var modifiers = new List<ushort>();
+        ushort? key = null;
+        foreach (var token in tokens)
+        {
+            var normalized = token.ToUpperInvariant();
+            if (normalized is "WIN" or "WINDOWS" or "META" or "SUPER" or "COMMAND" or "CMD")
+                throw new ArgumentException("Windows-key shortcuts are not allowed.");
+            if (normalized is "CTRL" or "CONTROL") modifiers.Add(0x11);
+            else if (normalized == "SHIFT") modifiers.Add(0x10);
+            else if (normalized is "ALT" or "MENU") modifiers.Add(0x12);
+            else if (key is null) key = VirtualKey(normalized);
+            else throw new ArgumentException("A key chord can contain only one non-modifier key.");
+        }
+        if (key is null) throw new ArgumentException("A key chord requires one non-modifier key.");
+        var inputs = new List<Input>();
+        inputs.AddRange(modifiers.Select(code => KeyboardInputEvent(code, false)));
+        inputs.Add(KeyboardInputEvent(key.Value, false));
+        inputs.Add(KeyboardInputEvent(key.Value, true));
+        inputs.AddRange(modifiers.AsEnumerable().Reverse().Select(code => KeyboardInputEvent(code, true)));
+        SendAll(inputs.ToArray(), "keyboard chord");
+    }
+
+    private static void SendUnicodeText(UiSnapshot snapshot, string value)
+    {
+        if (value.Length > 4096) throw new ArgumentOutOfRangeException(nameof(value), "Text input is limited to 4096 UTF-16 code units.");
+        var inputs = new List<Input>(value.Length * 2);
+        foreach (var character in value)
+        {
+            inputs.Add(new Input { Type = 1, Union = new InputUnion { Keyboard = new KeyboardInput { Scan = character, Flags = 0x0004 } } });
+            inputs.Add(new Input { Type = 1, Union = new InputUnion { Keyboard = new KeyboardInput { Scan = character, Flags = 0x0004 | 0x0002 } } });
+        }
+        SendAll(inputs.ToArray(), "unicode text");
+    }
+
+    private static ushort VirtualKey(string name)
+    {
+        if (name.Length == 1 && char.IsLetterOrDigit(name[0])) return char.ToUpperInvariant(name[0]);
+        if (name.StartsWith('F') && int.TryParse(name.AsSpan(1), out var function) && function is >= 1 and <= 24)
+            return (ushort)(0x70 + function - 1);
+        return name switch
+        {
+            "BACKSPACE" => 0x08, "TAB" => 0x09, "ENTER" or "RETURN" => 0x0D, "ESC" or "ESCAPE" => 0x1B,
+            "SPACE" => 0x20, "PAGEUP" => 0x21, "PAGEDOWN" => 0x22, "END" => 0x23, "HOME" => 0x24,
+            "LEFT" => 0x25, "UP" => 0x26, "RIGHT" => 0x27, "DOWN" => 0x28, "INSERT" => 0x2D,
+            "DELETE" => 0x2E, "PLUS" => 0xBB, "COMMA" => 0xBC, "MINUS" => 0xBD, "PERIOD" => 0xBE,
+            _ => throw new ArgumentException($"Unsupported key name '{name}'.")
+        };
+    }
+
+    private static Input MouseInputEvent(uint flags) =>
+        new() { Type = 0, Union = new InputUnion { Mouse = new MouseInput { Flags = flags } } };
+
+    private static Input KeyboardInputEvent(ushort virtualKey, bool keyUp) =>
+        new() { Type = 1, Union = new InputUnion { Keyboard = new KeyboardInput { VirtualKey = virtualKey, Flags = keyUp ? 0x0002u : 0 } } };
+
+    private static void SendAll(Input[] inputs, string operation)
+    {
+        if (inputs.Length == 0) return;
+        if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>()) != (uint)inputs.Length)
+            throw new InvalidOperationException($"SendInput did not deliver the complete {operation}.");
+    }
+
     private static IntPtr FindOwnerWindow(AutomationElement element)
     {
         AutomationElement? current = element;
@@ -348,10 +547,16 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                 _tokens.TryRemove(pair.Key, out _);
             }
         }
+        foreach (var pair in _snapshots)
+        {
+            if (pair.Value.ExpiresAt < now) _snapshots.TryRemove(pair.Key, out _);
+        }
     }
 
     private sealed record UiToken(AutomationElement Element, int ProcessId, string SnapshotId,
         string ClientSessionId, DateTimeOffset ExpiresAt);
+    private sealed record UiSnapshot(int ProcessId, string SnapshotId, string ClientSessionId,
+        IntPtr WindowHandle, NativeRect Rectangle, string WindowTitle, DateTimeOffset ExpiresAt);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeRect { public int Left; public int Top; public int Right; public int Bottom; }
@@ -360,11 +565,20 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     [StructLayout(LayoutKind.Sequential)]
     private struct Input { public uint Type; public InputUnion Union; }
     [StructLayout(LayoutKind.Explicit)]
-    private struct InputUnion { [FieldOffset(0)] public MouseInput Mouse; }
+    private struct InputUnion
+    {
+        [FieldOffset(0)] public MouseInput Mouse;
+        [FieldOffset(0)] public KeyboardInput Keyboard;
+    }
     [StructLayout(LayoutKind.Sequential)]
     private struct MouseInput
     {
         public int X; public int Y; public uint MouseData; public uint Flags; public uint Time; public IntPtr ExtraInfo;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KeyboardInput
+    {
+        public ushort VirtualKey; public ushort Scan; public uint Flags; public uint Time; public IntPtr ExtraInfo;
     }
 
     [DllImport("user32.dll")]
@@ -375,6 +589,8 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     private static extern bool SetForegroundWindow(IntPtr handle);
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    private static extern bool IsWindow(IntPtr handle);
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr handle, out int processId);
     [DllImport("user32.dll")]

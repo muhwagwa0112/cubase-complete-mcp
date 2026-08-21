@@ -70,4 +70,8 @@ public sealed class SafetyAndPipeTests
         Assert.Equal(a, SafetyPolicy.HashArguments("track", new JsonObject { ["id"] = 1 }));
         Assert.NotEqual(a, SafetyPolicy.HashArguments("track", new JsonObject { ["id"] = 2 }));
     }
+
+    [Fact]
+    public void CompleteCapabilityRegistry_IsReadOnly() =>
+        Assert.Equal(RiskLevel.None, SafetyPolicy.Classify("capabilities.list", null));
 }

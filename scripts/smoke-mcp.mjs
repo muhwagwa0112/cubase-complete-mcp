@@ -44,19 +44,24 @@ child.stdout.on('data', chunk => {
       send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'cubase_status', arguments: {} } });
       send({ jsonrpc: '2.0', id: 5, method: 'resources/read', params: { uri: 'cubase://commands' } });
       send({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'cubase_command', arguments: { category: 'File', name: 'Close', action: 'execute' } } });
+      send({ jsonrpc: '2.0', id: 7, method: 'resources/read', params: { uri: 'cubase://capabilities' } });
     }
-    if (responses.has(2) && responses.has(3) && responses.has(4) && responses.has(5) && responses.has(6)) {
+    if (responses.has(2) && responses.has(3) && responses.has(4) && responses.has(5) && responses.has(6) && responses.has(7)) {
       const tools = responses.get(2).result.tools;
       const resources = responses.get(3).result.resources;
       const status = responses.get(4).result;
       const commandsEnvelope = JSON.parse(responses.get(5).result.contents[0].text);
       const safetyEnvelope = JSON.parse(responses.get(6).result.content[0].text);
+      const capabilitiesEnvelope = JSON.parse(responses.get(7).result.contents[0].text);
       const commandCount = Array.isArray(commandsEnvelope.data) ? commandsEnvelope.data.length : -1;
-      const safe = tools.length === 12 && resources.length === 4 && !status.isError
-        && commandCount === 2777 && safetyEnvelope.status === 'RequiresConfirmation';
+      const capabilitySummary = capabilitiesEnvelope.data?.summary ?? {};
+      const safe = tools.length === 13 && resources.length === 4 && !status.isError
+        && commandCount === 2777 && safetyEnvelope.status === 'RequiresConfirmation'
+        && capabilitySummary.command_capabilities === 2777 && capabilitySummary.unclassified_commands === 0
+        && capabilitySummary.direct_roots === 4 && capabilitySummary.ui_actions >= 14;
       const output = { tool_count: tools.length, tool_names: tools.map(tool => tool.name).sort(),
         resource_uris: resources.map(resource => resource.uri).sort(), command_resource_count: commandCount,
-        dangerous_command_status: safetyEnvelope.status, status };
+        dangerous_command_status: safetyEnvelope.status, capability_summary: capabilitySummary, status };
       finish(safe ? 0 : 2, output);
     }
   }

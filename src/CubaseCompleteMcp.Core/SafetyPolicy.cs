@@ -33,7 +33,7 @@ public static class SafetyPolicy
         }
 
         return normalized.EndsWith(".get", StringComparison.Ordinal)
-            || normalized is "status" or "diagnostics" or "capabilities.search" or "commands.list"
+            || normalized is "status" or "diagnostics" or "capabilities.search" or "capabilities.list" or "commands.list"
             ? RiskLevel.None
             : RiskLevel.Low;
     }

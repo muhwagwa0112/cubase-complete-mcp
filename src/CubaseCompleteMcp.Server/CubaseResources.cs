@@ -16,7 +16,7 @@ public sealed class CubaseResources(BrokerClient broker)
     [McpServerResource(UriTemplate = "cubase://capabilities", Name = "cubase-capabilities", MimeType = "application/json")]
     [Description("Capability matrix with paths, risks, prerequisites and verification state.")]
     public Task<string> Capabilities(CancellationToken cancellationToken = default) =>
-        Read("capabilities.search", new JsonObject { ["limit"] = 500 }, cancellationToken);
+        Read("capabilities.list", null, cancellationToken);
 
     [McpServerResource(UriTemplate = "cubase://commands", Name = "cubase-commands", MimeType = "application/json")]
     [Description("Extracted Cubase Key Command catalog.")]

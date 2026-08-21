@@ -50,12 +50,21 @@ public sealed class CubaseTools(BrokerClient broker)
     [McpServerTool(Name = "cubase_plugin", ReadOnly = false, Destructive = true, OpenWorld = false)]
     [Description("Enumerate DirectAccess plug-in slots and parameters, assign/remove/bypass/open editors, and set process or display values.")]
     public Task<JsonNode> Plugin(string action = "list", string root = "selected_track", string? object_id = null,
-        string? parameter_tag = null, double? process_value = null, string? display_value = null,
+        string? parameter_tag = null, double? process_value = null, double? plain_value = null, string? display_value = null,
         string? plugin_uid = null, string? confirmation_id = null, JsonElement? options = null,
         CancellationToken cancellationToken = default) =>
         SendAsync("plugin", Merge(options, ("action", action), ("root", root), ("object_id", object_id),
-            ("parameter_tag", parameter_tag), ("process_value", process_value), ("display_value", display_value),
+            ("parameter_tag", parameter_tag), ("process_value", process_value), ("plain_value", plain_value), ("display_value", display_value),
             ("plugin_uid", plugin_uid)), confirmation_id, cancellationToken);
+
+    [McpServerTool(Name = "cubase_direct", ReadOnly = false, Destructive = false, OpenWorld = false)]
+    [Description("Traverse any supported DirectAccess root and read or write exposed parameters by ephemeral object ID and parameter tag.")]
+    public Task<JsonNode> Direct(string action = "list", string root = "selected_track", string? object_id = null,
+        string? parameter_tag = null, double? process_value = null, double? plain_value = null,
+        string? display_value = null, JsonElement? options = null, CancellationToken cancellationToken = default) =>
+        SendAsync("direct", Merge(options, ("action", action), ("root", root), ("object_id", object_id),
+            ("parameter_tag", parameter_tag), ("process_value", process_value), ("plain_value", plain_value),
+            ("display_value", display_value)), null, cancellationToken);
 
     [McpServerTool(Name = "cubase_project", ReadOnly = false, Destructive = true, OpenWorld = false)]
     [Description("Create, open, save, close, import, export and render Cubase projects through command or verified UI fallback paths.")]
@@ -72,9 +81,13 @@ public sealed class CubaseTools(BrokerClient broker)
 
     [McpServerTool(Name = "cubase_ui_invoke", ReadOnly = false, Destructive = true, OpenWorld = false)]
     [Description("Invoke one snapshot-scoped Cubase UI element via UI Automation or guarded SendInput, then re-inspect to verify.")]
-    public Task<JsonNode> UiInvoke(string element_token, string action, string? value = null,
-        string? confirmation_id = null, CancellationToken cancellationToken = default) =>
-        SendAsync("ui.invoke", Args(("element_token", element_token), ("action", action), ("value", value)), confirmation_id, cancellationToken);
+    public Task<JsonNode> UiInvoke(string action, string? element_token = null, string? snapshot_id = null,
+        double? x = null, double? y = null, double? x2 = null, double? y2 = null, int? delta = null,
+        string? key = null, string? value = null, string? confirmation_id = null,
+        CancellationToken cancellationToken = default) =>
+        SendAsync("ui.invoke", Args(("action", action), ("element_token", element_token), ("snapshot_id", snapshot_id),
+            ("x", x), ("y", y), ("x2", x2), ("y2", y2), ("delta", delta), ("key", key), ("value", value)),
+            confirmation_id, cancellationToken);
 
     [McpServerTool(Name = "cubase_batch", ReadOnly = false, Destructive = true, OpenWorld = false)]
     [Description("Run operations sequentially and stop at the first failure. Confirm-required children require an outer confirmation commit.")]
