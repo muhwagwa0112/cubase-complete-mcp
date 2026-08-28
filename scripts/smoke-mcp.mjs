@@ -1,19 +1,32 @@
 import { spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const publishRoot = join(root, 'artifacts', 'publish');
 const candidates = [];
 for (const entry of readdirSync(publishRoot, { withFileTypes: true })) {
   if (!/^\d{8}-\d{6}$/.test(entry.name)) continue;
-  const candidate = entry.isDirectory() ? join(publishRoot, entry.name, 'CubaseCompleteMcp.Server.exe') : null;
-  if (candidate && existsSync(candidate)) candidates.push({ path: candidate, release: entry.name });
+  if (!entry.isDirectory()) continue;
+  const releaseRoot = join(publishRoot, entry.name);
+  const manifestPath = join(releaseRoot, 'release-manifest.json');
+  if (!existsSync(manifestPath)) continue;
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8').replace(/^\uFEFF/, ''));
+    if (manifest.schema_version !== 1 || manifest.configuration !== 'Release' || manifest.release_id !== entry.name) continue;
+    const valid = ['server', 'broker', 'core', 'cli'].every(name => {
+      const component = manifest.components?.[name];
+      if (!component?.path || !component?.sha256) return false;
+      const path = join(releaseRoot, component.path);
+      return existsSync(path) && createHash('sha256').update(readFileSync(path)).digest('hex') === component.sha256;
+    });
+    if (valid) candidates.push({ path: join(releaseRoot, manifest.components.server.path), release: entry.name, manifest });
+  } catch { /* Ignore invalid releases and select the latest valid manifest. */ }
 }
-const flat = join(publishRoot, 'CubaseCompleteMcp.Server.exe');
-if (candidates.length === 0 && existsSync(flat)) candidates.push({ path: flat, release: 'legacy-flat' });
-const server = candidates.sort((a, b) => b.release.localeCompare(a.release))[0]?.path;
+const selected = candidates.sort((a, b) => b.release.localeCompare(a.release))[0];
+const server = selected?.path;
 if (!server) throw new Error('No published CubaseCompleteMcp.Server.exe was found.');
 const child = spawn(server, [], { stdio: ['pipe', 'pipe', 'pipe'] });
 let buffer = '';
@@ -66,7 +79,8 @@ child.stdout.on('data', chunk => {
         && capabilitySummary.direct_roots === 4 && capabilitySummary.ui_actions >= 14
         && capabilitySummary.midi_composition_actions >= 32
         && midiEnvelope.status === 'Ok' && midiEnvelope.data?.summary?.tracks === 1;
-      const output = { tool_count: tools.length, tool_names: tools.map(tool => tool.name).sort(),
+      const output = { release_id: selected.release, git_sha: selected.manifest.git_sha,
+        tool_count: tools.length, tool_names: tools.map(tool => tool.name).sort(),
         resource_uris: resources.map(resource => resource.uri).sort(), command_resource_count: commandCount,
         dangerous_command_status: safetyEnvelope.status, capability_summary: capabilitySummary,
         midi_document_status: midiEnvelope.status, midi_document_summary: midiEnvelope.data?.summary, status };

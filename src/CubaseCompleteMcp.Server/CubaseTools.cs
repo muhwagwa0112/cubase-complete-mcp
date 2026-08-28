@@ -89,7 +89,7 @@ public sealed class CubaseTools(BrokerClient broker)
             ("max_elements", max_elements), ("include_screenshot", include_screenshot)), null, cancellationToken);
 
     [McpServerTool(Name = "cubase_ui_invoke", ReadOnly = false, Destructive = true, OpenWorld = false)]
-    [Description("Invoke one snapshot-scoped Cubase UI element via UI Automation or guarded SendInput, then re-inspect to verify.")]
+    [Description("Invoke one snapshot-scoped Cubase UI input. The result is always Unverified; call cubase_ui_inspect with a fresh snapshot to verify the postcondition.")]
     public Task<JsonNode> UiInvoke(string action, string? element_token = null, string? snapshot_id = null,
         double? x = null, double? y = null, double? x2 = null, double? y2 = null, int? delta = null,
         string? key = null, string? value = null, string? confirmation_id = null,

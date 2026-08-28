@@ -14,9 +14,11 @@ var builder = Host.CreateApplicationBuilder(args);
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
 builder.Services.AddSingleton(CubasePaths.Discover());
+builder.Services.AddSingleton(BuildIdentityService.Current());
 builder.Services.AddSingleton<ConfirmationStore>();
 builder.Services.AddSingleton<CubaseProcessInspector>();
 builder.Services.AddSingleton<WinMmMidiTransport>();
+builder.Services.AddSingleton<LoopMidiRuntime>();
 builder.Services.AddSingleton<CubaseMidiSession>();
 builder.Services.AddSingleton<CubaseUiAutomation>();
 builder.Services.AddSingleton(provider => new MidiCompositionService(

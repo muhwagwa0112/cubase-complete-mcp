@@ -11,6 +11,7 @@ public sealed record DriverReply(bool Ok, JsonNode? Data, BrokerError? Error, bo
 public sealed class CubaseMidiSession
 {
     private readonly WinMmMidiTransport _transport;
+    private readonly LoopMidiRuntime _loopMidi;
     private readonly ILogger<CubaseMidiSession> _logger;
     private readonly ConcurrentDictionary<uint, TaskCompletionSource<DriverReply>> _pending = new();
     private readonly MidiFrameReassembler _reassembler = new();
@@ -22,9 +23,11 @@ public sealed class CubaseMidiSession
     private DateTimeOffset _lastReplyAt;
     private JsonObject _eventState = new();
 
-    public CubaseMidiSession(WinMmMidiTransport transport, ILogger<CubaseMidiSession> logger)
+    public CubaseMidiSession(WinMmMidiTransport transport, LoopMidiRuntime loopMidi,
+        ILogger<CubaseMidiSession> logger)
     {
         _transport = transport;
+        _loopMidi = loopMidi;
         _logger = logger;
         _transport.MessageReceived += OnMessageReceived;
     }
@@ -33,6 +36,7 @@ public sealed class CubaseMidiSession
     public bool IsDriverOnline => _sessionId != 0 && DateTimeOffset.UtcNow - _lastReplyAt < TimeSpan.FromSeconds(15);
     public uint SessionId => _sessionId;
     public long Revision { get; private set; }
+    public LoopMidiRuntimeSnapshot? LoopMidiSnapshot { get; private set; }
 
     public JsonObject EventState
     {
@@ -45,13 +49,17 @@ public sealed class CubaseMidiSession
         }
     }
 
-    public bool EnsureTransportOpen() => _transport.TryOpen(
-        CubaseConstants.OutputPortName,
-        CubaseConstants.InputPortName);
+    public async Task<bool> EnsureTransportOpenAsync(CancellationToken cancellationToken = default)
+    {
+        LoopMidiSnapshot = await _loopMidi.EnsureAvailableAsync(_transport.EnumeratePorts, cancellationToken)
+            .ConfigureAwait(false);
+        return LoopMidiSnapshot.PortsAvailable && _transport.TryOpen(
+            CubaseConstants.OutputPortName, CubaseConstants.InputPortName);
+    }
 
     public async Task<bool> TryHandshakeAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
     {
-        if (!EnsureTransportOpen())
+        if (!await EnsureTransportOpenAsync(cancellationToken).ConfigureAwait(false))
         {
             return false;
         }

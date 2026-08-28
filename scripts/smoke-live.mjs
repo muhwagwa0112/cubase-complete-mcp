@@ -1,19 +1,32 @@
 import { spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const publishRoot = join(root, 'artifacts', 'publish');
 const candidates = [];
 for (const entry of readdirSync(publishRoot, { withFileTypes: true })) {
   if (!/^\d{8}-\d{6}$/.test(entry.name)) continue;
-  const candidate = entry.isDirectory() ? join(publishRoot, entry.name, 'CubaseCompleteMcp.Server.exe') : null;
-  if (candidate) {
-    if (existsSync(candidate)) candidates.push({ path: candidate, release: entry.name });
-  }
+  if (!entry.isDirectory()) continue;
+  const releaseRoot = join(publishRoot, entry.name);
+  const manifestPath = join(releaseRoot, 'release-manifest.json');
+  if (!existsSync(manifestPath)) continue;
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8').replace(/^\uFEFF/, ''));
+    const valid = manifest.schema_version === 1 && manifest.configuration === 'Release'
+      && manifest.release_id === entry.name && ['server', 'broker', 'core', 'cli'].every(name => {
+        const component = manifest.components?.[name];
+        if (!component?.path || !component?.sha256) return false;
+        const path = join(releaseRoot, component.path);
+        return existsSync(path) && createHash('sha256').update(readFileSync(path)).digest('hex') === component.sha256;
+      });
+    if (valid) candidates.push({ path: join(releaseRoot, manifest.components.server.path), release: entry.name, manifest });
+  } catch { /* Ignore invalid releases. */ }
 }
-const server = candidates.sort((a, b) => b.release.localeCompare(a.release))[0]?.path;
+const selected = candidates.sort((a, b) => b.release.localeCompare(a.release))[0];
+const server = selected?.path;
 if (!server) throw new Error('No published CubaseCompleteMcp.Server.exe was found.');
 
 const child = spawn(server, [], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -71,6 +84,7 @@ try {
 
   const status = envelope(await request('tools/call', { name: 'cubase_status', arguments: {} }));
   if (!status.data?.driver_online) throw new Error(`CompleteBridge is offline: ${JSON.stringify(status)}`);
+  if (status.data?.connection_state !== 'ready') throw new Error(`Connection state is not ready: ${JSON.stringify(status)}`);
 
   const tracks = envelope(await request('tools/call', {
     name: 'cubase_track', arguments: { action: 'list', options: { max_nodes: 32 } }
@@ -142,10 +156,14 @@ try {
       throw new Error(`MIDI Cubase import failed: ${JSON.stringify(midiImport)}`);
     }
     const observedNames = midiImport.data?.observed_track_names ?? [];
+    const strictMethods = ['direct_access_track_names', 'project_ocr_track_names', 'combined_track_names'];
     const postconditionObserved = observedNames.includes(smokeTrackName)
-      || (midiImport.data?.direct_node_delta ?? 0) > 0
-      || (midiImport.data?.direct_added_object_count ?? 0) > 0;
-    if (midiImport.status !== 'Ok' || midiImport.metadata?.verified !== true || !postconditionObserved) {
+      && strictMethods.includes(midiImport.data?.verification_method);
+    if (midiImport.status !== 'Ok' || midiImport.metadata?.verified !== true || !postconditionObserved
+        || typeof midiImport.data?.rendered_sha256 !== 'string'
+        || !Array.isArray(midiImport.data?.workflow_stages)
+        || (midiImport.data?.menu_fallback_count ?? 0) > 1
+        || (midiImport.data?.missing_expected_track_names ?? []).length !== 0) {
       throw new Error(`MIDI Cubase track postcondition failed for '${smokeTrackName}': ${JSON.stringify(midiImport)}`);
     }
   }
@@ -227,6 +245,8 @@ try {
   }
 
   process.stdout.write(JSON.stringify({
+    release_id: selected.release,
+    git_sha: selected.manifest.git_sha,
     driver_online: status.data.driver_online,
     cubase_version: status.data.cubase_version,
     api13_available: status.data.api13_available,

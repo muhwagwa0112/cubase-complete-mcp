@@ -1,5 +1,7 @@
 using System.Globalization;
+using System.Diagnostics;
 using System.IO;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using CubaseCompleteMcp.Core;
@@ -15,11 +17,12 @@ public sealed class CubaseController
     private readonly CubaseMidiSession _session;
     private readonly CubaseUiAutomation _ui;
     private readonly MidiCompositionService _compositions;
+    private readonly BuildIdentity _buildIdentity;
     private readonly KeyCommandCatalog? _commands;
 
     public CubaseController(CubasePaths paths, ConfirmationStore confirmations,
         CubaseProcessInspector processes, WinMmMidiTransport midi, CubaseMidiSession session,
-        CubaseUiAutomation ui, MidiCompositionService compositions)
+        CubaseUiAutomation ui, MidiCompositionService compositions, BuildIdentity buildIdentity)
     {
         _paths = paths;
         _confirmations = confirmations;
@@ -28,6 +31,7 @@ public sealed class CubaseController
         _session = session;
         _ui = ui;
         _compositions = compositions;
+        _buildIdentity = buildIdentity;
         try
         {
             _commands = KeyCommandCatalog.Load(paths.KeyCommandsFile);
@@ -40,8 +44,21 @@ public sealed class CubaseController
 
     public string? CommandCatalogWarning { get; }
 
-    public Task<BrokerResponse> HandleAsync(BrokerRequest request, CancellationToken cancellationToken) =>
-        HandleCoreAsync(request, false, cancellationToken);
+    public async Task<BrokerResponse> HandleAsync(BrokerRequest request, CancellationToken cancellationToken)
+    {
+        var compatibility = BrokerCompatibility.Evaluate(request.ClientProtocolVersion,
+            request.ClientReleaseId, _buildIdentity);
+        if (!compatibility.ProtocolCompatible)
+            return BrokerResponse.Failure(request.Id, ResultStatus.Error, "BROKER_PROTOCOL_MISMATCH",
+                $"Client pipe protocol {request.ClientProtocolVersion} is incompatible with broker protocol {CubaseConstants.PipeProtocolVersion}.");
+        var response = await HandleCoreAsync(request, false, cancellationToken).ConfigureAwait(false);
+        var warnings = response.Metadata?.Warnings.ToList() ?? [];
+        warnings.AddRange(compatibility.Warnings);
+        return response.Metadata is null ? response : response with
+        {
+            Metadata = response.Metadata with { Warnings = warnings }
+        };
+    }
 
     private async Task<BrokerResponse> HandleCoreAsync(BrokerRequest request, bool parentConfirmed,
         CancellationToken cancellationToken)
@@ -69,7 +86,7 @@ public sealed class CubaseController
 
             return operation switch
             {
-                "status" => await StatusAsync(request.Id, cancellationToken).ConfigureAwait(false),
+                "status" => await StatusAsync(request, cancellationToken).ConfigureAwait(false),
                 "capabilities.search" => Capabilities(request),
                 "capabilities.list" => AllCapabilities(request),
                 "commands.list" => Commands(request),
@@ -84,7 +101,7 @@ public sealed class CubaseController
                 "ui.inspect" => await UiInspectAsync(request).ConfigureAwait(false),
                 "ui.invoke" => UiInvoke(request),
                 "batch" => await BatchAsync(request, parentConfirmed, cancellationToken).ConfigureAwait(false),
-                "diagnostics" => await DiagnosticsAsync(request.Id, cancellationToken).ConfigureAwait(false),
+                "diagnostics" => await DiagnosticsAsync(request, cancellationToken).ConfigureAwait(false),
                 _ => BrokerResponse.Failure(request.Id, ResultStatus.Unsupported, "UNKNOWN_OPERATION",
                     $"Unknown broker operation '{request.Operation}'.")
             };
@@ -100,23 +117,37 @@ public sealed class CubaseController
         }
     }
 
-    private async Task<BrokerResponse> StatusAsync(string id, CancellationToken cancellationToken)
+    private async Task<BrokerResponse> StatusAsync(BrokerRequest request, CancellationToken cancellationToken)
     {
         var process = _processes.Inspect();
-        var ports = _midi.EnumeratePorts();
+        var driverOnline = process.Running && await _session.TryHandshakeAsync(TimeSpan.FromMilliseconds(900), cancellationToken).ConfigureAwait(false);
+        var runtime = _session.LoopMidiSnapshot;
+        var ports = runtime?.ObservedPorts ?? _midi.EnumeratePorts().ToArray();
         var midiInput = ports.Any(port => port.IsInput && port.Name.Equals(CubaseConstants.OutputPortName, StringComparison.OrdinalIgnoreCase));
         var midiOutput = ports.Any(port => !port.IsInput && port.Name.Equals(CubaseConstants.InputPortName, StringComparison.OrdinalIgnoreCase));
-        var driverOnline = process.Running && await _session.TryHandshakeAsync(TimeSpan.FromMilliseconds(900), cancellationToken).ConfigureAwait(false);
+        var restartRequired = process.Running && !driverOnline && runtime is { PortsAvailable: true, StartedByBroker: true };
+        var connectionState = driverOnline ? "ready"
+            : runtime?.Installed == false ? "loopmidi_missing"
+            : runtime?.AutostartResult is "invalid_executable" or "loopmidi_start_failed" ? "loopmidi_start_failed"
+            : runtime?.PortsAvailable != true ? "ports_missing"
+            : restartRequired ? "cubase_restart_required"
+            : "driver_handshake_timeout";
         var warnings = new List<string>();
         if (!midiInput || !midiOutput) warnings.Add("The required loopMIDI port pair is incomplete.");
         if (process.Running && !driverOnline) warnings.Add("Cubase is running, but the CompleteBridge v2 driver did not answer.");
+        if (restartRequired) warnings.Add("loopMIDI was started after Cubase; restart Cubase manually if MIDI Remote does not rebind the ports.");
+        if (IsReleaseMismatch(request)) warnings.Add("The MCP client and Broker are running from different Releases.");
         if (CommandCatalogWarning is not null) warnings.Add(CommandCatalogWarning);
         if (!IsApi13Version(process.Version)) warnings.Add("Cubase 15.0.20 or newer is required for MIDI Remote API v1.3 features.");
 
         var snapshot = new CubaseStatusSnapshot(process.Running, process.Version, process.ProcessId,
             process.WindowTitle, true, midiInput, midiOutput, driverOnline, IsApi13Version(process.Version),
-            _commands?.Commands.Count ?? 0, _commands?.CategoryCount ?? 0, _session.Revision, warnings.ToArray());
-        return BrokerResponse.Success(id, JsonSerializer.SerializeToNode(snapshot, PipeProtocol.JsonOptions),
+            _commands?.Commands.Count ?? 0, _commands?.CategoryCount ?? 0, _session.Revision, warnings.ToArray(),
+            connectionState, runtime?.Installed ?? File.Exists(LoopMidiRuntime.ExecutablePath),
+            runtime?.ProcessRunning ?? false, runtime?.AutostartAttempted ?? false,
+            runtime?.AutostartResult ?? "not_checked", runtime?.ConfiguredPorts ?? [], ports,
+            restartRequired, request.ClientReleaseId, _buildIdentity.ReleaseId, IsReleaseMismatch(request));
+        return BrokerResponse.Success(request.Id, JsonSerializer.SerializeToNode(snapshot, PipeProtocol.JsonOptions),
             "broker+winmm", true, sessionRevision: _session.Revision);
     }
 
@@ -327,6 +358,10 @@ public sealed class CubaseController
         var documentId = arguments["document_id"]?.GetValue<string>()
             ?? throw new ArgumentException("document_id is required.");
         var rendered = _compositions.RenderDocument(documentId, session);
+        var roundTrip = StandardMidiFile.Read(rendered.Bytes, rendered.Document.Name);
+        if (roundTrip.Ppq != rendered.Document.Ppq || roundTrip.Tracks.Count != rendered.Document.Tracks.Count)
+            throw new InvalidDataException("Rendered MIDI did not preserve its PPQ and track count during round-trip validation.");
+        var renderedSha256 = Convert.ToHexString(SHA256.HashData(rendered.Bytes)).ToLowerInvariant();
         var transportBefore = await _session.SendAsync("transport.get", null, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
         DriverReply? stopReply = null;
@@ -352,6 +387,19 @@ public sealed class CubaseController
         }
         catch (Exception error) { throw new InvalidOperationException($"MIDI import dialog recovery failed: {error.Message}", error); }
         DriverReply? commandReply = null;
+        var workflowStages = new JsonArray();
+        var stageTimings = new JsonObject();
+        var menuFallbackCount = 0;
+        void RecordStage(string label, JsonObject stage)
+        {
+            workflowStages.Add(new JsonObject
+            {
+                ["label"] = label,
+                ["stage"] = stage["stage"]?.DeepClone(),
+                ["elapsed_ms"] = stage["elapsed_ms"]?.DeepClone()
+            });
+            stageTimings[label] = stage["elapsed_ms"]?.DeepClone();
+        }
         bool reusedFileDialog;
         bool anyFileDialog;
         try
@@ -370,89 +418,121 @@ public sealed class CubaseController
                 return BrokerResponse.Failure(request.Id, ResultStatus.Error, commandReply.Error?.Code ?? "MIDI_IMPORT_COMMAND_FAILED",
                     commandReply.Error?.Message ?? "Cubase rejected the Import MIDI File command.", commandReply.Error?.Details, "midi_remote");
         }
-        JsonObject? projectChoiceBefore;
-        try
-        {
-            projectChoiceBefore = await _ui.ChooseExistingProjectForMidiImportAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception error) { throw new InvalidOperationException($"MIDI import project choice failed: {error.Message}", error); }
+        JsonObject stage;
+        try { stage = reusedFileDialog
+                ? new JsonObject { ["stage"] = "midi_file_dialog", ["elapsed_ms"] = 0 }
+                : await _ui.WaitForMidiImportStageAsync(5000, cancellationToken).ConfigureAwait(false); }
+        catch (Exception error) { throw new InvalidOperationException($"MIDI import stage detection failed: {error.Message}", error); }
+        RecordStage("after_command", stage);
+        JsonObject? projectChoiceBefore = null;
         JsonObject? menuFallback = null;
-        if (projectChoiceBefore is null && !_ui.HasOpenMidiImportFileDialog())
+        if (stage["stage"]?.GetValue<string>() == "project_choice")
+        {
+            try
+            {
+                projectChoiceBefore = await _ui.ChooseExistingProjectForMidiImportAsync(cancellationToken).ConfigureAwait(false);
+                stage = await _ui.WaitForMidiImportStageAsync(5000, cancellationToken).ConfigureAwait(false);
+                RecordStage("after_project_choice", stage);
+            }
+            catch (Exception error) { throw new InvalidOperationException($"MIDI import project choice failed: {error.Message}", error); }
+        }
+        if (MidiImportWorkflowPolicy.ShouldUseMenuFallback(stage["stage"]?.GetValue<string>(), menuFallbackCount))
         {
             try
             {
                 menuFallback = await _ui.OpenMidiImportDialogViaMenuAsync(cancellationToken).ConfigureAwait(false);
-                projectChoiceBefore = await _ui.ChooseExistingProjectForMidiImportAsync(cancellationToken).ConfigureAwait(false);
+                menuFallbackCount = 1;
+                stage = await _ui.WaitForMidiImportStageAsync(5000, cancellationToken).ConfigureAwait(false);
+                RecordStage("after_menu_fallback", stage);
+                if (stage["stage"]?.GetValue<string>() == "project_choice")
+                {
+                    projectChoiceBefore = await _ui.ChooseExistingProjectForMidiImportAsync(cancellationToken).ConfigureAwait(false);
+                    stage = await _ui.WaitForMidiImportStageAsync(5000, cancellationToken).ConfigureAwait(false);
+                    RecordStage("after_fallback_project_choice", stage);
+                }
             }
             catch (Exception error) { throw new InvalidOperationException($"MIDI import menu fallback failed: {error.Message}", error); }
         }
+        if (stage["stage"]?.GetValue<string>() != "midi_file_dialog" && !_ui.HasOpenMidiImportFileDialog())
+            throw new InvalidOperationException("MIDI import did not reach a file dialog after the command and single menu fallback.");
         JsonObject dialog;
         try { dialog = await _ui.SubmitFileDialogAsync(rendered.Path, cancellationToken).ConfigureAwait(false); }
         catch (Exception error) { throw new InvalidOperationException($"MIDI import file submission failed: {error.Message}", error); }
-        JsonObject? projectChoiceAfter;
-        try
+        var duplicateFileDialog = dialog["dialog_closed"]?.GetValue<bool>() != true;
+        JsonObject? projectChoiceAfter = null;
+        JsonObject? options = null;
+        if (!duplicateFileDialog)
         {
-            // Cubase can ask whether to create a new project either before the file picker or
-            // after the selected MIDI file has been accepted, depending on its import settings.
-            projectChoiceAfter = await _ui.ChooseExistingProjectForMidiImportAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception error) { throw new InvalidOperationException($"MIDI import post-file project choice failed: {error.Message}", error); }
-        var projectChoice = projectChoiceAfter ?? projectChoiceBefore;
-        JsonObject? options;
-        try
-        {
-            options = arguments["accept_import_options"]?.GetValue<bool>() == false
-                ? null : await _ui.AcceptImportOptionsAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception error) { throw new InvalidOperationException($"MIDI import options failed: {error.Message}", error); }
-        await Task.Delay(400, cancellationToken).ConfigureAwait(false);
-        bool fileDialogRemains;
-        try { fileDialogRemains = _ui.HasOpenFileDialog(); }
-        catch (Exception error) { throw new InvalidOperationException($"MIDI import postcondition failed: {error.Message}", error); }
-        DriverReply after = default!;
-        for (var attempt = 0; attempt < 10; attempt++)
-        {
-            after = await _session.SendAsync("direct.get", new JsonObject
+            try
             {
-                ["root"] = "mixer", ["include_parameters"] = false, ["max_nodes"] = 1024, ["max_depth"] = 4
-            }, cancellationToken: cancellationToken).ConfigureAwait(false);
-            if (after.Ok && after.Data?["root"]?.GetValue<string>() == "mixer") break;
-            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+                stage = await _ui.WaitForMidiImportStageAsync(3000, cancellationToken).ConfigureAwait(false);
+                RecordStage("after_file_submit", stage);
+                if (stage["stage"]?.GetValue<string>() == "project_choice")
+                {
+                    projectChoiceAfter = await _ui.ChooseExistingProjectForMidiImportAsync(cancellationToken).ConfigureAwait(false);
+                    stage = await _ui.WaitForMidiImportStageAsync(3000, cancellationToken).ConfigureAwait(false);
+                    RecordStage("after_post_file_project_choice", stage);
+                }
+                if (stage["stage"]?.GetValue<string>() == "import_options"
+                    && arguments["accept_import_options"]?.GetValue<bool>() != false)
+                    options = await _ui.AcceptImportOptionsAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception error) { throw new InvalidOperationException($"MIDI import post-file workflow failed: {error.Message}", error); }
         }
-        var expectedTrackNames = rendered.Document.Tracks.Skip(1).Select(track => track.Name)
-            .Where(name => !string.IsNullOrWhiteSpace(name)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var projectChoice = projectChoiceAfter ?? projectChoiceBefore;
+        bool fileDialogRemains;
+        try { fileDialogRemains = duplicateFileDialog || _ui.HasOpenMidiImportFileDialog() || _ui.HasOpenFileDialog(); }
+        catch (Exception error) { throw new InvalidOperationException($"MIDI import postcondition failed: {error.Message}", error); }
+        DriverReply after = before;
+        string[] directNames = [];
+        JsonObject? uiPostcondition = null;
+        string? observedProjectText = null;
+        string? ocrObservationError = null;
+        var verification = MidiImportVerification.Evaluate(rendered.Document, directNames,
+            observedProjectText, fileDialogRemains, after.Ok);
+        if (!duplicateFileDialog)
+        {
+            var verificationTimer = Stopwatch.StartNew();
+            long lastOcrAt = -1000;
+            while (verificationTimer.Elapsed < TimeSpan.FromSeconds(10))
+            {
+                after = await _session.SendAsync("direct.get", new JsonObject
+                {
+                    ["root"] = "mixer", ["include_parameters"] = false, ["max_nodes"] = 1024, ["max_depth"] = 4
+                }, cancellationToken: cancellationToken).ConfigureAwait(false);
+                directNames = DirectNames(after.Data?["nodes"] as JsonArray);
+                fileDialogRemains = _ui.HasOpenMidiImportFileDialog() || _ui.HasOpenFileDialog();
+                var directResult = MidiImportVerification.Evaluate(rendered.Document, directNames,
+                    observedProjectText, fileDialogRemains, after.Ok);
+                if (!directResult.Verified && verificationTimer.ElapsedMilliseconds - lastOcrAt >= 1000)
+                {
+                    try
+                    {
+                        uiPostcondition = await _ui.ObserveProjectTextAsync(cancellationToken).ConfigureAwait(false);
+                        observedProjectText = uiPostcondition["text"]?.GetValue<string>() ?? string.Empty;
+                        ocrObservationError = null;
+                    }
+                    catch (Exception error) when (error is InvalidOperationException or IOException)
+                    {
+                        ocrObservationError = error.Message;
+                    }
+                    lastOcrAt = verificationTimer.ElapsedMilliseconds;
+                }
+                verification = MidiImportVerification.Evaluate(rendered.Document, directNames,
+                    observedProjectText, fileDialogRemains, after.Ok);
+                if (verification.Verified) break;
+                await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+            }
+        }
         var beforeNodeCount = before.Data?["nodes"] is JsonArray beforeNodes ? beforeNodes.Count : 0;
         var afterNodeCount = after.Data?["nodes"] is JsonArray afterNodes ? afterNodes.Count : 0;
         var directNodeDelta = afterNodeCount - beforeNodeCount;
         var beforeObjectIds = DirectObjectIds(before.Data?["nodes"] as JsonArray);
         var afterObjectIds = DirectObjectIds(after.Data?["nodes"] as JsonArray);
         var addedObjectIds = afterObjectIds.Except(beforeObjectIds, StringComparer.Ordinal).ToArray();
-        var directObservedTrackNames = after.Data?["nodes"] is JsonArray nodes
-            ? nodes.OfType<JsonObject>().SelectMany(node => new[]
-                {
-                    node["title"]?.GetValue<string>(), node["unique_name"]?.GetValue<string>()
-                })
-                .Where(name => !string.IsNullOrWhiteSpace(name)).Cast<string>()
-                .Where(name => expectedTrackNames.Contains(name, StringComparer.OrdinalIgnoreCase))
-                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
-            : [];
-        var observedTrackNames = new HashSet<string>(directObservedTrackNames, StringComparer.OrdinalIgnoreCase);
-        JsonObject? uiPostcondition = null;
-        if (directNodeDelta <= 0 && !expectedTrackNames.All(observedTrackNames.Contains))
-        {
-            for (var attempt = 0; attempt < 3 && !expectedTrackNames.All(observedTrackNames.Contains); attempt++)
-            {
-                if (attempt > 0) await Task.Delay(250, cancellationToken).ConfigureAwait(false);
-                uiPostcondition = await _ui.ObserveProjectTextAsync(cancellationToken).ConfigureAwait(false);
-                var observedText = uiPostcondition["text"]?.GetValue<string>() ?? string.Empty;
-                foreach (var expected in expectedTrackNames.Where(expected =>
-                             observedText.Contains(expected, StringComparison.OrdinalIgnoreCase)))
-                    observedTrackNames.Add(expected);
-            }
-        }
-        var trackNamesVerified = expectedTrackNames.Length > 0 && expectedTrackNames.All(observedTrackNames.Contains);
-        var graphGrowthVerified = directNodeDelta > 0 || addedObjectIds.Length > 0;
-        var verified = !fileDialogRemains && after.Ok && (trackNamesVerified || graphGrowthVerified);
+        var unverifiedReason = duplicateFileDialog ? "duplicate_midi_file_dialog" : verification.UnverifiedReason;
+        var missingExpectedTrackNames = verification.ExpectedTrackNames
+            .Except(verification.ObservedTrackNames, StringComparer.Ordinal).ToArray();
         var beforeSummary = DirectObservationSummary(before);
         var afterSummary = DirectObservationSummary(after);
         var uiPostconditionSummary = uiPostcondition is null ? null : new JsonObject
@@ -465,33 +545,40 @@ public sealed class CubaseController
         var data = new JsonObject
         {
             ["document"] = MidiCompositionService.Summary(rendered.Document), ["rendered_path"] = rendered.Path,
-            ["rendered_bytes"] = rendered.Bytes.Length, ["project_choice"] = projectChoice?.DeepClone(),
+            ["rendered_bytes"] = rendered.Bytes.Length, ["rendered_sha256"] = renderedSha256,
+            ["round_trip_document"] = MidiCompositionService.Summary(roundTrip), ["project_choice"] = projectChoice?.DeepClone(),
             ["project_choice_before_file"] = projectChoiceBefore?.DeepClone(),
             ["project_choice_after_file"] = projectChoiceAfter?.DeepClone(),
             ["transport_before"] = transportBefore.Data?.DeepClone(), ["transport_stop"] = stopReply?.Data?.DeepClone(),
             ["recovered_project_folder_dialog"] = recoveredProjectFolderDialog,
             ["reused_open_file_dialog"] = reusedFileDialog,
             ["menu_fallback"] = menuFallback,
+            ["menu_fallback_count"] = menuFallbackCount,
+            ["workflow_stages"] = workflowStages,
+            ["stage_timings_ms"] = stageTimings,
             ["file_dialog"] = dialog, ["import_options"] = options,
             ["file_dialog_remains"] = fileDialogRemains,
-            ["expected_track_names"] = new JsonArray(expectedTrackNames.Select(name => (JsonNode?)JsonValue.Create(name)).ToArray()),
-            ["observed_track_names"] = new JsonArray(observedTrackNames.Select(name => (JsonNode?)JsonValue.Create(name)).ToArray()),
-            ["track_names_verified"] = trackNamesVerified,
+            ["expected_track_names"] = new JsonArray(verification.ExpectedTrackNames.Select(name => (JsonNode?)JsonValue.Create(name)).ToArray()),
+            ["direct_observed_track_names"] = new JsonArray(verification.DirectObservedTrackNames.Select(name => (JsonNode?)JsonValue.Create(name)).ToArray()),
+            ["ocr_observed_track_names"] = new JsonArray(verification.OcrObservedTrackNames.Select(name => (JsonNode?)JsonValue.Create(name)).ToArray()),
+            ["observed_track_names"] = new JsonArray(verification.ObservedTrackNames.Select(name => (JsonNode?)JsonValue.Create(name)).ToArray()),
+            ["track_names_verified"] = verification.Verified,
+            ["unverified_reason"] = unverifiedReason,
+            ["missing_expected_track_names"] = new JsonArray(missingExpectedTrackNames
+                .Select(name => (JsonNode?)JsonValue.Create(name)).ToArray()),
             ["direct_node_delta"] = directNodeDelta,
             ["direct_added_object_count"] = addedObjectIds.Length,
-            ["verification_method"] = trackNamesVerified ? "direct_access_or_project_ocr_track_name"
-                : graphGrowthVerified ? "direct_access_mixer_graph_change" : "none",
+            ["verification_method"] = verification.Method,
             ["track_postcondition"] = uiPostconditionSummary,
+            ["ocr_observation_error"] = ocrObservationError,
             ["cubase_observation_before"] = beforeSummary.DeepClone(),
             ["cubase_observation_after"] = afterSummary.DeepClone(),
             ["import_submitted"] = true
         };
         return BrokerResponse.Success(request.Id, data,
-            menuFallback is null ? "smf+midi_remote_command+ui_automation" : "smf+midi_remote_command+ui_automation_menu_fallback", verified,
+            menuFallback is null ? "smf+midi_remote_command+ui_automation" : "smf+midi_remote_command+ui_automation_menu_fallback", verification.Verified,
             before: beforeSummary, after: afterSummary,
-            warnings: verified && !trackNamesVerified
-                ? ["Cubase verified the import by mixer-object graph growth; the exact track name was outside the visible/API-exposed region."]
-                : verified ? [] : ["The MIDI file was submitted, but Cubase did not expose a conclusive imported-track postcondition."],
+            warnings: verification.Verified ? [] : ["The MIDI file was submitted, but every expected track name was not conclusively observed in Cubase."],
             sessionRevision: Math.Max(commandReply?.Revision ?? 0, after.Revision));
     }
 
@@ -508,6 +595,13 @@ public sealed class CubaseController
         ? new HashSet<string>(StringComparer.Ordinal)
         : nodes.OfType<JsonObject>().Select(node => node["unique_id"]?.GetValue<string>())
             .Where(id => !string.IsNullOrWhiteSpace(id)).Cast<string>().ToHashSet(StringComparer.Ordinal);
+
+    private static string[] DirectNames(JsonArray? nodes) => nodes is null ? []
+        : nodes.OfType<JsonObject>().SelectMany(node => new[]
+            {
+                node["title"]?.GetValue<string>(), node["unique_name"]?.GetValue<string>()
+            })
+            .Where(name => !string.IsNullOrWhiteSpace(name)).Cast<string>().ToArray();
 
     private async Task<BrokerResponse> UiInspectAsync(BrokerRequest request)
     {
@@ -537,7 +631,8 @@ public sealed class CubaseController
             if (node is not JsonObject item) throw new ArgumentException("Every batch item must be an object.");
             var child = new BrokerRequest($"{request.Id}:{responses.Count}",
                 item["operation"]?.GetValue<string>() ?? throw new ArgumentException("Batch item operation is required."),
-                item["arguments"] as JsonObject, null, request.ClientSessionId);
+                item["arguments"] as JsonObject, null, request.ClientSessionId,
+                request.ClientProtocolVersion, request.ClientReleaseId);
             var response = await HandleCoreAsync(child, parentConfirmed, cancellationToken).ConfigureAwait(false);
             responses.Add(JsonSerializer.SerializeToNode(response, PipeProtocol.JsonOptions));
             if (response.Status is not ResultStatus.Ok and not ResultStatus.Unverified) break;
@@ -549,9 +644,10 @@ public sealed class CubaseController
             sessionRevision: _session.Revision);
     }
 
-    private async Task<BrokerResponse> DiagnosticsAsync(string id, CancellationToken cancellationToken)
+    private async Task<BrokerResponse> DiagnosticsAsync(BrokerRequest request, CancellationToken cancellationToken)
     {
-        var status = await StatusAsync(id + ":status", cancellationToken).ConfigureAwait(false);
+        var statusRequest = request with { Id = request.Id + ":status", Operation = "status" };
+        var status = await StatusAsync(statusRequest, cancellationToken).ConfigureAwait(false);
         var ports = _midi.EnumeratePorts();
         var data = new JsonObject
         {
@@ -559,10 +655,20 @@ public sealed class CubaseController
             ["midi_ports"] = JsonSerializer.SerializeToNode(ports, PipeProtocol.JsonOptions),
             ["midi_last_error"] = _midi.LastError,
             ["event_state"] = _session.EventState,
-            ["paths"] = JsonSerializer.SerializeToNode(_paths, PipeProtocol.JsonOptions)
+            ["paths"] = JsonSerializer.SerializeToNode(_paths, PipeProtocol.JsonOptions),
+            ["client_release_id"] = request.ClientReleaseId,
+            ["broker_release_id"] = _buildIdentity.ReleaseId,
+            ["release_mismatch"] = IsReleaseMismatch(request),
+            ["pipe_protocol_version"] = CubaseConstants.PipeProtocolVersion,
+            ["broker_executable_path"] = _buildIdentity.ExecutablePath
         };
-        return BrokerResponse.Success(id, data, "broker_diagnostics", true, sessionRevision: _session.Revision);
+        return BrokerResponse.Success(request.Id, data, "broker_diagnostics", true, sessionRevision: _session.Revision);
     }
+
+    private bool IsReleaseMismatch(BrokerRequest request) =>
+        !string.IsNullOrWhiteSpace(request.ClientReleaseId)
+        && !string.IsNullOrWhiteSpace(_buildIdentity.ReleaseId)
+        && !request.ClientReleaseId.Equals(_buildIdentity.ReleaseId, StringComparison.Ordinal);
 
     private async Task<BrokerResponse> DriverAsync(BrokerRequest request, string driverOperation,
         CancellationToken cancellationToken, JsonObject? driverArguments = null)

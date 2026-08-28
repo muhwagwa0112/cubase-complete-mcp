@@ -6,10 +6,16 @@ namespace CubaseCompleteMcp.Core;
 public sealed class BrokerClient : IAsyncDisposable
 {
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly BuildIdentity _identity = BuildIdentityService.Current();
     private NamedPipeClientStream? _pipe;
 
     public async Task<BrokerResponse> SendAsync(BrokerRequest request, CancellationToken cancellationToken = default)
     {
+        request = request with
+        {
+            ClientProtocolVersion = request.ClientProtocolVersion ?? _identity.PipeProtocolVersion,
+            ClientReleaseId = request.ClientReleaseId ?? _identity.ReleaseId
+        };
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {

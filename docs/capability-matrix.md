@@ -2,7 +2,7 @@
 
 | Area | Primary path | Support | Verification contract |
 |---|---|---|---|
-| Status, ports, version | Broker / WinMM | Full | Direct process and port observation |
+| Status, ports, version | Broker / WinMM | Full | Cubase process, guarded loopMIDI autostart, configured/observed ports, connection state, driver handshake and client/Broker Release identity |
 | 69 categories / 2,777 commands | Generated command bindings | Complete classified catalog; execution context-dependent | Exact ID/name plus v1.3 `canPerform`; execution remains `UNVERIFIED` without a state postcondition |
 | Play, stop, record, cycle, click, tempo, locators | High-level MIDI Remote bindings | Full after live validation | State callbacks and session revision |
 | Track enumeration | Mixer DirectAccess | Dynamic | Fresh object traversal |
@@ -17,7 +17,7 @@
 | Tempo/time/key maps, markers, lyrics, SysEx | `cubase_midi` meta events | Full | Standards-compliant SMF encoding/decoding |
 | Quantize, transpose, humanize, range replacement | `cubase_midi` transforms | Full | Deterministic mutation summary; replacement requires confirmation |
 | MIDI file import/export | SMF format 0/1 | Full for PPQ files | Header/track/event validation, SHA-256 and decode round-trip |
-| Generated MIDI import into Cubase | Command Binding plus owned file dialog | Command/UI hybrid | Rendered file hash, dialog submission and before/after mixer traversal |
+| Generated MIDI import into Cubase | Command Binding plus owned file dialog | Command/UI hybrid | Rendered file hash/round-trip, dialog closure and every expected track name observed through DirectAccess/OCR |
 | Plugin slot assignment | API v1.3 plugin manager | Feature-detected | API return plus refreshed slot traversal |
 | Control Room / Quick Controls | DirectAccess roots | Dynamic | Fresh traversal/read-back |
 | Save, new, open, close, import/export | Key Command then UI | Mixed | File/window/project postcondition required |

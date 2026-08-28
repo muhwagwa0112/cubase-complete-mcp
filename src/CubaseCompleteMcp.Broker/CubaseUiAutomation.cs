@@ -181,20 +181,14 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                     submissionAttempted = true;
                     InvokeButton(button);
 
-                    var closed = false;
-                    for (var closeAttempt = 0; closeAttempt < 30; closeAttempt++)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        try { _ = dialog.Current.Name; }
-                        catch (Exception ex) when (IsUnavailableElement(ex)) { closed = true; break; }
-                        await Task.Delay(100, cancellationToken).ConfigureAwait(false);
-                    }
-                    if (!closed)
-                        throw new InvalidOperationException("Cubase kept the file dialog open after the Open/Import action.");
+                    var handle = new IntPtr(dialog.Current.NativeWindowHandle);
+                    var closed = await WaitForFileDialogToCloseAsync(process.ProcessId.Value, handle,
+                        dialog, title, cancellationToken).ConfigureAwait(false);
                     return new JsonObject
                     {
                         ["dialog_title"] = title, ["button"] = buttonName, ["path"] = Path.GetFullPath(absolutePath),
-                        ["submitted"] = true, ["dialog_closed"] = closed
+                        ["submitted"] = true, ["dialog_closed"] = closed,
+                        ["unverified_reason"] = MidiImportWorkflowPolicy.SubmissionUnverifiedReason(closed)
                     };
                 }
                 catch (Exception ex) when (IsUnavailableElement(ex))
@@ -202,28 +196,15 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                     unavailable = ex;
                     if (submissionAttempted)
                     {
-                        await Task.Delay(150, cancellationToken).ConfigureAwait(false);
-                        try
+                        var closed = await WaitForFileDialogToCloseAsync(process.ProcessId.Value,
+                            IntPtr.Zero, dialog, title, cancellationToken).ConfigureAwait(false);
+                        return new JsonObject
                         {
-                            if (FindMidiImportFileDialog(process.ProcessId.Value) is null)
-                            {
-                                return new JsonObject
-                                {
-                                    ["dialog_title"] = title, ["button"] = buttonName,
-                                    ["path"] = Path.GetFullPath(absolutePath), ["submitted"] = true,
-                                    ["dialog_closed"] = true, ["fallback"] = "uia_invoke_dialog_replaced"
-                                };
-                            }
-                        }
-                        catch (Exception replacementError) when (IsUnavailableElement(replacementError))
-                        {
-                            return new JsonObject
-                            {
-                                ["dialog_title"] = title, ["button"] = buttonName,
-                                ["path"] = Path.GetFullPath(absolutePath), ["submitted"] = true,
-                                ["dialog_closed"] = true, ["fallback"] = "uia_invoke_dialog_replaced"
-                            };
-                        }
+                            ["dialog_title"] = title, ["button"] = buttonName,
+                            ["path"] = Path.GetFullPath(absolutePath), ["submitted"] = true,
+                            ["dialog_closed"] = closed, ["fallback"] = "uia_invoke_dialog_replaced",
+                            ["unverified_reason"] = MidiImportWorkflowPolicy.SubmissionUnverifiedReason(closed)
+                        };
                     }
                     var keyboardResult = await TrySubmitFileDialogByKeyboardAsync(
                         process.ProcessId.Value, absolutePath, cancellationToken).ConfigureAwait(false);
@@ -266,6 +247,28 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         return null;
     }
 
+    public async Task<JsonObject> WaitForMidiImportStageAsync(int timeoutMilliseconds,
+        CancellationToken cancellationToken)
+    {
+        var process = processInspector.Inspect();
+        if (!process.Running || process.ProcessId is null)
+            throw new InvalidOperationException("Cubase is not running.");
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        while (stopwatch.ElapsedMilliseconds < timeoutMilliseconds)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var processId = process.ProcessId.Value;
+            if (FindMidiImportProjectChoice(processId) is not null)
+                return new JsonObject { ["stage"] = "project_choice", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
+            if (FindMidiImportFileDialog(processId) is not null)
+                return new JsonObject { ["stage"] = "midi_file_dialog", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
+            if (FindImportOptionsDialog(processId) is not null)
+                return new JsonObject { ["stage"] = "import_options", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        return new JsonObject { ["stage"] = "none", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
+    }
+
     public async Task<JsonObject?> AcceptImportOptionsAsync(CancellationToken cancellationToken)
     {
         var process = processInspector.Inspect();
@@ -273,7 +276,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         for (var attempt = 0; attempt < 30; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var dialog = FindModalDialog(process.ProcessId.Value, ["import", "midi", "가져오기"]);
+            var dialog = FindImportOptionsDialog(process.ProcessId.Value);
             if (dialog is not null)
             {
                 var button = FindButton(dialog, ["ok", "확인", "import", "가져오기"]);
@@ -380,6 +383,25 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
 
     private static AutomationElement? FindMidiImportFileDialog(int processId)
     {
+        // Windows common-item dialogs can be owned by Cubase without appearing as a
+        // RootElement child for the Cubase process. Resolve the native top-level
+        // window first, then bridge back into UI Automation for the editable field
+        // and Open button. The native lookup is still constrained to a recognized
+        // MIDI title and a rectangle contained by a Cubase window.
+        var nativeDialog = FindContainedDialogWindow(processId,
+            ["Import MIDI File", "MIDI 파일 가져오기", "MIDI 파일 열기"]);
+        if (nativeDialog != IntPtr.Zero)
+        {
+            try
+            {
+                var candidate = AutomationElement.FromHandle(nativeDialog);
+                if (candidate is not null && IsMidiImportDialogTitle(candidate.Current.Name)
+                    && FindFileNameEdit(candidate) is not null && FindMidiImportAcceptButton(candidate) is not null)
+                    return candidate;
+            }
+            catch (Exception ex) when (IsUnavailableElement(ex)) { }
+        }
+
         var titleCondition = new OrCondition(
             new PropertyCondition(AutomationElement.NameProperty, "Import MIDI File"),
             new PropertyCondition(AutomationElement.NameProperty, "Import MIDI File..."),
@@ -476,6 +498,13 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                             ["dialog_closed"] = true, ["fallback"] = "common_file_dialog_win32"
                         };
                     }
+                    return new JsonObject
+                    {
+                        ["dialog_title"] = title, ["button"] = button.Current.Name,
+                        ["path"] = Path.GetFullPath(absolutePath), ["submitted"] = true,
+                        ["dialog_closed"] = false, ["fallback"] = "common_file_dialog_win32",
+                        ["unverified_reason"] = MidiImportWorkflowPolicy.SubmissionUnverifiedReason(false)
+                    };
                 }
 
                 var editRectangle = edit.Current.BoundingRectangle;
@@ -492,16 +521,14 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                     await Task.Delay(100, cancellationToken).ConfigureAwait(false);
                     ClickScreenPoint((int)(buttonRectangle.X + buttonRectangle.Width / 2),
                         (int)(buttonRectangle.Y + buttonRectangle.Height / 2));
-                    // Return control immediately: Cubase can replace the file picker with
-                    // its "create a new project?" prompt. The controller must choose No
-                    // before any further keyboard fallback can activate the default button.
-                    await Task.Delay(150, cancellationToken).ConfigureAwait(false);
+                    var boundedClosed = await WaitForFileDialogToCloseAsync(processId, handle,
+                        dialog, title, cancellationToken).ConfigureAwait(false);
                     return new JsonObject
                     {
                         ["dialog_title"] = title, ["button"] = button.Current.Name,
                         ["path"] = Path.GetFullPath(absolutePath), ["submitted"] = true,
-                        ["dialog_closed"] = false, ["fallback"] = "common_file_dialog_bounded_click",
-                        ["requires_post_submit_verification"] = true
+                        ["dialog_closed"] = boundedClosed, ["fallback"] = "common_file_dialog_bounded_click",
+                        ["unverified_reason"] = MidiImportWorkflowPolicy.SubmissionUnverifiedReason(boundedClosed)
                     };
                 }
             }
@@ -520,12 +547,12 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         SendKeyChord("ENTER");
 
         var closed = await WaitForFileDialogToCloseAsync(processId, handle, dialog, title, cancellationToken).ConfigureAwait(false);
-        if (!closed) return null;
         return new JsonObject
         {
             ["dialog_title"] = title, ["button"] = "keyboard:Alt+N/Enter",
             ["path"] = Path.GetFullPath(absolutePath), ["submitted"] = true,
-            ["dialog_closed"] = closed, ["fallback"] = "common_file_dialog_keyboard"
+            ["dialog_closed"] = closed, ["fallback"] = "common_file_dialog_keyboard",
+            ["unverified_reason"] = MidiImportWorkflowPolicy.SubmissionUnverifiedReason(closed)
         };
     }
 
@@ -533,17 +560,13 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         int processId, IntPtr dialogHandle, AutomationElement dialog, string originalTitle,
         CancellationToken cancellationToken)
     {
-        for (var attempt = 0; attempt < 30; attempt++)
+        var consecutiveAbsent = 0;
+        for (var attempt = 0; attempt < 50; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (dialogHandle != IntPtr.Zero && !IsWindow(dialogHandle)) return true;
-            try
-            {
-                if (!dialog.Current.Name.Equals(originalTitle, StringComparison.Ordinal)) return true;
-            }
-            catch (Exception ex) when (IsUnavailableElement(ex)) { return true; }
-            try { if (FindMidiImportFileDialog(processId) is null) return true; }
-            catch (Exception ex) when (IsUnavailableElement(ex)) { return true; }
+            try { consecutiveAbsent = FindMidiImportFileDialog(processId) is null ? consecutiveAbsent + 1 : 0; }
+            catch (Exception ex) when (IsUnavailableElement(ex)) { consecutiveAbsent = 0; }
+            if (MidiImportWorkflowPolicy.IsFileDialogClosureStable(consecutiveAbsent)) return true;
             await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         }
         return false;
@@ -564,6 +587,27 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                 if (FindButton(window, ["create", "생성"]) is not null
                     && FindButton(window, ["cancel", "취소"]) is not null
                     && FindButton(window, ["no", "아니요"]) is not null)
+                    return window;
+            }
+            catch (Exception ex) when (IsUnavailableElement(ex)) { }
+        }
+        return null;
+    }
+
+    private static AutomationElement? FindImportOptionsDialog(int processId)
+    {
+        foreach (var window in FindProcessWindowCandidates(processId))
+        {
+            try
+            {
+                var title = window.Current.Name;
+                if (IsMidiImportDialogTitle(title) || FindFileNameEdit(window) is not null) continue;
+                if (FindButton(window, ["create", "생성"]) is not null
+                    && FindButton(window, ["no", "아니요"]) is not null) continue;
+                if ((title.Contains("import", StringComparison.OrdinalIgnoreCase)
+                        || title.Contains("midi", StringComparison.OrdinalIgnoreCase)
+                        || title.Contains("가져오기", StringComparison.OrdinalIgnoreCase))
+                    && FindButton(window, ["ok", "확인", "import", "가져오기"]) is not null)
                     return window;
             }
             catch (Exception ex) when (IsUnavailableElement(ex)) { }

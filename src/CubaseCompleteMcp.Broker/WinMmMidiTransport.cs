@@ -1,11 +1,10 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using CubaseCompleteMcp.Core;
 using Microsoft.Extensions.Logging;
 
 namespace CubaseCompleteMcp.Broker;
-
-public sealed record MidiPortInfo(uint Id, string Name, bool IsInput);
 
 public sealed class WinMmMidiTransport : IAsyncDisposable
 {
@@ -35,14 +34,14 @@ public sealed class WinMmMidiTransport : IAsyncDisposable
     public bool IsOpen => _inputHandle != IntPtr.Zero && _outputHandle != IntPtr.Zero;
     public string? LastError { get; private set; }
 
-    public IReadOnlyList<MidiPortInfo> EnumeratePorts()
+    public IReadOnlyList<MidiPortSnapshot> EnumeratePorts()
     {
-        var ports = new List<MidiPortInfo>();
+        var ports = new List<MidiPortSnapshot>();
         for (uint index = 0; index < midiInGetNumDevs(); index++)
         {
             if (midiInGetDevCapsW((UIntPtr)index, out var caps, (uint)Marshal.SizeOf<MidiInCaps>()) == 0)
             {
-                ports.Add(new MidiPortInfo(index, caps.Name, true));
+                ports.Add(new MidiPortSnapshot(index, caps.Name, true));
             }
         }
 
@@ -50,7 +49,7 @@ public sealed class WinMmMidiTransport : IAsyncDisposable
         {
             if (midiOutGetDevCapsW((UIntPtr)index, out var caps, (uint)Marshal.SizeOf<MidiOutCaps>()) == 0)
             {
-                ports.Add(new MidiPortInfo(index, caps.Name, false));
+                ports.Add(new MidiPortSnapshot(index, caps.Name, false));
             }
         }
 

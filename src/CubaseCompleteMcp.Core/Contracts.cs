@@ -12,6 +12,7 @@ public static class CubaseConstants
     public const string InputPortName = "CubaseMCP To Cubase";
     public const string OutputPortName = "CubaseMCP From Cubase";
     public const string ServerName = "cubase-complete";
+    public const int PipeProtocolVersion = 1;
     public const int MinimumCubaseBuildForApi13 = 20;
 }
 
@@ -40,7 +41,9 @@ public sealed record BrokerRequest(
     string Operation,
     JsonObject? Arguments = null,
     string? ConfirmationId = null,
-    string? ClientSessionId = null);
+    string? ClientSessionId = null,
+    int? ClientProtocolVersion = null,
+    string? ClientReleaseId = null);
 
 public sealed record BrokerResponse(
     string Id,
@@ -128,7 +131,20 @@ public sealed record CubaseStatusSnapshot(
     int CommandCount,
     int CommandCategoryCount,
     long SessionRevision,
-    string[] Warnings);
+    string[] Warnings,
+    string ConnectionState,
+    [property: JsonPropertyName("loopmidi_installed")] bool LoopMidiInstalled,
+    [property: JsonPropertyName("loopmidi_process_running")] bool LoopMidiProcessRunning,
+    [property: JsonPropertyName("loopmidi_autostart_attempted")] bool LoopMidiAutostartAttempted,
+    [property: JsonPropertyName("loopmidi_autostart_result")] string LoopMidiAutostartResult,
+    [property: JsonPropertyName("configured_loopmidi_ports")] string[] ConfiguredLoopMidiPorts,
+    MidiPortSnapshot[] ObservedMidiPorts,
+    bool CubaseRestartRequired,
+    string? ClientReleaseId,
+    string? BrokerReleaseId,
+    bool ReleaseMismatch);
+
+public sealed record MidiPortSnapshot(uint Id, string Name, bool IsInput);
 
 public sealed record KeyCommandDescriptor(string Id, string Category, string Name, int Index);
 

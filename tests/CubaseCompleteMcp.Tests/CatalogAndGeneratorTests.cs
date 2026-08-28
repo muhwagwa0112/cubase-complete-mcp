@@ -98,6 +98,8 @@ public sealed class CatalogAndGeneratorTests : IDisposable
         Assert.Contains(ui, action => action.Action == "key" && action.Target == "snapshot_window");
         Assert.Contains(ui, action => action.Action == "text" && action.Target == "snapshot_window");
         Assert.All(ui.Where(action => action.Action != "focus"), action => Assert.Equal(RiskLevel.Confirm, action.Risk));
+        Assert.All(ui.Where(action => action.Action is "invoke" or "toggle" or "select" or "expand" or "collapse"),
+            action => Assert.Contains("Always Unverified", action.VerificationContract, StringComparison.Ordinal));
     }
 
     private KeyCommandCatalog LoadCatalog() => KeyCommandCatalog.Load(WriteXml(

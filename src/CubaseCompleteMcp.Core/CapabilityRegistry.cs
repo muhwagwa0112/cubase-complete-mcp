@@ -47,11 +47,11 @@ public static class CapabilityRegistry
 
     public static UiActionDescriptor[] UiActions() =>
     [
-        new("invoke", "uia_element", RiskLevel.Confirm, "uia", ["element_token"], "Reinspect after action"),
-        new("toggle", "uia_element", RiskLevel.Confirm, "uia", ["element_token"], "Reinspect after action"),
-        new("select", "uia_element", RiskLevel.Confirm, "uia", ["element_token"], "Reinspect after action"),
-        new("expand", "uia_element", RiskLevel.Confirm, "uia", ["element_token"], "Reinspect after action"),
-        new("collapse", "uia_element", RiskLevel.Confirm, "uia", ["element_token"], "Reinspect after action"),
+        new("invoke", "uia_element", RiskLevel.Confirm, "uia", ["element_token"], "Always Unverified; call cubase_ui_inspect after action"),
+        new("toggle", "uia_element", RiskLevel.Confirm, "uia", ["element_token"], "Always Unverified; call cubase_ui_inspect after action"),
+        new("select", "uia_element", RiskLevel.Confirm, "uia", ["element_token"], "Always Unverified; call cubase_ui_inspect after action"),
+        new("expand", "uia_element", RiskLevel.Confirm, "uia", ["element_token"], "Always Unverified; call cubase_ui_inspect after action"),
+        new("collapse", "uia_element", RiskLevel.Confirm, "uia", ["element_token"], "Always Unverified; call cubase_ui_inspect after action"),
         new("set_value", "uia_element", RiskLevel.Confirm, "uia", ["element_token", "value"], "Reinspect and read value"),
         new("focus", "uia_element", RiskLevel.Low, "uia", ["element_token"], "Foreground owner and focus check"),
         new("click", "snapshot_coordinate", RiskLevel.Confirm, "guarded_send_input", ["snapshot_id", "x", "y"], "Reinspect after action"),
