@@ -75,7 +75,9 @@ child.stdout.on('data', chunk => {
       const capabilitySummary = capabilitiesEnvelope.data?.summary ?? {};
       const safe = tools.length === 14 && resources.length === 4 && !status.isError
         && commandCount === 2777 && safetyEnvelope.status === 'RequiresConfirmation'
-        && capabilitySummary.command_capabilities === 2777 && capabilitySummary.unclassified_commands === 0
+        && capabilitySummary.command_capabilities === 2777
+        && capabilitySummary.classified_commands + capabilitySummary.unclassified_commands === capabilitySummary.command_capabilities
+        && capabilitySummary.classified_commands > 0
         && capabilitySummary.direct_roots === 4 && capabilitySummary.ui_actions >= 14
         && capabilitySummary.midi_composition_actions >= 32
         && midiEnvelope.status === 'Ok' && midiEnvelope.data?.summary?.tracks === 1;

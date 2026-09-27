@@ -28,7 +28,7 @@ public static class MidiImportVerification
             .Where(name => validExpected.Contains(name, StringComparer.OrdinalIgnoreCase))
             .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         var ocr = validExpected.Where(name => !string.IsNullOrWhiteSpace(ocrText)
-            && ocrText.Contains(name, StringComparison.OrdinalIgnoreCase)).ToArray();
+            && ContainsBounded(ocrText!, name)).ToArray();
         var observed = direct.Concat(ocr).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         var allDirect = !ambiguous && expected.All(name => direct.Contains(name, StringComparer.OrdinalIgnoreCase));
         var allOcr = !ambiguous && expected.All(name => ocr.Contains(name, StringComparer.OrdinalIgnoreCase));
@@ -46,4 +46,28 @@ public static class MidiImportVerification
             : "expected_track_names_not_observed";
         return new MidiImportVerificationResult(verified, method, reason, expected, direct, ocr, observed);
     }
+
+    /// <summary>
+    /// Matches a track name only when the OCR text contains it as a whole token. A plain substring search would
+    /// report "Bass" as observed when the imported project only contains "Bassoon".
+    /// </summary>
+    private static bool ContainsBounded(string text, string name)
+    {
+        var index = text.IndexOf(name, StringComparison.OrdinalIgnoreCase);
+        while (index >= 0)
+        {
+            var before = index == 0 ? '\0' : text[index - 1];
+            var after = index + name.Length >= text.Length ? '\0' : text[index + name.Length];
+            if (!IsNameCharacter(before) && !IsNameCharacter(after))
+            {
+                return true;
+            }
+
+            index = text.IndexOf(name, index + 1, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return false;
+    }
+
+    private static bool IsNameCharacter(char value) => char.IsLetterOrDigit(value) || value == '_';
 }

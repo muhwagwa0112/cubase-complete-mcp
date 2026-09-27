@@ -216,8 +216,8 @@ public sealed class CubaseController
             {
                 ["domain_capabilities"] = StaticCapabilities().Length,
                 ["command_capabilities"] = commandCapabilities.Length,
-                ["classified_commands"] = commandCapabilities.Length,
-                ["unclassified_commands"] = 0,
+                ["classified_commands"] = commandCapabilities.Count(capability => capability.Classified),
+                ["unclassified_commands"] = commandCapabilities.Count(capability => !capability.Classified),
                 ["direct_roots"] = CapabilityRegistry.DirectRoots().Length,
                 ["ui_actions"] = CapabilityRegistry.UiActions().Length,
                 ["midi_composition_actions"] = CapabilityRegistry.MidiCompositionActions().Length,
@@ -625,7 +625,10 @@ public sealed class CubaseController
     {
         if (request.Arguments?["operations"] is not JsonArray operations || operations.Count == 0)
             throw new ArgumentException("batch.operations must be a non-empty array.");
+        var continueOnUnverified = request.Arguments?["continue_on_unverified"]?.GetValue<bool>() == true;
         var responses = new JsonArray();
+        var statuses = new List<ResultStatus>();
+        var stopReason = "completed";
         foreach (var node in operations)
         {
             if (node is not JsonObject item) throw new ArgumentException("Every batch item must be an object.");
@@ -635,12 +638,64 @@ public sealed class CubaseController
                 request.ClientProtocolVersion, request.ClientReleaseId);
             var response = await HandleCoreAsync(child, parentConfirmed, cancellationToken).ConfigureAwait(false);
             responses.Add(JsonSerializer.SerializeToNode(response, PipeProtocol.JsonOptions));
-            if (response.Status is not ResultStatus.Ok and not ResultStatus.Unverified) break;
+            statuses.Add(response.Status);
+            if (response.Status is ResultStatus.RequiresConfirmation)
+            {
+                stopReason = "confirmation_required";
+                break;
+            }
+
+            if (response.Status is not ResultStatus.Ok and not ResultStatus.Unverified)
+            {
+                stopReason = "failed";
+                break;
+            }
+
+            if (response.Status is ResultStatus.Unverified && !continueOnUnverified)
+            {
+                stopReason = "unverified_predecessor";
+                break;
+            }
         }
 
-        var allOk = responses.All(node => node?["status"]?.GetValue<string>() is "Ok" or "Unverified");
-        return BrokerResponse.Success(request.Id, new JsonObject { ["responses"] = responses }, "batch", allOk,
-            warnings: allOk ? [] : ["Batch stopped at the first failed operation. Automatic compensation is not available for every Cubase action."],
+        var executed = statuses.Count;
+        var ok = statuses.Count(status => status is ResultStatus.Ok);
+        var unverified = statuses.Count(status => status is ResultStatus.Unverified);
+        var pending = statuses.Count(status => status is ResultStatus.RequiresConfirmation);
+        var failed = executed - ok - unverified - pending;
+        var notExecuted = operations.Count - executed;
+        var outcome = stopReason switch
+        {
+            "confirmation_required" => "awaiting_confirmation",
+            "failed" => ok + unverified > 0 ? "partially_applied" : "failed",
+            _ when unverified > 0 || notExecuted > 0 => "unverified",
+            _ => "verified"
+        };
+        var warnings = new List<string>();
+        if (stopReason == "failed")
+            warnings.Add("Batch stopped at the first failed operation. Automatic compensation is not available for every Cubase action.");
+        if (stopReason == "unverified_predecessor")
+            warnings.Add("Batch stopped after an operation that could not be verified, because later operations may depend on it. Pass continue_on_unverified=true to run the remaining operations anyway.");
+        if (stopReason == "confirmation_required")
+            warnings.Add("Batch stopped at an operation that requires confirmation. No change was made for that operation; re-issue the batch with its confirmation_id.");
+        if (notExecuted > 0)
+            warnings.Add($"{notExecuted} of {operations.Count} batch operations were not executed.");
+
+        var data = new JsonObject
+        {
+            ["responses"] = responses,
+            ["total"] = operations.Count,
+            ["executed"] = executed,
+            ["not_executed"] = notExecuted,
+            ["ok"] = ok,
+            ["unverified"] = unverified,
+            ["failed"] = failed,
+            ["requires_confirmation"] = pending,
+            ["stopped_after_index"] = stopReason == "completed" ? null : executed - 1,
+            ["stop_reason"] = stopReason,
+            ["outcome"] = outcome
+        };
+        return BrokerResponse.Success(request.Id, data, "batch", ok == operations.Count, warnings: warnings,
             sessionRevision: _session.Revision);
     }
 
@@ -704,11 +759,12 @@ public sealed class CubaseController
     {
         var action = arguments?["action"]?.GetValue<string>()?.ToLowerInvariant();
         if (operation == "track" && action == "delete") return RiskLevel.Confirm;
+        if (operation == "transport" && action is "record_start" or "record_stop") return RiskLevel.Confirm;
         if (operation == "transport" && action == "record" && arguments?["enabled"]?.GetValue<bool>() != false) return RiskLevel.Confirm;
         if (operation == "project" && action is "overwrite" or "close_unsaved" or "save") return RiskLevel.Confirm;
         if (operation == "project" && action == "save_as" && arguments?["overwrite"]?.GetValue<bool>() == true) return RiskLevel.Confirm;
         if (operation == "project" && action is "close" or "new" or "revert") return RiskLevel.Confirm;
-        if (operation == "plugin" && action == "bulk_replace") return RiskLevel.Confirm;
+        if (operation == "plugin" && action is "assign" or "bulk_replace") return RiskLevel.Confirm;
         if (operation == "midi.compose" && action is "list" or "list_documents" or "get" or "get_document" or "inspect_file") return RiskLevel.None;
         if (operation == "midi.compose" && action is "delete" or "delete_document" or "remove_track" or "remove_part" or "replace_range") return RiskLevel.Confirm;
         if (operation == "midi.compose" && action is "render" or "render_file" or "export_file"
@@ -730,18 +786,27 @@ public sealed class CubaseController
         return SafetyPolicy.Classify(operation, arguments);
     }
 
-    private static string DescribeImpact(string operation, JsonObject? arguments) =>
-        operation switch
+    private static string DescribeImpact(string operation, JsonObject? arguments)
+    {
+        var action = arguments?["action"]?.GetValue<string>()?.ToLowerInvariant();
+        return operation switch
         {
             "track" => "Delete the selected Cubase track. This may remove events and automation.",
+            "transport" when action == "record" && arguments?["enabled"]?.GetValue<bool>() == false
+                => "Stop the current Cubase recording.",
+            "transport" when action == "record_stop" => "Stop the current Cubase recording.",
             "transport" => "Start recording into the current Cubase project.",
             "project" => "Perform a project operation that can overwrite a file or discard unsaved changes.",
+            "plugin" when action == "assign"
+                => "Assign a plug-in to an existing Cubase plug-in slot. Any plug-in already in that slot is discarded and its settings are lost.",
             "plugin" => "Replace multiple plug-in assignments.",
+            "mixer" => "Change mixer channel state. The affected channel is resolved from the target arguments before the write.",
             "midi.compose" => "Delete or replace MIDI composition data, or overwrite an existing MIDI file.",
             "batch" => $"Run a batch containing {arguments?["operations"]?.AsArray().Count ?? 0} operations, including a destructive operation.",
             "ui.invoke" => "Invoke a potentially destructive Cubase UI action.",
             _ => $"Perform the confirm-required operation '{operation}'."
         };
+    }
 
     private static bool IsApi13Version(string? version)
     {

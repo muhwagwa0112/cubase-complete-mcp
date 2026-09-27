@@ -40,7 +40,7 @@ public sealed class CubaseTools(BrokerClient broker)
         SendAsync("track", Merge(options, ("action", action), ("track_id", track_id), ("name", name), ("track_type", track_type)), confirmation_id, cancellationToken);
 
     [McpServerTool(Name = "cubase_mixer", ReadOnly = false, Destructive = false, OpenWorld = false)]
-    [Description("Read and edit mixer volume, pan, mute, solo, monitor, record-enable, EQ, filters, sends, automation and meters.")]
+    [Description("Read and edit mixer volume, pan, mute, solo, monitor and record-enable on the selected track, or on the channel addressed by track_id. EQ, filters, sends and automation require object_id with parameter_tag. Meters are not exposed by the driver mirror.")]
     public Task<JsonNode> Mixer(string action = "get", string? track_id = null, string? parameter = null,
         double? value = null, string? display_value = null, JsonElement? options = null,
         CancellationToken cancellationToken = default) =>
@@ -48,7 +48,7 @@ public sealed class CubaseTools(BrokerClient broker)
             ("value", value), ("display_value", display_value)), null, cancellationToken);
 
     [McpServerTool(Name = "cubase_plugin", ReadOnly = false, Destructive = true, OpenWorld = false)]
-    [Description("Enumerate DirectAccess plug-in slots and parameters, assign/remove/bypass/open editors, and set process or display values.")]
+    [Description("Inspect a plug-in slot and its parameters through a DirectAccess root, assign a plug-in to a slot (MIDI Remote API 1.3, requires confirmation), and read or write plug-in parameter values by parameter_tag. Removing, bypassing and opening plug-in editors are not dispatched by the server.")]
     public Task<JsonNode> Plugin(string action = "list", string root = "selected_track", string? object_id = null,
         string? parameter_tag = null, double? process_value = null, double? plain_value = null, string? display_value = null,
         string? plugin_uid = null, string? confirmation_id = null, JsonElement? options = null,
@@ -76,7 +76,7 @@ public sealed class CubaseTools(BrokerClient broker)
             confirmation_id, cancellationToken);
 
     [McpServerTool(Name = "cubase_project", ReadOnly = false, Destructive = true, OpenWorld = false)]
-    [Description("Create, open, save, close, import, export and render Cubase projects through command or verified UI fallback paths.")]
+    [Description("Run project Key Commands for the currently open project: save, save_as, new, open, close, export_audio, import_audio, import_midi and export_midi. The server dispatches the command binding only; path arguments are not delivered, and actions without a verified binding return PROJECT_REQUIRES_UI instead of a UI fallback.")]
     public Task<JsonNode> Project(string action = "get", string? path = null, bool? overwrite = null,
         string? confirmation_id = null, JsonElement? options = null, CancellationToken cancellationToken = default) =>
         SendAsync("project", Merge(options, ("action", action), ("path", path), ("overwrite", overwrite)), confirmation_id, cancellationToken);

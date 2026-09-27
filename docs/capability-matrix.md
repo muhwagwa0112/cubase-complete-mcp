@@ -3,7 +3,7 @@
 | Area | Primary path | Support | Verification contract |
 |---|---|---|---|
 | Status, ports, version | Broker / WinMM | Full | Cubase process, guarded loopMIDI autostart, configured/observed ports, connection state, driver handshake and client/Broker Release identity |
-| 69 categories / 2,777 commands | Generated command bindings | Complete classified catalog; execution context-dependent | Exact ID/name plus v1.3 `canPerform`; execution remains `UNVERIFIED` without a state postcondition |
+| 69 categories / 2,777 commands | Generated command bindings | Catalog complete; risk classification covers the rule-matched subset only (`classified_commands` / `unclassified_commands`); execution context-dependent | Exact ID/name plus v1.3 `canPerform` where the host exposes it; execution remains `UNVERIFIED` without a state postcondition |
 | Play, stop, record, cycle, click, tempo, locators | High-level MIDI Remote bindings | Full after live validation | State callbacks and session revision |
 | Track enumeration | Mixer DirectAccess | Dynamic | Fresh object traversal |
 | Track create/delete/duplicate/freeze/enable | Key Commands | Command-backed | `canPerform`; destructive delete requires confirmation |
@@ -26,6 +26,6 @@
 | OCR | Windows.Media.Ocr | Snapshot-scoped | Words and rectangles returned with the screenshot |
 | Windows Graphics Capture | None | Not implemented | PrintWindow is used instead |
 
-“Dynamic” means the server supports whatever the current Cubase object tree exposes rather than maintaining a hard-coded plugin-specific schema. `cubase://capabilities` is the machine-readable coverage ledger and reports zero unclassified Key Commands. A third-party plugin can still expose zero automatable parameters, fail to load, or render a control whose state cannot be observed; those cases remain `best_effort` rather than being mislabeled as fully verified.
+“Dynamic” means the server supports whatever the current Cubase object tree exposes rather than maintaining a hard-coded plugin-specific schema. `cubase://capabilities` is the machine-readable coverage ledger: `classified_commands` counts the Key Commands that matched an explicit risk rule, and `unclassified_commands` counts the ones that fall through to the default `Low` risk and still need review. A third-party plugin can still expose zero automatable parameters, fail to load, or render a control whose state cannot be observed; those cases remain `best_effort` rather than being mislabeled as fully verified.
 
 MIDI composition uses PPQ Standard MIDI Files rather than editing `.cpr` binaries. Format 0 and 1 files are supported. SMPTE-division files, VST Note Expression, Expression Maps, Chord Track voicings and other Cubase-proprietary event types remain accessible through Cubase commands/UI but are not serialized as native structured `cubase_midi` events.

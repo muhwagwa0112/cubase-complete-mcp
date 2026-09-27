@@ -23,7 +23,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     {
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) return false;
-        try { return FindFileDialog(process.ProcessId.Value) is not null; }
+        try { return FindFileDialog(CreateTarget(process)) is not null; }
         catch (Exception ex) when (IsUnavailableElement(ex)) { return false; }
     }
 
@@ -31,9 +31,30 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     {
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) return false;
-        try { return FindMidiImportFileDialog(process.ProcessId.Value) is not null; }
+        try { return FindMidiImportFileDialog(CreateTarget(process)) is not null; }
         catch (Exception ex) when (IsUnavailableElement(ex)) { return false; }
     }
+
+    /// <summary>
+    /// Binds a window lookup to the inspected Cubase process and re-verifies that the process id still
+    /// belongs to it. Window ownership is never attributed to a Cubase process whose identity could not
+    /// be confirmed.
+    /// </summary>
+    private CubaseWindowTarget CreateTarget(CubaseProcessState process)
+    {
+        var processId = process.ProcessId ?? throw new InvalidOperationException("Cubase is not running.");
+        return new CubaseWindowTarget(processId, process.StartTime,
+            processInspector.IsIdentityCurrent(processId, process.StartTime));
+    }
+
+    /// <summary>
+    /// Re-verifies identity for the long polling loops. Unknown identity is never treated as trusted, so
+    /// a process id reused after a Cubase restart stops being accepted in the middle of an operation.
+    /// </summary>
+    private CubaseWindowTarget RefreshTarget(CubaseWindowTarget target) => target with
+    {
+        IdentityVerified = processInspector.IsIdentityCurrent(target.ProcessId, target.StartTime)
+    };
 
     public async Task<JsonObject> ObserveProjectTextAsync(CancellationToken cancellationToken)
     {
@@ -64,12 +85,13 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null)
             throw new InvalidOperationException("Cubase is not running.");
-        var processId = process.ProcessId.Value;
+        var target = CreateTarget(process);
+        var processId = target.ProcessId;
         if (HasOpenMidiImportFileDialog())
             return new JsonObject { ["opened"] = true, ["already_open"] = true, ["path"] = "existing_midi_import_dialog" };
         if (HasOpenFileDialog())
             throw new InvalidOperationException("A non-MIDI Cubase file dialog is already open; close it before importing MIDI.");
-        if (FindMidiImportProjectChoice(processId) is not null)
+        if (FindMidiImportProjectChoice(target) is not null)
             return new JsonObject { ["opened"] = true, ["already_open"] = true, ["path"] = "existing_project_choice" };
 
         var projectWindow = FindProjectWindow(processId)
@@ -96,7 +118,9 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         for (var attempt = 0; attempt < 40; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (FindMidiImportFileDialog(processId) is not null || FindMidiImportProjectChoice(processId) is not null)
+            var currentTarget = RefreshTarget(target);
+            if (FindMidiImportFileDialog(currentTarget) is not null
+                || FindMidiImportProjectChoice(currentTarget) is not null)
             {
                 return new JsonObject
                 {
@@ -113,8 +137,8 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     {
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) return null;
-        var nativeDialog = FindContainedDialogWindow(process.ProcessId.Value,
-            ["Set Project Folder", "프로젝트 폴더"]);
+        var target = CreateTarget(process);
+        var nativeDialog = FindContainedDialogWindow(target, CubaseDialogStage.ProjectFolderChoice);
         if (nativeDialog != IntPtr.Zero)
         {
             if (!PostMessage(nativeDialog, 0x0010, IntPtr.Zero, IntPtr.Zero)) // WM_CLOSE
@@ -125,10 +149,13 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                 ["dialog_title"] = "Set Project Folder", ["button"] = "WM_CLOSE", ["dismissed"] = !IsWindow(nativeDialog)
             };
         }
+        var titleFragments = WindowOwnershipPolicy.TitleFragmentsFor(CubaseDialogStage.ProjectFolderChoice);
         for (var attempt = 0; attempt < 20; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            foreach (var window in FindProcessWindowCandidates(process.ProcessId.Value))
+            foreach (var window in FindProcessWindowCandidates(RefreshTarget(target),
+                CubaseDialogStage.ProjectFolderChoice, titleFragments,
+                candidate => FindButton(candidate, ["cancel", "취소"]) is not null))
             {
                 try
                 {
@@ -136,8 +163,8 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                     var cancel = FindButton(window, ["cancel", "취소"]);
                     var selectFolder = FindButton(window, ["select folder", "폴더 선택"]);
                     if (cancel is null || (selectFolder is null
-                        && !title.Contains("Set Project Folder", StringComparison.OrdinalIgnoreCase)
-                        && !title.Contains("프로젝트 폴더", StringComparison.OrdinalIgnoreCase))) continue;
+                        && !titleFragments.Any(fragment =>
+                            title.Contains(fragment, StringComparison.OrdinalIgnoreCase)))) continue;
                     var name = cancel.Current.Name;
                     var rectangle = cancel.Current.BoundingRectangle;
                     if (!rectangle.IsEmpty && rectangle.Width > 0 && rectangle.Height > 0)
@@ -159,11 +186,13 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         if (!Path.IsPathFullyQualified(absolutePath)) throw new ArgumentException("File-dialog path must be absolute.");
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) throw new InvalidOperationException("Cubase is not running.");
+        var target = CreateTarget(process);
         Exception? unavailable = null;
         for (var attempt = 0; attempt < 40; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var dialog = FindMidiImportFileDialog(process.ProcessId.Value);
+            var currentTarget = RefreshTarget(target);
+            var dialog = FindMidiImportFileDialog(currentTarget);
             if (dialog is not null)
             {
                 var submissionAttempted = false;
@@ -182,7 +211,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                     InvokeButton(button);
 
                     var handle = new IntPtr(dialog.Current.NativeWindowHandle);
-                    var closed = await WaitForFileDialogToCloseAsync(process.ProcessId.Value, handle,
+                    var closed = await WaitForFileDialogToCloseAsync(currentTarget, handle,
                         dialog, title, cancellationToken).ConfigureAwait(false);
                     return new JsonObject
                     {
@@ -196,7 +225,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                     unavailable = ex;
                     if (submissionAttempted)
                     {
-                        var closed = await WaitForFileDialogToCloseAsync(process.ProcessId.Value,
+                        var closed = await WaitForFileDialogToCloseAsync(currentTarget,
                             IntPtr.Zero, dialog, title, cancellationToken).ConfigureAwait(false);
                         return new JsonObject
                         {
@@ -207,7 +236,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                         };
                     }
                     var keyboardResult = await TrySubmitFileDialogByKeyboardAsync(
-                        process.ProcessId.Value, absolutePath, cancellationToken).ConfigureAwait(false);
+                        currentTarget, absolutePath, cancellationToken).ConfigureAwait(false);
                     if (keyboardResult is not null) return keyboardResult;
                 }
             }
@@ -222,10 +251,11 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     {
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) return null;
+        var target = CreateTarget(process);
         for (var attempt = 0; attempt < 20; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var window = FindMidiImportProjectChoice(process.ProcessId.Value);
+            var window = FindMidiImportProjectChoice(RefreshTarget(target));
             if (window is not null)
             {
                 try
@@ -253,16 +283,17 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null)
             throw new InvalidOperationException("Cubase is not running.");
+        var target = CreateTarget(process);
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         while (stopwatch.ElapsedMilliseconds < timeoutMilliseconds)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var processId = process.ProcessId.Value;
-            if (FindMidiImportProjectChoice(processId) is not null)
+            var currentTarget = RefreshTarget(target);
+            if (FindMidiImportProjectChoice(currentTarget) is not null)
                 return new JsonObject { ["stage"] = "project_choice", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
-            if (FindMidiImportFileDialog(processId) is not null)
+            if (FindMidiImportFileDialog(currentTarget) is not null)
                 return new JsonObject { ["stage"] = "midi_file_dialog", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
-            if (FindImportOptionsDialog(processId) is not null)
+            if (FindImportOptionsDialog(currentTarget) is not null)
                 return new JsonObject { ["stage"] = "import_options", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
             await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         }
@@ -273,10 +304,11 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     {
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) return null;
+        var target = CreateTarget(process);
         for (var attempt = 0; attempt < 30; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var dialog = FindImportOptionsDialog(process.ProcessId.Value);
+            var dialog = FindImportOptionsDialog(RefreshTarget(target));
             if (dialog is not null)
             {
                 var button = FindButton(dialog, ["ok", "확인", "import", "가져오기"]);
@@ -368,28 +400,21 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         };
     }
 
-    private static AutomationElement? FindFileDialog(int processId)
+    private AutomationElement? FindFileDialog(CubaseWindowTarget target)
     {
-        foreach (var window in FindProcessWindowCandidates(processId).Reverse())
-        {
-            try
-            {
-                if (FindFileNameEdit(window) is not null && FindAcceptButton(window) is not null) return window;
-            }
-            catch (Exception ex) when (IsUnavailableElement(ex)) { }
-        }
-        return null;
+        var candidates = FindProcessWindowCandidates(target, CubaseDialogStage.FileDialog, [],
+            window => FindFileNameEdit(window) is not null && FindAcceptButton(window) is not null);
+        return candidates.Count == 0 ? null : candidates[^1];
     }
 
-    private static AutomationElement? FindMidiImportFileDialog(int processId)
+    private AutomationElement? FindMidiImportFileDialog(CubaseWindowTarget target)
     {
         // Windows common-item dialogs can be owned by Cubase without appearing as a
         // RootElement child for the Cubase process. Resolve the native top-level
         // window first, then bridge back into UI Automation for the editable field
-        // and Open button. The native lookup is still constrained to a recognized
-        // MIDI title and a rectangle contained by a Cubase window.
-        var nativeDialog = FindContainedDialogWindow(processId,
-            ["Import MIDI File", "MIDI 파일 가져오기", "MIDI 파일 열기"]);
+        // and Open button. The native lookup only accepts a window whose GW_OWNER
+        // chain reaches the identity-verified Cubase process.
+        var nativeDialog = FindContainedDialogWindow(target, CubaseDialogStage.MidiImportFileDialog);
         if (nativeDialog != IntPtr.Zero)
         {
             try
@@ -408,7 +433,10 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
             new PropertyCondition(AutomationElement.NameProperty, "Import MIDI File\u2026"),
             new PropertyCondition(AutomationElement.NameProperty, "MIDI 파일 가져오기"),
             new PropertyCondition(AutomationElement.NameProperty, "MIDI 파일 열기"));
-        foreach (var window in FindProcessWindowCandidates(processId).Reverse())
+        var declaredTitleFragments = WindowOwnershipPolicy.TitleFragmentsFor(CubaseDialogStage.MidiImportFileDialog);
+        foreach (var window in FindProcessWindowCandidates(target, CubaseDialogStage.MidiImportFileDialog,
+            declaredTitleFragments, candidate => FindFileNameEdit(candidate) is not null
+                && FindMidiImportAcceptButton(candidate) is not null).Reverse())
         {
             try
             {
@@ -455,11 +483,11 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     private static AutomationElement? FindMidiImportAcceptButton(AutomationElement dialog) =>
         FindButton(dialog, ["open", "열기", "import", "가져오기"]);
 
-    private static async Task<JsonObject?> TrySubmitFileDialogByKeyboardAsync(
-        int processId, string absolutePath, CancellationToken cancellationToken)
+    private async Task<JsonObject?> TrySubmitFileDialogByKeyboardAsync(
+        CubaseWindowTarget target, string absolutePath, CancellationToken cancellationToken)
     {
         AutomationElement? dialog;
-        try { dialog = FindMidiImportFileDialog(processId); }
+        try { dialog = FindMidiImportFileDialog(target); }
         catch (Exception ex) when (IsUnavailableElement(ex)) { return null; }
         if (dialog is null) return null;
 
@@ -489,7 +517,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                 {
                     _ = SendMessage(editHandle, 0x000C, IntPtr.Zero, Path.GetFullPath(absolutePath)); // WM_SETTEXT
                     _ = SendMessage(buttonHandle, 0x00F5, IntPtr.Zero, IntPtr.Zero); // BM_CLICK
-                    if (await WaitForFileDialogToCloseAsync(processId, handle, dialog, title, cancellationToken).ConfigureAwait(false))
+                    if (await WaitForFileDialogToCloseAsync(target, handle, dialog, title, cancellationToken).ConfigureAwait(false))
                     {
                         return new JsonObject
                         {
@@ -521,7 +549,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
                     await Task.Delay(100, cancellationToken).ConfigureAwait(false);
                     ClickScreenPoint((int)(buttonRectangle.X + buttonRectangle.Width / 2),
                         (int)(buttonRectangle.Y + buttonRectangle.Height / 2));
-                    var boundedClosed = await WaitForFileDialogToCloseAsync(processId, handle,
+                    var boundedClosed = await WaitForFileDialogToCloseAsync(target, handle,
                         dialog, title, cancellationToken).ConfigureAwait(false);
                     return new JsonObject
                     {
@@ -546,7 +574,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         SendUnicodeText(Path.GetFullPath(absolutePath));
         SendKeyChord("ENTER");
 
-        var closed = await WaitForFileDialogToCloseAsync(processId, handle, dialog, title, cancellationToken).ConfigureAwait(false);
+        var closed = await WaitForFileDialogToCloseAsync(target, handle, dialog, title, cancellationToken).ConfigureAwait(false);
         return new JsonObject
         {
             ["dialog_title"] = title, ["button"] = "keyboard:Alt+N/Enter",
@@ -556,15 +584,15 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         };
     }
 
-    private static async Task<bool> WaitForFileDialogToCloseAsync(
-        int processId, IntPtr dialogHandle, AutomationElement dialog, string originalTitle,
+    private async Task<bool> WaitForFileDialogToCloseAsync(
+        CubaseWindowTarget target, IntPtr dialogHandle, AutomationElement dialog, string originalTitle,
         CancellationToken cancellationToken)
     {
         var consecutiveAbsent = 0;
         for (var attempt = 0; attempt < 50; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            try { consecutiveAbsent = FindMidiImportFileDialog(processId) is null ? consecutiveAbsent + 1 : 0; }
+            try { consecutiveAbsent = FindMidiImportFileDialog(target) is null ? consecutiveAbsent + 1 : 0; }
             catch (Exception ex) when (IsUnavailableElement(ex)) { consecutiveAbsent = 0; }
             if (MidiImportWorkflowPolicy.IsFileDialogClosureStable(consecutiveAbsent)) return true;
             await Task.Delay(100, cancellationToken).ConfigureAwait(false);
@@ -572,21 +600,34 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         return false;
     }
 
-    private static AutomationElement? FindModalDialog(int processId, string[] titleFragments)
-    {
-        return FindProcessWindowCandidates(processId).FirstOrDefault(window => titleFragments.Any(fragment =>
-            window.Current.Name.Contains(fragment, StringComparison.OrdinalIgnoreCase)));
-    }
+    /// <summary>
+    /// Generic modal lookup for callers that declare their own title fragments. It has no production call
+    /// site today; it stays wired through the ownership policy so it cannot become an ownership bypass.
+    /// </summary>
+    private AutomationElement? FindModalDialog(CubaseWindowTarget target, string[] titleFragments) =>
+        FindProcessWindowCandidates(target, CubaseDialogStage.GenericModal, titleFragments,
+            window => MatchedTitleFragments(window.Current.Name, titleFragments).Count > 0).FirstOrDefault();
 
-    private static AutomationElement? FindMidiImportProjectChoice(int processId)
+    private AutomationElement? FindMidiImportProjectChoice(CubaseWindowTarget target) =>
+        FindProcessWindowCandidates(target, CubaseDialogStage.MidiImportProjectChoice, [],
+            HasMidiImportProjectChoiceStructure).FirstOrDefault();
+
+    /// <summary>The MIDI import project question exposes Create, Cancel, and No buttons.</summary>
+    private static bool HasMidiImportProjectChoiceStructure(AutomationElement window) =>
+        FindButton(window, ["create", "생성"]) is not null
+        && FindButton(window, ["cancel", "취소"]) is not null
+        && FindButton(window, ["no", "아니요"]) is not null;
+
+    private AutomationElement? FindImportOptionsDialog(CubaseWindowTarget target)
     {
-        foreach (var window in FindProcessWindowCandidates(processId))
+        var declaredTitleFragments = WindowOwnershipPolicy.TitleFragmentsFor(CubaseDialogStage.MidiImportOptions);
+        foreach (var window in FindProcessWindowCandidates(target, CubaseDialogStage.MidiImportOptions,
+            declaredTitleFragments, HasImportOptionsStructure))
         {
             try
             {
-                if (FindButton(window, ["create", "생성"]) is not null
-                    && FindButton(window, ["cancel", "취소"]) is not null
-                    && FindButton(window, ["no", "아니요"]) is not null)
+                if (HasImportOptionsStructure(window)
+                    && MatchedTitleFragments(window.Current.Name, declaredTitleFragments).Count > 0)
                     return window;
             }
             catch (Exception ex) when (IsUnavailableElement(ex)) { }
@@ -594,25 +635,16 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         return null;
     }
 
-    private static AutomationElement? FindImportOptionsDialog(int processId)
+    /// <summary>
+    /// Import-options dialogs expose an OK/Import button and are neither the MIDI file dialog nor the
+    /// MIDI import project question.
+    /// </summary>
+    private static bool HasImportOptionsStructure(AutomationElement window)
     {
-        foreach (var window in FindProcessWindowCandidates(processId))
-        {
-            try
-            {
-                var title = window.Current.Name;
-                if (IsMidiImportDialogTitle(title) || FindFileNameEdit(window) is not null) continue;
-                if (FindButton(window, ["create", "생성"]) is not null
-                    && FindButton(window, ["no", "아니요"]) is not null) continue;
-                if ((title.Contains("import", StringComparison.OrdinalIgnoreCase)
-                        || title.Contains("midi", StringComparison.OrdinalIgnoreCase)
-                        || title.Contains("가져오기", StringComparison.OrdinalIgnoreCase))
-                    && FindButton(window, ["ok", "확인", "import", "가져오기"]) is not null)
-                    return window;
-            }
-            catch (Exception ex) when (IsUnavailableElement(ex)) { }
-        }
-        return null;
+        if (IsMidiImportDialogTitle(window.Current.Name) || FindFileNameEdit(window) is not null) return false;
+        if (FindButton(window, ["create", "생성"]) is not null
+            && FindButton(window, ["no", "아니요"]) is not null) return false;
+        return FindButton(window, ["ok", "확인", "import", "가져오기"]) is not null;
     }
 
     private static AutomationElement? FindProjectWindow(int processId)
@@ -697,92 +729,224 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     private static string NormalizeMenuName(string value) => value.Replace("&", "", StringComparison.Ordinal)
         .Replace("_", "", StringComparison.Ordinal).Trim().TrimEnd('.', '\u2026');
 
-    private static IReadOnlyList<AutomationElement> FindProcessWindowCandidates(int processId)
+    /// <summary>
+    /// Resolves the top-level windows that may act as a dialog of the declared workflow stage. Windows
+    /// running in the identity-verified Cubase process are accepted directly; a foreign window is only
+    /// accepted when its owner chain reaches a Cubase window. Screen overlap never grants ownership and
+    /// an unverifiable Cubase process identity is never trusted.
+    /// </summary>
+    private IReadOnlyList<AutomationElement> FindProcessWindowCandidates(
+        CubaseWindowTarget target, CubaseDialogStage stage, IReadOnlyList<string> declaredTitleFragments,
+        Func<AutomationElement, bool> structuralRoleProbe)
     {
-        var condition = new PropertyCondition(AutomationElement.ProcessIdProperty, processId);
-        var topLevel = AutomationElement.RootElement.FindAll(TreeScope.Children, condition)
+        var currentTarget = RefreshTarget(target);
+        var cubaseWindows = AutomationElement.RootElement.FindAll(TreeScope.Children,
+                new PropertyCondition(AutomationElement.ProcessIdProperty, currentTarget.ProcessId))
             .Cast<AutomationElement>().ToArray();
-        var candidates = new List<AutomationElement>(topLevel);
-        var cubaseHandles = topLevel.Select(window => new IntPtr(window.Current.NativeWindowHandle))
-            .Where(handle => handle != IntPtr.Zero).ToHashSet();
-        var cubaseRectangles = topLevel.Select(window => window.Current.BoundingRectangle)
-            .Where(rectangle => !rectangle.IsEmpty && rectangle.Width > 0 && rectangle.Height > 0).ToArray();
-        var rootWindows = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition)
-            .Cast<AutomationElement>();
-        foreach (var window in rootWindows)
+        var cubaseHandles = new HashSet<IntPtr>();
+        var cubaseRectangles = new List<NativeRect>();
+        foreach (var window in cubaseWindows)
         {
             try
             {
                 var handle = new IntPtr(window.Current.NativeWindowHandle);
-                if (handle != IntPtr.Zero && !cubaseHandles.Contains(handle)
-                    && (IsOwnedBy(handle, cubaseHandles) || IsRecognizedContainedCubaseDialog(window, cubaseRectangles)))
-                    candidates.Add(window);
+                if (handle == IntPtr.Zero) continue;
+                cubaseHandles.Add(handle);
+                var bounds = window.Current.BoundingRectangle;
+                if (!bounds.IsEmpty && bounds.Width > 0 && bounds.Height > 0)
+                    cubaseRectangles.Add(ToNativeRect(bounds));
             }
             catch (Exception ex) when (IsUnavailableElement(ex)) { }
+        }
+
+        var candidates = new List<AutomationElement>();
+        foreach (var window in cubaseWindows)
+            CollectAcceptedWindow(currentTarget, stage, declaredTitleFragments, structuralRoleProbe,
+                cubaseRectangles, window, candidates);
+        foreach (var window in AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition)
+                     .Cast<AutomationElement>())
+        {
+            try
+            {
+                if (cubaseHandles.Contains(new IntPtr(window.Current.NativeWindowHandle))) continue;
+            }
+            catch (Exception ex) when (IsUnavailableElement(ex)) { continue; }
+            CollectAcceptedWindow(currentTarget, stage, declaredTitleFragments, structuralRoleProbe,
+                cubaseRectangles, window, candidates);
         }
         return candidates;
     }
 
-    private static bool IsRecognizedContainedCubaseDialog(
-        AutomationElement window, IReadOnlyList<System.Windows.Rect> cubaseRectangles)
+    /// <summary>Applies the ownership policy to one top-level candidate and keeps it when accepted.</summary>
+    private static void CollectAcceptedWindow(CubaseWindowTarget target, CubaseDialogStage stage,
+        IReadOnlyList<string> declaredTitleFragments, Func<AutomationElement, bool> structuralRoleProbe,
+        IReadOnlyList<NativeRect> cubaseRectangles, AutomationElement window, List<AutomationElement> candidates)
     {
-        var title = window.Current.Name;
-        var recognizedTitle = title.Contains("Import MIDI File", StringComparison.OrdinalIgnoreCase)
-            || title.Contains("Set Project Folder", StringComparison.OrdinalIgnoreCase)
-            || title.Contains("MIDI 파일", StringComparison.OrdinalIgnoreCase)
-            || title.Contains("프로젝트 폴더", StringComparison.OrdinalIgnoreCase);
-        if (!recognizedTitle) return false;
-        var rectangle = window.Current.BoundingRectangle;
-        if (rectangle.IsEmpty || rectangle.Width <= 0 || rectangle.Height <= 0) return false;
-        var centerX = rectangle.X + rectangle.Width / 2;
-        var centerY = rectangle.Y + rectangle.Height / 2;
-        return cubaseRectangles.Any(owner => centerX >= owner.X && centerX <= owner.X + owner.Width
-            && centerY >= owner.Y && centerY <= owner.Y + owner.Height);
+        try
+        {
+            var facts = ReadUiWindowFacts(window);
+            if (!IsOwnershipAccepted(target, stage, declaredTitleFragments, facts,
+                ProbeStructuralRole(structuralRoleProbe, window), cubaseRectangles)) return;
+            candidates.Add(window);
+        }
+        catch (Exception ex) when (IsUnavailableElement(ex)) { }
     }
 
-    private static IntPtr FindContainedDialogWindow(int cubaseProcessId, string[] titleFragments)
+    private static bool ProbeStructuralRole(Func<AutomationElement, bool> probe, AutomationElement window)
     {
-        var owners = new List<NativeRect>();
-        _ = EnumWindows((handle, parameter) =>
-        {
-            _ = GetWindowThreadProcessId(handle, out var processId);
-            if (processId == cubaseProcessId && GetWindowRect(handle, out var rectangle)
-                && rectangle.Right > rectangle.Left && rectangle.Bottom > rectangle.Top)
-                owners.Add(rectangle);
-            return true;
-        }, IntPtr.Zero);
-        if (owners.Count == 0) return IntPtr.Zero;
+        try { return probe(window); }
+        catch (Exception ex) when (IsUnavailableElement(ex)) { return false; }
+    }
 
+    /// <summary>Reads the facts UI Automation exposes for one top-level element.</summary>
+    private static CandidateWindowFacts ReadUiWindowFacts(AutomationElement window)
+    {
+        var handle = new IntPtr(window.Current.NativeWindowHandle);
+        _ = GetWindowThreadProcessId(handle, out var ownerProcessId);
+        var bounds = window.Current.BoundingRectangle;
+        return new CandidateWindowFacts(handle,
+            ownerProcessId != 0 ? ownerProcessId : window.Current.ProcessId,
+            window.Current.Name,
+            !bounds.IsEmpty && bounds.Width > 0 && bounds.Height > 0 ? ToNativeRect(bounds) : null,
+            !window.Current.IsOffscreen && (handle == IntPtr.Zero || IsWindowVisible(handle)));
+    }
+
+    /// <summary>
+    /// Native top-level window lookup used before bridging back into UI Automation. The window must be
+    /// visible, carry the title role of the declared stage, expose a usable rectangle, and either run in
+    /// the identity-verified Cubase process or be owned by a top-level window of that process.
+    /// </summary>
+    private IntPtr FindContainedDialogWindow(CubaseWindowTarget target, CubaseDialogStage stage)
+    {
+        var currentTarget = RefreshTarget(target);
+        var declaredTitleFragments = WindowOwnershipPolicy.TitleFragmentsFor(stage);
+        if (declaredTitleFragments.Count == 0) return IntPtr.Zero;
+        var cubaseRectangles = CollectCubaseWindowRectangles(currentTarget.ProcessId);
         var match = IntPtr.Zero;
-        _ = EnumWindows((handle, parameter) =>
+        _ = EnumWindows((handle, enumerateParameter) =>
         {
-            if (!IsWindowVisible(handle)) return true;
+            if (handle == IntPtr.Zero) return true;
             var length = GetWindowTextLength(handle);
             if (length <= 0) return true;
             var title = new StringBuilder(length + 1);
             _ = GetWindowText(handle, title, title.Capacity);
-            if (!titleFragments.Any(fragment => title.ToString().Contains(fragment, StringComparison.OrdinalIgnoreCase)))
-                return true;
-            if (!GetWindowRect(handle, out var rectangle)) return true;
-            var centerX = rectangle.Left + (rectangle.Right - rectangle.Left) / 2;
-            var centerY = rectangle.Top + (rectangle.Bottom - rectangle.Top) / 2;
-            if (!owners.Any(owner => centerX >= owner.Left && centerX <= owner.Right
-                && centerY >= owner.Top && centerY <= owner.Bottom)) return true;
+            var windowTitle = title.ToString();
+            if (MatchedTitleFragments(windowTitle, declaredTitleFragments).Count == 0) return true;
+            _ = GetWindowThreadProcessId(handle, out var ownerProcessId);
+            NativeRect? rectangle = null;
+            if (GetWindowRect(handle, out var bounds) && bounds.Right > bounds.Left && bounds.Bottom > bounds.Top)
+                rectangle = bounds;
+            var facts = new CandidateWindowFacts(handle, ownerProcessId, windowTitle, rectangle,
+                IsWindowVisible(handle));
+            if (!IsOwnershipAccepted(currentTarget, stage, declaredTitleFragments, facts,
+                structuralRoleConfirmed: false, cubaseRectangles)) return true;
             match = handle;
             return false;
         }, IntPtr.Zero);
         return match;
     }
 
-    private static bool IsOwnedBy(IntPtr handle, HashSet<IntPtr> owners)
+    /// <summary>
+    /// Applies <see cref="WindowOwnershipPolicy"/> to one candidate window on native facts: the window
+    /// runs in the identity-verified Cubase process, or its bounded GW_OWNER chain reaches a top-level
+    /// window of that process while the window stays inside a Cubase window rectangle.
+    /// </summary>
+    private static bool IsOwnershipAccepted(CubaseWindowTarget target, CubaseDialogStage stage,
+        IReadOnlyList<string> declaredTitleFragments, CandidateWindowFacts facts, bool structuralRoleConfirmed,
+        IReadOnlyList<NativeRect> cubaseRectangles)
     {
-        for (var depth = 0; depth < 8 && handle != IntPtr.Zero; depth++)
+        var ownerChain = WalkOwnerChain(RootWindowHandle(facts.Handle), target.ProcessId);
+        var evidence = new WindowOwnershipEvidence
         {
-            handle = GetWindow(handle, 4); // GW_OWNER
-            if (owners.Contains(handle)) return true;
-        }
-        return false;
+            CandidateHandle = facts.Handle,
+            CandidateProcessId = facts.ProcessId,
+            CubaseProcessId = target.ProcessId,
+            CubaseIdentityVerified = target.IdentityVerified,
+            OwnerChainProcessId = ownerChain.IsCubaseProcess ? target.ProcessId
+                : ownerChain.OwnerHandle == IntPtr.Zero ? null : ownerChain.OwnerProcessId,
+            OwnerChainReachedCubaseTopLevel = ownerChain.IsCubaseTopLevel,
+            ExpectedStage = stage,
+            MatchedTitleFragments = MatchedTitleFragments(facts.Title, declaredTitleFragments),
+            DeclaredTitleFragments = declaredTitleFragments,
+            StructuralRoleConfirmed = structuralRoleConfirmed,
+            IsVisible = facts.IsVisible,
+            HasNonEmptyTitle = !string.IsNullOrWhiteSpace(facts.Title),
+            HasNonEmptyRectangle = facts.Rectangle is not null,
+            RectangleInsideCubaseWindow = facts.Rectangle is { } rectangle
+                && IsCenterInsideCubaseWindow(rectangle, cubaseRectangles)
+        };
+        return WindowOwnershipPolicy.Evaluate(evidence).Accepted;
     }
+
+    /// <summary>
+    /// Walks the GW_OWNER chain (bounded) to find the window that owns the candidate. The attribution is
+    /// the first owner running in the Cubase process; otherwise the last owner reached is reported, so a
+    /// foreign window is never attributed to Cubase by its screen position.
+    /// </summary>
+    private static OwnerChainAttribution WalkOwnerChain(IntPtr handle, int cubaseProcessId)
+    {
+        var ownerHandle = IntPtr.Zero;
+        var ownerProcessId = 0;
+        var current = handle;
+        for (var depth = 0; depth < OwnerChainDepth && current != IntPtr.Zero; depth++)
+        {
+            current = GetWindow(current, 4); // GW_OWNER
+            if (current == IntPtr.Zero) break;
+            ownerHandle = current;
+            _ = GetWindowThreadProcessId(current, out ownerProcessId);
+            if (ownerProcessId == cubaseProcessId)
+                return new OwnerChainAttribution(current, ownerProcessId, true, IsTopLevelWindow(current));
+        }
+        return new OwnerChainAttribution(ownerHandle, ownerProcessId, false, false);
+    }
+
+    /// <summary>Resolves the top-level ancestor so ownership is judged on the real dialog window.</summary>
+    private static IntPtr RootWindowHandle(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero) return IntPtr.Zero;
+        var root = GetAncestor(handle, 2); // GA_ROOT
+        return root == IntPtr.Zero ? handle : root;
+    }
+
+    private static bool IsTopLevelWindow(IntPtr handle) => GetAncestor(handle, 2) == handle; // GA_ROOT
+
+    /// <summary>Rectangles of the top-level windows that currently belong to the Cubase process.</summary>
+    private static List<NativeRect> CollectCubaseWindowRectangles(int processId)
+    {
+        var rectangles = new List<NativeRect>();
+        _ = EnumWindows((handle, enumerateParameter) =>
+        {
+            _ = GetWindowThreadProcessId(handle, out var ownerProcessId);
+            if (ownerProcessId == processId && GetWindowRect(handle, out var rectangle)
+                && rectangle.Right > rectangle.Left && rectangle.Bottom > rectangle.Top)
+                rectangles.Add(rectangle);
+            return true;
+        }, IntPtr.Zero);
+        return rectangles;
+    }
+
+    /// <summary>Declared title fragments that the window title actually contains.</summary>
+    private static IReadOnlyList<string> MatchedTitleFragments(string title,
+        IReadOnlyList<string> declaredTitleFragments) =>
+        declaredTitleFragments.Where(fragment => title.Contains(fragment, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+    /// <summary>Whether the candidate's center lies inside one of the Cubase window rectangles.</summary>
+    private static bool IsCenterInsideCubaseWindow(NativeRect candidate, IReadOnlyList<NativeRect> cubaseRectangles)
+    {
+        var centerX = candidate.Left + (candidate.Right - candidate.Left) / 2;
+        var centerY = candidate.Top + (candidate.Bottom - candidate.Top) / 2;
+        return cubaseRectangles.Any(rectangle => centerX >= rectangle.Left && centerX <= rectangle.Right
+            && centerY >= rectangle.Top && centerY <= rectangle.Bottom);
+    }
+
+    private static NativeRect ToNativeRect(System.Windows.Rect rectangle) => new()
+    {
+        Left = (int)rectangle.X,
+        Top = (int)rectangle.Y,
+        Right = (int)rectangle.Right,
+        Bottom = (int)rectangle.Bottom
+    };
 
     private static AutomationElement? FindButton(AutomationElement dialog, string[] names)
     {
@@ -1288,6 +1452,22 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         string ClientSessionId, DateTimeOffset ExpiresAt);
     private sealed record UiSnapshot(int ProcessId, string SnapshotId, string ClientSessionId,
         IntPtr WindowHandle, NativeRect Rectangle, string WindowTitle, DateTimeOffset ExpiresAt);
+
+    /// <summary>
+    /// Cubase process identity one dialog lookup is bound to. <see cref="StartTime"/> is the value the
+    /// process reported when it was inspected, so a reused process id is detected instead of trusted.
+    /// </summary>
+    private sealed record CubaseWindowTarget(int ProcessId, DateTimeOffset? StartTime, bool IdentityVerified);
+
+    /// <summary>Native facts about one candidate top-level window.</summary>
+    private sealed record CandidateWindowFacts(IntPtr Handle, int ProcessId, string Title,
+        NativeRect? Rectangle, bool IsVisible);
+
+    /// <summary>Window the bounded GW_OWNER walk attributed the candidate to.</summary>
+    private readonly record struct OwnerChainAttribution(IntPtr OwnerHandle, int OwnerProcessId,
+        bool IsCubaseProcess, bool IsCubaseTopLevel);
+
+    private const int OwnerChainDepth = 8;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeRect { public int Left; public int Top; public int Right; public int Bottom; }

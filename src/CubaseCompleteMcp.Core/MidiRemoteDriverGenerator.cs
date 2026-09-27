@@ -126,7 +126,7 @@ var PENDING_TIMEOUT_MS = 10000;
 var runtime = {
     active: false, device: null, mapping: null, sessionId: 0, sequence: 0, revision: 0,
     pendingChunks: {}, completed: {}, commandIds: [], commandValues: [], commandBindings: [], commandIndex: {},
-    directRoots: {}, state: {
+    directRoots: {}, mixRoots: {}, state: {
         playing: null, recording: null, cycle: null, metronome: null, tempo: null,
         position: '', leftLocator: '', rightLocator: '', selectedTrack: '',
         volume: null, pan: null, mute: null, solo: null, monitor: null, recordEnable: null
@@ -325,37 +325,52 @@ makeDirectRoot('control_room', page.mHostAccess.mControlRoom);
 makeDirectRoot('focused_quick_controls', page.mHostAccess.mFocusedQuickControls);
 
 function directRoot(name) { var root = runtime.directRoots[name || 'selected_track']; if (!root) { throw new Error('DirectAccess root is unavailable: ' + name); } return root; }
+function intArg(value, fallback, minimum, maximum) {
+    var parsed;
+    if (value === undefined || value === null || value === '') { return fallback; }
+    parsed = Number(value);
+    if (!isFinite(parsed)) { return fallback; }
+    return Math.max(minimum, Math.min(maximum, Math.floor(parsed)));
+}
 function directObject(root, objectId, includeParameters, parameterLimit) {
     var result = {object_id: objectId, unique_name: root.getObjectUniqueName(runtime.mapping, objectId), unique_id: root.getObjectUniqueIDString(runtime.mapping, objectId), title: root.getObjectTitle(runtime.mapping, objectId), parameters: []};
-    var count, i, tag, parameter;
+    var count, total, i, tag, parameter;
     if (root.getObjectTypeName) { result.type = root.getObjectTypeName(runtime.mapping, objectId); }
-    if (includeParameters) {
-        count = Math.min(root.getNumberOfParameters(runtime.mapping, objectId), parameterLimit);
-        for (i = 0; i < count; i += 1) {
+    total = root.getNumberOfParameters(runtime.mapping, objectId);
+    result.parameter_total = total;
+    if (!includeParameters) { result.parameters_omitted = true; return result; }
+    count = Math.min(total, parameterLimit);
+    result.parameters_truncated = total > count;
+    for (i = 0; i < count; i += 1) {
             tag = root.getParameterTagByIndex(runtime.mapping, objectId, i);
             parameter = {tag: tag, title: root.getParameterTitle(runtime.mapping, objectId, tag, 256), process_value: root.getParameterProcessValue(runtime.mapping, objectId, tag), display_value: root.getParameterDisplayValue(runtime.mapping, objectId, tag), units: root.getParameterDisplayUnits(runtime.mapping, objectId, tag)};
             if (root.convertParameterProcessValueToPlain) { parameter.plain_value = root.convertParameterProcessValueToPlain(runtime.mapping, objectId, tag, parameter.process_value); }
             if (root.getParameterProcessValueType) { parameter.value_type = root.getParameterProcessValueType(runtime.mapping, objectId, tag); }
             if (root.isParameterAutomatable) { parameter.automatable = root.isParameterAutomatable(runtime.mapping, objectId, tag); }
             if (root.getParameterEditLockState) { parameter.edit_locked = root.getParameterEditLockState(runtime.mapping, objectId, tag); }
-            result.parameters.push(parameter);
-        }
+        result.parameters.push(parameter);
     }
     return result;
 }
 function directSnapshot(args) {
-    var root = directRoot(args.root), base = root.getBaseObjectID(runtime.mapping), maxNodes = Math.max(1, Math.min(1024, args.max_nodes || 256));
-    var maxDepth = Math.max(0, Math.min(16, args.max_depth || 8)), parameterLimit = Math.max(0, Math.min(1024, args.max_parameters || 128));
+    var root = directRoot(args.root), base = root.getBaseObjectID(runtime.mapping), maxNodes = intArg(args.max_nodes, 256, 1, 1024);
+    var maxDepth = intArg(args.max_depth, 8, 0, 16), parameterLimit = intArg(args.max_parameters, 128, 0, 1024);
     var includeParameters = args.include_parameters !== false, queue = [{id: base, depth: 0, parent: -1}], nodes = [], item, count, i, child;
+    var depthLimited = 0, nodeLimited = 0, parametersTruncated = 0;
     while (queue.length && nodes.length < maxNodes) {
         item = queue.shift(); child = directObject(root, item.id, includeParameters, parameterLimit); child.parent_id = item.parent; child.depth = item.depth; nodes.push(child);
-        if (item.depth < maxDepth) { count = root.getNumberOfChildObjects(runtime.mapping, item.id); for (i = 0; i < count && queue.length + nodes.length < maxNodes; i += 1) { queue.push({id: root.getChildObjectID(runtime.mapping, item.id, i), depth: item.depth + 1, parent: item.id}); } }
+        if (child.parameters_truncated) { parametersTruncated += 1; }
+        count = root.getNumberOfChildObjects(runtime.mapping, item.id);
+        if (item.depth >= maxDepth) { depthLimited += count; }
+        else { for (i = 0; i < count; i += 1) { if (queue.length + nodes.length >= maxNodes) { nodeLimited += 1; } else { queue.push({id: root.getChildObjectID(runtime.mapping, item.id, i), depth: item.depth + 1, parent: item.id}); } } }
     }
-    return {root: args.root || 'selected_track', base_object_id: base, nodes: nodes, truncated: queue.length > 0};
+    return {root: args.root || 'selected_track', base_object_id: base, nodes: nodes,
+        truncated: queue.length > 0 || nodeLimited > 0 || depthLimited > 0 || parametersTruncated > 0,
+        limits: {max_nodes: maxNodes, max_depth: maxDepth, max_parameters: parameterLimit, include_parameters: includeParameters},
+        truncation: {queued_nodes_unvisited: queue.length, node_limit_children: nodeLimited, depth_limit_children: depthLimited, nodes_with_truncated_parameters: parametersTruncated}};
 }
-function directSet(args) {
-    var root = directRoot(args.root), objectId = Number(args.object_id), tag = Number(args.parameter_tag), before, beforeDisplay, after, afterDisplay, wasLocked = false, requestedProcess = null, verified = false;
-    if (!isFinite(objectId) || !isFinite(tag)) { throw new Error('object_id and parameter_tag are required numbers'); }
+function applyParameter(root, objectId, tag, args) {
+    var before, beforeDisplay, after, afterDisplay, wasLocked = false, requestedProcess = null, verified = false;
     before = root.getParameterProcessValue(runtime.mapping, objectId, tag);
     beforeDisplay = root.getParameterDisplayValue(runtime.mapping, objectId, tag);
     if (root.getParameterEditLockState) { wasLocked = root.getParameterEditLockState(runtime.mapping, objectId, tag); }
@@ -380,6 +395,83 @@ function directSet(args) {
     runtime.revision += 1;
     return {before: before, before_display: beforeDisplay, after: after, after_display: afterDisplay, verified: verified};
 }
+function directSet(args) {
+    var root = directRoot(args.root), objectId = Number(args.object_id), tag = Number(args.parameter_tag);
+    if (!isFinite(objectId) || !isFinite(tag)) { throw new Error('object_id and parameter_tag are required numbers'); }
+    return applyParameter(root, objectId, tag, args);
+}
+function selectedTrackIdentity() {
+    return {unique_id: selectedTrack.getUniqueIDString ? selectedTrack.getUniqueIDString(runtime.mapping) : null,
+        runtime_id: selectedTrack.getRuntimeID ? Number(selectedTrack.getRuntimeID(runtime.mapping)) : null,
+        title: runtime.state.selectedTrack};
+}
+function mixerBankIndex(value) {
+    var parsed = Number(value);
+    if (!isFinite(parsed) || Math.floor(parsed) !== parsed || parsed < 0 || parsed >= mixChannels.length) {
+        throw new Error('track_id must be a mixer bank channel index between 0 and ' + (mixChannels.length - 1) + '; received ' + JSON.stringify(value));
+    }
+    return parsed;
+}
+function mixerChannelRoot(index) {
+    var channel = mixChannels[index], cache = runtime.mixRoots[index];
+    if (!channel) { throw new Error('mixer bank channel is unavailable at index ' + index); }
+    if (!page.mHostAccess.makeDirectAccess) { throw new Error('track_id targeting requires MIDI Remote API 1.2 DirectAccess, which this host does not expose'); }
+    if (!cache) {
+        cache = {root: page.mHostAccess.makeDirectAccess(channel), mapping: runtime.mapping};
+        runtime.mixRoots[index] = cache;
+        if (cache.root.activate) { cache.root.activate(runtime.mapping); }
+    } else if (cache.mapping !== runtime.mapping) {
+        if (cache.root.activate) { cache.root.activate(runtime.mapping); }
+        cache.mapping = runtime.mapping;
+    }
+    if (cache.root.update) { cache.root.update(runtime.mapping); }
+    return cache.root;
+}
+function mixerChannelIdentity(index) {
+    var channel = mixChannels[index], root = mixerChannelRoot(index);
+    return {track_id: index, object_id: Number(root.getBaseObjectID(runtime.mapping)),
+        unique_id: channel.getUniqueIDString ? channel.getUniqueIDString(runtime.mapping) : null,
+        runtime_id: channel.getRuntimeID ? Number(channel.getRuntimeID(runtime.mapping)) : null};
+}
+function findParameterTag(root, objectId, requested) {
+    var normalized = String(requested).toLowerCase().replace(/[^a-z0-9]/g, ''), total = root.getNumberOfParameters(runtime.mapping, objectId);
+    var i, tag, title, candidate, prefix = null, samples = [];
+    for (i = 0; i < total; i += 1) {
+        tag = root.getParameterTagByIndex(runtime.mapping, objectId, i);
+        title = String(root.getParameterTitle(runtime.mapping, objectId, tag, 256) || '');
+        candidate = title.toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (candidate && normalized && candidate === normalized) { return {tag: tag, title: title, match: 'exact'}; }
+        if (candidate && normalized && candidate.indexOf(normalized) === 0) {
+            if (prefix === null) { prefix = {tag: tag, title: title, match: 'prefix'}; }
+            else { prefix = {ambiguous: true, first: prefix.title, second: title}; }
+        }
+        if (samples.length < 8) { samples.push(title); }
+    }
+    if (prefix !== null && !prefix.ambiguous) { return prefix; }
+    if (prefix !== null) { throw new Error('parameter "' + requested + '" is ambiguous on the resolved mixer channel ("' + prefix.first + '" and "' + prefix.second + '" both match); use object_id and parameter_tag instead'); }
+    throw new Error('parameter "' + requested + '" is not exposed on the resolved mixer channel; observed titles: ' + samples.join(', '));
+}
+function setMixerNamedOnTrack(args) {
+    var index = mixerBankIndex(args.track_id), before = mixerChannelIdentity(index), root, found, result, after, request = args, key;
+    if (typeof args.process_value !== 'number' && typeof args.plain_value !== 'number' && args.display_value === undefined) {
+        if (typeof args.value !== 'number' || !isFinite(args.value) || args.value < 0 || args.value > 1) {
+            throw new Error('mixer value must be normalized between 0 and 1 when track_id addresses the channel');
+        }
+        request = {};
+        for (key in args) { if (Object.prototype.hasOwnProperty.call(args, key)) { request[key] = args[key]; } }
+        request.process_value = args.value;
+    }
+    root = mixerChannelRoot(index);
+    found = findParameterTag(root, before.object_id, args.parameter);
+    result = applyParameter(root, before.object_id, found.tag, request);
+    after = mixerChannelIdentity(index);
+    return {target: {scope: 'track_index', track_id: index, object_id: before.object_id, unique_id: before.unique_id,
+            runtime_id: before.runtime_id, runtime_id_after: after.runtime_id,
+            identity_stable: before.runtime_id !== null && before.runtime_id === after.runtime_id},
+        parameter: args.parameter, parameter_tag: found.tag, parameter_title: found.title, parameter_match: found.match,
+        before: result.before, before_display: result.before_display, after: result.after, after_display: result.after_display,
+        verified: result.verified && before.runtime_id !== null && before.runtime_id === after.runtime_id};
+}
 function commandCapability(args) {
     var index = runtime.commandIndex[args.id], binding;
     if (typeof index !== 'number') { throw new Error('unknown command id'); }
@@ -398,7 +490,7 @@ function setTransport(args) {
     var action = args.action;
     if (action === 'play') { pulse(surface.play); }
     else if (action === 'stop') { pulse(surface.stop); }
-    else if (action === 'record') { pulse(surface.record); }
+    else if (action === 'record' || action === 'record_start' || action === 'record_stop') { return recordRequest(action, args.enabled); }
     else if (action === 'cycle') { setSurface(surface.cycle, args.enabled ? 1 : 0); }
     else if (action === 'metronome') { setSurface(surface.metronome, args.enabled ? 1 : 0); }
     else if (action === 'tempo') { if (typeof args.bpm !== 'number' || args.bpm < 20 || args.bpm > 300) { throw new Error('bpm must be between 20 and 300'); } timeDisplay.setTempoBPM(runtime.mapping, args.bpm); }
@@ -408,6 +500,23 @@ function setTransport(args) {
     else { throw new Error('unsupported transport action'); }
     runtime.revision += 1; return {requested: args, state: runtime.state};
 }
+function recordRequest(action, enabled) {
+    var mode = action, before = runtime.state.recording, after, pulsed = false;
+    if (mode === 'record') { mode = enabled === false ? 'record_stop' : 'record_start'; }
+    if (mode === 'record_start') {
+        if (before === true) { return {action: 'record_start', pulsed: false, recording_before: before, recording_after: before, already_recording: true, verified: true}; }
+        pulse(surface.record); pulsed = true;
+    } else if (mode === 'record_stop') {
+        if (before === false) { return {action: 'record_stop', pulsed: false, recording_before: before, recording_after: before, already_stopped: true, verified: true}; }
+        if (before === null || before === undefined) { throw new Error('the mirrored record state is unknown, so a toggle pulse cannot be guaranteed to stop recording; read transport.get first or stop recording in Cubase directly'); }
+        pulse(surface.record); pulsed = true;
+    } else { throw new Error('unsupported record action: ' + action); }
+    after = runtime.state.recording;
+    runtime.revision += 1;
+    return {action: mode, pulsed: pulsed, recording_before: before, recording_after: after,
+        verified: mode === 'record_start' ? after === true : after === false,
+        note: 'Transport record is a host toggle; the operation reports verified only when the driver mirror observed the requested record state.'};
+}
 function setTrack(args) {
     if (args.action === 'previous') { pulse(surface.previousTrack); }
     else if (args.action === 'next') { pulse(surface.nextTrack); }
@@ -415,24 +524,73 @@ function setTrack(args) {
     runtime.revision += 1; return {requested: args, state: runtime.state};
 }
 function setMixer(args) {
-    var value = args.value, parameter = args.parameter, target;
+    var value = args.value, parameter = args.parameter, target, identity, after, direct;
+    var named = parameter === 'volume' || parameter === 'pan' || parameter === 'mute' || parameter === 'solo' || parameter === 'monitor' || parameter === 'record_enable';
+    var hasTrack = args.track_id !== undefined && args.track_id !== null && args.track_id !== '';
+    var hasObject = args.object_id !== undefined && args.object_id !== null && args.object_id !== '';
+    if (hasTrack && named) { return setMixerNamedOnTrack(args); }
+    if (hasTrack && hasObject) {
+        identity = mixerChannelIdentity(mixerBankIndex(args.track_id));
+        if (Number(args.object_id) !== identity.object_id) {
+            throw new Error('track_id ' + identity.track_id + ' resolves to object_id ' + identity.object_id + ', not the requested object_id ' + args.object_id);
+        }
+        direct = directSet(args); direct.target = identity; runtime.revision += 1; return direct;
+    }
+    if (hasTrack && !hasObject) {
+        throw new Error('track_id targeting supports the named parameters volume, pan, mute, solo, monitor and record_enable; "' + parameter + '" requires object_id with parameter_tag');
+    }
     if (parameter === 'volume') { target = surface.volume; }
     else if (parameter === 'pan') { target = surface.pan; }
     else if (parameter === 'mute') { target = surface.mute; value = value ? 1 : 0; }
     else if (parameter === 'solo') { target = surface.solo; value = value ? 1 : 0; }
     else if (parameter === 'monitor') { target = surface.monitor; value = value ? 1 : 0; }
     else if (parameter === 'record_enable') { target = surface.recordEnable; value = value ? 1 : 0; }
-    else { return directSet(args); }
+    else if (hasObject) { direct = directSet(args); direct.target = {scope: 'selected_track_object_id'}; runtime.revision += 1; return direct; }
+    else { throw new Error('unsupported mixer parameter "' + parameter + '"; use volume, pan, mute, solo, monitor, record_enable, or object_id with parameter_tag'); }
     if (typeof value !== 'number' || !isFinite(value) || value < 0 || value > 1) { throw new Error('mixer value must be normalized between 0 and 1'); }
-    setSurface(target, value); runtime.revision += 1; return {requested: args, state: runtime.state};
+    identity = selectedTrackIdentity();
+    setSurface(target, value);
+    runtime.revision += 1;
+    after = selectedTrackIdentity();
+    return {requested: args, target: {scope: 'selected_track', unique_id: identity.unique_id, runtime_id: identity.runtime_id,
+            runtime_id_after: after.runtime_id, identity_stable: identity.runtime_id !== null && identity.runtime_id === after.runtime_id},
+        state: runtime.state};
 }
 function pluginSet(args) {
-    var root = directRoot(args.root || 'selected_track');
+    var root = directRoot(args.root || 'selected_track'), manager = root.mPluginManager, objectId, before, after, assigned, changed;
     if (args.action === 'set_parameter') { return directSet(args); }
-    if (args.action === 'assign' && root.mPluginManager && root.mPluginManager.trySetSlotPlugin) {
-        return {assigned: root.mPluginManager.trySetSlotPlugin(runtime.mapping, Number(args.object_id), String(args.plugin_uid), args.replace !== false)};
+    if (args.action === 'inspect_slot') {
+        objectId = Number(args.object_id);
+        if (!isFinite(objectId) || objectId < 0) { throw new Error('object_id of the target plug-in slot is required'); }
+        return {action: 'inspect_slot', slot: pluginSlotState(root, objectId),
+            api_1_3_plugin_manager: !!(manager && manager.trySetSlotPlugin)};
     }
-    throw new Error('plugin action is unavailable; use DirectAccess parameter set or UI fallback');
+    if (args.action === 'assign') {
+        objectId = Number(args.object_id);
+        if (!manager || !manager.trySetSlotPlugin) { throw new Error('plug-in slot assignment requires MIDI Remote API 1.3; this host does not expose mPluginManager.trySetSlotPlugin'); }
+        if (!isFinite(objectId) || objectId < 0) { throw new Error('object_id of the target plug-in slot is required'); }
+        if (typeof args.plugin_uid !== 'string' || args.plugin_uid.length === 0) { throw new Error('plugin_uid is required for plug-in slot assignment'); }
+        before = pluginSlotState(root, objectId);
+        assigned = !!manager.trySetSlotPlugin(runtime.mapping, objectId, args.plugin_uid, args.confirm_replace === true);
+        after = pluginSlotState(root, objectId);
+        runtime.revision += 1;
+        changed = before.unique_id !== after.unique_id || before.title !== after.title || before.unique_name !== after.unique_name
+            || before.parameter_total !== after.parameter_total || before.child_objects !== after.child_objects;
+        return {action: 'assign', assigned: assigned, dont_ask_discard: args.confirm_replace === true,
+            prior_slot: before, slot: after, slot_changed: changed, verified: false,
+            note: args.confirm_replace === true
+                ? 'confirm_replace was true, so existing plug-in contents can be discarded without a host prompt.'
+                : 'The host decides whether to prompt before discarding existing plug-in contents; confirm_replace was not set to true.'};
+    }
+    throw new Error('plugin action is unavailable; supported actions are set_parameter, inspect_slot and assign');
+}
+function pluginSlotState(root, objectId) {
+    return {object_id: objectId, unique_name: root.getObjectUniqueName(runtime.mapping, objectId),
+        unique_id: root.getObjectUniqueIDString(runtime.mapping, objectId),
+        title: root.getObjectTitle(runtime.mapping, objectId),
+        type: root.getObjectTypeName ? root.getObjectTypeName(runtime.mapping, objectId) : null,
+        parameter_total: root.getNumberOfParameters(runtime.mapping, objectId),
+        child_objects: root.getNumberOfChildObjects(runtime.mapping, objectId)};
 }
 function capabilities() {
     return {host_version: hostVersion(), api_1_2_direct_access: !!page.mHostAccess.makeDirectAccess,
@@ -452,7 +610,7 @@ function dispatch(frame, envelope) {
     else if (operation === 'command.can_perform') { respond(frame, commandCapability(args), true); }
     else if (operation === 'command.execute') { result = executeCommand(args); respond(frame, result, false); }
     else if (operation === 'transport.get') { respond(frame, runtime.state, true); }
-    else if (operation === 'transport.set') { respond(frame, setTransport(args), false); }
+    else if (operation === 'transport.set') { result = setTransport(args); respond(frame, result, !!result.verified); }
     else if (operation === 'track.get') { respond(frame, {selected_track: runtime.state.selectedTrack}, true); }
     else if (operation === 'track.set') { respond(frame, setTrack(args), false); }
     else if (operation === 'mixer.get') { respond(frame, runtime.state, true); }
@@ -475,10 +633,12 @@ page.mOnActivate = function (activeDevice, activeMapping) {
     var name;
     runtime.active = true; runtime.device = activeDevice; runtime.mapping = activeMapping; runtime.sessionId = makeSessionId(); runtime.completed = {}; runtime.pendingChunks = {}; runtime.revision += 1;
     for (name in runtime.directRoots) { if (runtime.directRoots.hasOwnProperty(name)) { runtime.directRoots[name].activate(activeMapping); } }
+    for (name in runtime.mixRoots) { if (runtime.mixRoots.hasOwnProperty(name) && runtime.mixRoots[name].root.activate) { runtime.mixRoots[name].root.activate(activeMapping); runtime.mixRoots[name].mapping = activeMapping; } }
 };
 page.mOnDeactivate = function (activeDevice, activeMapping) {
     var name;
     for (name in runtime.directRoots) { if (runtime.directRoots.hasOwnProperty(name)) { runtime.directRoots[name].deactivate(activeMapping); } }
+    for (name in runtime.mixRoots) { if (runtime.mixRoots.hasOwnProperty(name) && runtime.mixRoots[name].root.deactivate) { runtime.mixRoots[name].root.deactivate(activeMapping); } }
     runtime.active = false; runtime.device = null; runtime.mapping = null; runtime.sessionId = makeSessionId(); runtime.revision += 1;
 };
 

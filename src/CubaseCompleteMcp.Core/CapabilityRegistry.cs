@@ -13,28 +13,50 @@ public static class CapabilityRegistry
         var preconditions = api13Available
             ? ["CompleteBridge active", "Matching Cubase context"]
             : new[] { "CompleteBridge active", "Matching Cubase context", "Execution context cannot be preflighted on Cubase before 15.0.20" };
+        var classified = TryClassifyCommand(command, out var risk);
         return new CommandCapabilityDescriptor(command.Id, command.Category, command.Name, command.Index,
-            "midi_remote.command_binding", ClassifyCommand(command), "command_backed", preconditions,
-            api13Available, false);
+            "midi_remote.command_binding", risk, "command_backed", preconditions,
+            api13Available, false, classified);
     }
 
-    public static RiskLevel ClassifyCommand(KeyCommandDescriptor command)
+    public static RiskLevel ClassifyCommand(KeyCommandDescriptor command) =>
+        TryClassifyCommand(command, out var risk) ? risk : RiskLevel.Low;
+
+    /// <summary>
+    /// Classifies a catalog command against the explicit risk rules. Returns false when no rule matched, in
+    /// which case the command falls through to <see cref="RiskLevel.Low"/> and still needs review. The catalog
+    /// summary reports that fall-through count as <c>unclassified_commands</c>.
+    /// </summary>
+    public static bool TryClassifyCommand(KeyCommandDescriptor command, out RiskLevel risk)
     {
         var category = command.Category.Trim();
         var name = command.Name.Trim();
         if (DestructiveNameFragments.Any(fragment => name.Contains(fragment, StringComparison.OrdinalIgnoreCase)))
-            return RiskLevel.Confirm;
+        {
+            risk = RiskLevel.Confirm;
+            return true;
+        }
+
         if (category.Equals("File", StringComparison.OrdinalIgnoreCase)
             && (name.Equals("Close", StringComparison.OrdinalIgnoreCase)
                 || name.Equals("Quit", StringComparison.OrdinalIgnoreCase)
                 || name.Equals("New", StringComparison.OrdinalIgnoreCase)
                 || name.Equals("New Empty Project", StringComparison.OrdinalIgnoreCase)
                 || name.StartsWith("Save", StringComparison.OrdinalIgnoreCase)))
-            return RiskLevel.Confirm;
+        {
+            risk = RiskLevel.Confirm;
+            return true;
+        }
+
         if (category.Equals("Transport", StringComparison.OrdinalIgnoreCase)
             && name.Contains("Record", StringComparison.OrdinalIgnoreCase))
-            return RiskLevel.Confirm;
-        return RiskLevel.Low;
+        {
+            risk = RiskLevel.Confirm;
+            return true;
+        }
+
+        risk = RiskLevel.Low;
+        return false;
     }
 
     public static DirectRootDescriptor[] DirectRoots() =>

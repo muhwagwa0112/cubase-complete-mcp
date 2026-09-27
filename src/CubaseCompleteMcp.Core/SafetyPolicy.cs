@@ -63,17 +63,20 @@ public sealed class ConfirmationStore(TimeSpan? lifetime = null)
     public bool Consume(string id, string clientSessionId, string operation, JsonObject? arguments)
     {
         Prune();
-        if (!_items.TryRemove(id, out var item))
+        if (!_items.TryGetValue(id, out var item))
         {
             return false;
         }
 
-        return item.Proposal.ExpiresAt >= DateTimeOffset.UtcNow
+        // Validate before removing: a mismatched operation, session or argument set must not burn the approval,
+        // so the caller can still commit the exact plan the user approved with a corrected retry.
+        var matches = item.Proposal.ExpiresAt >= DateTimeOffset.UtcNow
             && item.ClientSessionId.Equals(clientSessionId, StringComparison.Ordinal)
             && item.Proposal.Operation.Equals(operation, StringComparison.Ordinal)
             && CryptographicOperations.FixedTimeEquals(
                 Encoding.ASCII.GetBytes(item.Proposal.ArgumentsHash),
                 Encoding.ASCII.GetBytes(SafetyPolicy.HashArguments(operation, arguments)));
+        return matches && _items.TryRemove(id, out _);
     }
 
     private void Prune()

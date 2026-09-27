@@ -14,6 +14,8 @@ public sealed class SafetyAndPipeTests
         var arguments = new JsonObject { ["action"] = "delete", ["track_id"] = "track-1" };
         var proposal = store.Prepare("session-a", "track", arguments, "delete track");
         Assert.False(store.Consume(proposal.ConfirmationId, "session-a", "track", new JsonObject { ["action"] = "delete", ["track_id"] = "track-2" }));
+        // A mismatched attempt must not burn the approval: the exact approved request still commits, once.
+        Assert.True(store.Consume(proposal.ConfirmationId, "session-a", "track", arguments));
         Assert.False(store.Consume(proposal.ConfirmationId, "session-a", "track", arguments));
         var second = store.Prepare("session-a", "track", arguments, "delete track");
         Assert.False(store.Consume(second.ConfirmationId, "session-b", "track", arguments));

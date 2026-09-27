@@ -94,7 +94,8 @@ public sealed record CommandCapabilityDescriptor(
     string SupportLevel,
     string[] Preconditions,
     bool CanPerformAvailable,
-    bool Verified);
+    bool Verified,
+    bool Classified);
 
 public sealed record DirectRootDescriptor(
     string Id,

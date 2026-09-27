@@ -1,21 +1,23 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
 namespace CubaseCompleteMcp.Broker;
 
-public sealed record CubaseProcessState(bool Running, int? ProcessId, string? Version, string? WindowTitle, IntPtr WindowHandle);
+public sealed record CubaseProcessState(bool Running, int? ProcessId, string? Version, string? WindowTitle,
+    IntPtr WindowHandle, DateTimeOffset? StartTime);
 
 public sealed class CubaseProcessInspector
 {
     public CubaseProcessState Inspect()
     {
         var process = Process.GetProcessesByName("Cubase15")
-            .OrderByDescending(static item => item.StartTime)
+            .OrderByDescending(TryReadStartTime)
             .FirstOrDefault();
         if (process is null)
         {
-            return new CubaseProcessState(false, null, null, null, IntPtr.Zero);
+            return new CubaseProcessState(false, null, null, null, IntPtr.Zero, null);
         }
 
         using (process)
@@ -23,7 +25,40 @@ public sealed class CubaseProcessInspector
             var version = process.MainModule?.FileVersionInfo.ProductVersion
                 ?? process.MainModule?.FileVersionInfo.FileVersion;
             var window = FindTopLevelWindow(process.Id);
-            return new CubaseProcessState(true, process.Id, version, window.Title, window.Handle);
+            return new CubaseProcessState(true, process.Id, version, window.Title, window.Handle,
+                TryReadStartTime(process));
+        }
+    }
+
+    /// <summary>
+    /// Confirms that the process currently occupying <paramref name="processId"/> is still the process
+    /// that was inspected, by re-reading its start time. False means the process is gone or the pid was
+    /// reused, so no window ownership may be attributed to it.
+    /// </summary>
+    public bool IsIdentityCurrent(int processId, DateTimeOffset? expectedStartTime)
+    {
+        if (processId <= 0 || expectedStartTime is null) return false;
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            var actualStartTime = TryReadStartTime(process);
+            return actualStartTime is not null && actualStartTime == expectedStartTime;
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or Win32Exception)
+        {
+            return false;
+        }
+    }
+
+    private static DateTimeOffset? TryReadStartTime(Process process)
+    {
+        try
+        {
+            return new DateTimeOffset(process.StartTime.ToUniversalTime(), TimeSpan.Zero);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
+        {
+            return null;
         }
     }
 
