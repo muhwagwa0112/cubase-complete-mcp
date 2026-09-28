@@ -225,7 +225,7 @@ public sealed partial class CubaseController
                 or InvalidDataException or JsonException or ArgumentException or FormatException or TimeoutException)
             {
                 response = context.Dispatched
-                    ? BrokerResponse.OutcomeUnknown(request.Id, $"The change was dispatched but its workflow failed before its result was known: {error.Message}")
+                    ? BrokerResponse.OutcomeUnknown(request.Id, $"The change was dispatched but its workflow failed before its result was known: {error.Message} ({Origin(error)})")
                     : BrokerResponse.Failure(request.Id, ResultStatus.Error,
                         error is OperationCanceledException ? ErrorCodes.Cancelled : "OPERATION_FAILED", error.Message);
             }
@@ -240,6 +240,21 @@ public sealed partial class CubaseController
             }
             return response;
         }, refusal => NotStarted(request, refusal.ErrorCode, refusal.Message), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Exception type and the innermost project frame, so a workflow failure can be located from its result.</summary>
+    internal static string Origin(Exception error)
+    {
+        var frame = (error.StackTrace ?? string.Empty).Split('
+')
+            .Select(line => line.Trim())
+            .FirstOrDefault(line => line.Contains("CubaseCompleteMcp.", StringComparison.Ordinal));
+        if (frame is not null)
+        {
+            var end = frame.IndexOf(" in ", StringComparison.Ordinal);
+            if (end > 0) frame = frame[..end];
+        }
+        return frame is null ? error.GetType().Name : $"{error.GetType().Name} {frame}";
     }
 
     /// <summary>FILE_CHANGED when only a bound file identity differs; TARGET_CHANGED for any other plan difference.</summary>
