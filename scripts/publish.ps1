@@ -10,6 +10,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$env:DOTNET_CLI_UI_LANGUAGE = 'en'
+$env:DOTNET_NOLOGO = '1'
+$env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $Output) { $Output = Join-Path $root 'artifacts\publish' }
 if (-not $LogDirectory) { $LogDirectory = Join-Path $root 'artifacts\publish-logs' }
@@ -40,13 +43,19 @@ function Invoke-Logged([string]$Name, [scriptblock]$Command) {
 $solution = Join-Path $root 'CubaseCompleteMcp.sln'
 Invoke-Logged 'restore' { dotnet restore $solution --locked-mode } | Out-Null
 Invoke-Logged 'build' { dotnet build $solution -c $Configuration --no-restore } | Out-Null
-$testLog = Invoke-Logged 'test' { dotnet test $solution -c $Configuration --no-build --logger "trx;LogFilePrefix=$releaseId" --results-directory (Join-Path $LogDirectory 'trx') }
-# A release gate must never pass on zero or skipped tests.
-$summaries = Select-String -LiteralPath $testLog -Pattern '(Passed|통과)!' | ForEach-Object { $_.Line }
-if (-not $summaries) { throw 'No test summary was found; refusing to publish.' }
-foreach ($line in $summaries) {
-    if ($line -match '(Skipped|건너뜀):\s*([1-9]\d*)') { throw "Tests were skipped: $line" }
-    if ($line -match '(Total|전체):\s*0\b') { throw "A test assembly ran zero tests: $line" }
+$trxDirectory = Join-Path $LogDirectory 'trx'
+Invoke-Logged 'test' { dotnet test $solution -c $Configuration --no-build --logger "trx;LogFilePrefix=$releaseId" --results-directory $trxDirectory } | Out-Null
+# A release gate must never pass on zero or skipped tests. The TRX counters are authoritative (console text is
+# localized and code-page dependent). Every test project must have produced its own TRX file.
+$testProjects = @(Get-ChildItem -Path (Join-Path $root 'tests') -Filter '*.csproj' -Recurse).Count
+$trxFiles = @(Get-ChildItem -LiteralPath $trxDirectory -Filter "$releaseId*.trx")
+if ($trxFiles.Count -ne $testProjects) { throw "Expected $testProjects TRX files, found $($trxFiles.Count); refusing to publish." }
+foreach ($file in $trxFiles) {
+    [xml]$trx = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8
+    $counters = $trx.TestRun.ResultSummary.Counters
+    if ([int]$counters.total -eq 0 -or [int]$counters.executed -eq 0) { throw "A test assembly ran zero tests: $($file.Name)" }
+    if ([int]$counters.notExecuted -gt 0 -or [int]$counters.executed -ne [int]$counters.total) { throw "Tests were skipped: $($file.Name)" }
+    if ([int]$counters.failed -gt 0 -or [int]$counters.passed -ne [int]$counters.total) { throw "Tests failed: $($file.Name)" }
 }
 
 New-Item -ItemType Directory -Force -Path $staging | Out-Null

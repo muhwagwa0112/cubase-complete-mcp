@@ -41,15 +41,19 @@ jobs:
         run: dotnet build CubaseCompleteMcp.sln -c Release --no-restore
       - name: Test
         shell: pwsh
+        env:
+          DOTNET_CLI_UI_LANGUAGE: en
         run: |
-          dotnet test CubaseCompleteMcp.sln -c Release --no-build --logger "trx" --results-directory test-results 2>&1 | Tee-Object -FilePath test-results-summary.log
+          dotnet test CubaseCompleteMcp.sln -c Release --no-build --logger "trx" --results-directory test-results
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # Required tests must run: zero tests or any skipped test fails the gate.
-          $lines = Select-String -Path test-results-summary.log -Pattern '(Passed|통과)!' | ForEach-Object { $_.Line }
-          if (-not $lines) { Write-Error 'No test summary found'; exit 1 }
-          foreach ($line in $lines) {
-            if ($line -match '(Skipped|건너뜀):\s*([1-9]\d*)') { Write-Error "Skipped tests: $line"; exit 1 }
-            if ($line -match '(Total|전체):\s*0\b') { Write-Error "Zero tests: $line"; exit 1 }
+          # Required tests must run: every test project needs a TRX with executed == passed == total > 0.
+          $projects = @(Get-ChildItem -Path tests -Filter '*.csproj' -Recurse).Count
+          $trx = @(Get-ChildItem -Path test-results -Filter '*.trx')
+          if ($trx.Count -ne $projects) { Write-Error "Expected $projects TRX files, found $($trx.Count)"; exit 1 }
+          foreach ($file in $trx) {
+            $counters = ([xml](Get-Content -LiteralPath $file.FullName -Raw)).TestRun.ResultSummary.Counters
+            if ([int]$counters.total -eq 0) { Write-Error "Zero tests: $($file.Name)"; exit 1 }
+            if ([int]$counters.notExecuted -gt 0 -or [int]$counters.executed -ne [int]$counters.total) { Write-Error "Skipped tests: $($file.Name)"; exit 1 }
           }
       - name: Publish and validate release payload
         shell: pwsh
@@ -61,6 +65,5 @@ jobs:
           name: ci-evidence
           path: |
             test-results/**/*.trx
-            test-results-summary.log
             ${{ runner.temp }}/release/*/release-manifest.json
           if-no-files-found: error
