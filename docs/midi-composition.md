@@ -11,7 +11,7 @@
 - Maps and text: `add_tempo`, `add_time_signature`, `add_key_signature`, `add_marker`, `add_lyrics`.
 - Generic events: `add_events` also accepts `text`, `sysex`, and raw `meta` events.
 - Transforms: `quantize`, `transpose`, `humanize`, `replace_range`.
-- Files and Cubase: `render_file`, `export_file`, `inspect_file`, `import_file`, `import_to_cubase`.
+- Files and Cubase: `render_file`, `export_file`, `inspect_file`, `import_file`, `compare_file`, `import_to_cubase`.
 
 Document IDs, track IDs and part IDs are opaque. Always use IDs returned by the preceding call. Composition documents are scoped to one MCP broker client session; render a `.mid` file for durable interchange.
 
@@ -89,3 +89,25 @@ Every transform can target a whole track or one `part_id`, plus an optional tick
 - Explicit overwrite requires `overwrite=true` and the confirmation flow.
 - SMPTE-division MIDI files are rejected because tick transforms require a PPQ grid.
 - Cubase-specific VST Note Expression, Expression Maps and Chord Track metadata are not part of Standard MIDI Files; use commands/DirectAccess/UI for those proprietary features.
+
+## Importing into Cubase (`import_to_cubase`)
+
+The import is causal: it must prove that *this* import created the tracks it reports.
+
+1. The plan records the canonical source digest, the transport state and the mixer-bank channel identities that already exist. If Cubase is playing or recording, the request is refused with `TRANSPORT_ACTIVE` unless `stop_transport=true`, which makes the stop part of a confirmed plan.
+2. A temporary render copy names every importable track `<original name> [CBMCP-xxxxxxxx]`, where the tag comes from the `operation_id`. The stored composition is not renamed. Track 0 is treated as a conductor only when the file has more than one track and track 0 contains no channel events; the reason is reported (`conductor_reason`).
+3. The Import MIDI File command is sent once; at most one File > Import > MIDI File menu fallback is used; the whole workflow is bounded to 30 seconds. With `accept_import_options=false` the options dialog is left for the user (`IMPORT_OPTIONS_PENDING`).
+4. Only new channel identities with the exact tagged titles count. Pre-existing tracks with the original names are never adopted.
+
+Verification levels:
+
+| level | evidence | reported status |
+|---|---|---|
+| `submitted` | file handed to Cubase's dialog, tagged targets not all observed | `Unverified`, `IMPORT_CAUSALITY_UNPROVEN` |
+| `targets_observed` | every tagged track observed as a new identity, mapped original → created with target handles | `Unverified`, `IMPORT_CAUSALITY_UNPROVEN` (MIDI Remote cannot read parts or events) |
+| `parts_observed` | parts/events observed on the new targets | requires owned-fixture export evidence |
+| `content_roundtrip_verified` | the new tracks exported from Cubase compare equal to the source (`compare_file`) | `compare_file` returns `content_equal=true` |
+
+`compare_file` (`document_id`, `path`) compares note, CC, program, pitch-bend and pressure events with timing scaled to 480 PPQ; track names, text/meta events and end-of-track are excluded. It returns both file hashes and examples of missing or unexpected events.
+
+Re-sending the same `operation_id` after completion returns the recorded result; an import whose outcome is unknown is never re-imported automatically.
