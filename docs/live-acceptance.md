@@ -29,8 +29,8 @@ The harness refuses to start if any authorization, marker, project identity, rel
 | LIVE-03 | metronome toggle/restore | record part needs recording authorization and a fixture without physical inputs |
 | LIVE-04 | MIDI + instrument track create, rename | plug-in part: `BLOCKED_ENV` until an installed plug-in UID can be enumerated and read back |
 | LIVE-05 | tagged import, `targets_observed` | parts are not observable through MIDI Remote (`BLOCKED_ENV` for the part assertion) |
-| LIVE-06 | save_as into the fixture, reopen, track presence | — |
-| LIVE-07 | locators, WAV export, header/length | host primary time format Bars+Beats |
+| LIVE-06 | save_as into the fixture, save_as to a second file, reopen the first, track presence | — |
+| LIVE-07 | locators, WAV export, header/length | host primary time format Bars+Beats; fails on Cubase 15.0.10, whose export dialog exposes no controls |
 | FAULT-01/02/04 | two clients, selection change before commit, failing batch resubmission | — |
 | FAULT-03 | — | operator-driven MIDI Remote reactivation with authorization |
 | E2E-02 | `compare_file` | operator exports the imported track to `<fixture>/roundtrip.mid` |

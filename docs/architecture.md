@@ -8,7 +8,7 @@ MCP client -- stdio --> CubaseCompleteMcp.Server          (operation_id issuance
                     singleton CubaseCompleteMcp.Broker
    OperationPlanner -> ConfirmationStore -> MutationCoordinator -> ExecutionJournal -> dispatch -> PostconditionVerifier
                        |                                       |
-               WinMM SysEx (wire v2)                     UI Automation (owned dialogs)
+               WinMM SysEx (wire v2)                     owned dialogs: Win32 / UIA / OCR
                        |                                  PrintWindow / SendInput
           MIDI Remote ES5 driver (contract 2)                     |
                        +-------------------- Cubase 15 -----------+
@@ -33,13 +33,15 @@ The pipe carries 32-bit big-endian length-prefixed JSON (8 MiB cap, `CurrentUser
 - Received frames are filtered (`DriverFrameFilter`): events only from the current session; terminal frames only for a pending request ID + opcode + session + epoch. Discarded frames update nothing.
 - The request cache is keyed by session + request ID and payload digest. Stale sessions are refused before the cache; a reused ID with another payload is `REQUEST_ID_CONFLICT`. Retransmission of the same request in the same session is answered from the cache.
 - Activation/deactivation resets the mirror to unknown (`null`). Toggles (record, cycle, metronome, mute, …) are refused while their state is unknown and are pulsed at most once toward a target state.
-- Targets: `track.list` reports the 64-slot bank with unique/runtime IDs. Writes carry the expected identity and are resolved inside the same host callback; a reordered bank is followed by identity, a replaced object (runtime ID change) is `STALE_TARGET`. Selection-dependent Key Commands carry `expected_selected` and are refused (`TARGET_CHANGED`) if the selection changed; without a guard they are `TARGET_CONTEXT_UNSAFE`.
+- Targets: `track.list` reports the children of the DirectAccess `VST Mixer` root (up to 256) with their unique ID string and object ID; `bank_index` is only the position among those children. Live on Cubase 15.0.10, calling `HostObject.getUniqueIDString`/`getRuntimeID` from a MIDI callback destabilized Cubase, so identities come from DirectAccess only, and each root is refreshed (`update`) before it is read. The selected track is identified from the `selected_track` root and matched into the mixer children. Writes carry the expected identity and are resolved inside the same host callback; a reordered bank is followed by identity, a replaced object (runtime ID change) is `STALE_TARGET`. Selection-dependent Key Commands carry `expected_selected` and are refused (`TARGET_CHANGED`) if the selection changed; without a guard they are `TARGET_CONTEXT_UNSAFE`.
 - Named parameters resolve by exact alias (including Korean titles), never by prefix. Ambiguous, hidden or edit-locked parameters are refused; the driver never steals a lock.
 - Writes return receipts (`mutation_sent`, `dispatch_revision`, before/after read-back); the broker decides verification.
 
 ## Workflows
 
 Track create/rename, project open/save/save-as, WAV export, plug-in assignment and MIDI import run as staged workflows: one command dispatch, owned dialogs only (window ownership policy: verified Cubase PID + start time, owner chain, stage title **and** control signature, bound to an opaque dialog ID), observed postconditions, and a recorded stage log. Failures report the last stage; workflows never delete files, close projects, repeat Undo or re-dispatch. The only cancel is of a dialog the workflow itself bound.
+
+What Cubase 15.0.10 exposes, as found live: Windows file dialogs are found by process-owned `#32770` windows with a file-name field (1001/1148) and IDOK. The Open and MIDI import dialogs accept `WM_SETTEXT` + IDOK; the Save As dialog ignores `WM_SETTEXT`, so the path is typed only while the dialog is foreground and the file-name field has focus, and read back before IDOK. Cubase's own Add Track dialog exposes no controls: the name is typed while it is the verified foreground window. Cubase question boxes ("Cubase Pro") expose no controls either: on open, the box is read by OCR and only the project-activation question is answered; any other question is left to the user (`pending_user_dialog`). The Export Audio Mixdown dialog exposes no controls, so WAV export fails explicitly. Cubase does not reopen the file of the already active project.
 
 MIDI import renders a temporary copy whose importable tracks are named `<name> [CBMCP-xxxxxxxx]` (derived from the operation ID), records the channel identities that existed before, and accepts only new identities with the tagged titles. MIDI Remote cannot read parts or events, so the automated result stops at `targets_observed` (reported `Unverified` with `IMPORT_CAUSALITY_UNPROVEN`); `compare_file` on a Cubase-exported MIDI file provides `content_roundtrip_verified`.
 

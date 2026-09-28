@@ -7,7 +7,8 @@
 What is implemented and how far it has been validated is stated per area in the [capability matrix](docs/capability-matrix.md). In short:
 
 - **Offline-validated** (unit, fake-host and generated-driver tests, Windows build): session isolation, no automatic resend of changes, execution journal, target handles, approvals bound to targets/files, mutation serialization, observed postconditions, batch contract, release integrity.
-- **Implemented, not yet validated against a live Cubase**: track create/rename dialogs, project open/save/save-as, WAV export, MIDI import UI stages, plug-in assignment verification. These are marked `implemented` (not `live_validated`).
+- **Validated on a live Cubase 15.0.10 fixture** (owned acceptance project, 2026-09-28): driver load and build identity, transport (play/stop/tempo/cycle/metronome, a 2 s recording with no physical input), track list and identities, track create (MIDI, instrument) and rename, target-bound mixer writes (another channel unchanged), two concurrent clients, project save/save-as/open, MIDI import up to `targets_observed`, the selection-change refusal and batch failure/resubmission. Driver reconnect was exercised only through project switches (the driver page re-activates; reads retry once after the new handshake).
+- **Not supported on Cubase 15.0.10**: WAV mixdown export. The Export Audio Mixdown dialog exposes no addressable controls, so the workflow stops with `WORKFLOW_CONTROL_MISSING` before typing or starting anything.
 - **Blocked by the environment**: plug-in catalog/UID verification (the installed MIDI Remote API declares no plug-in enumeration or UID read-back) and all MIDI Remote API 1.3 features on Cubase 15.0.10.
 
 Nothing in this repository claims a live Cubase run that has not happened. The finalization evidence and final report describe exactly which gates passed.
@@ -38,7 +39,7 @@ Every tool result has `status` and `execution_state`:
 
 ## Architecture in one paragraph
 
-stdio MCP server → current-user named pipe (protocol 2) → singleton broker → (a) WinMM SysEx to the generated ES5 MIDI Remote driver, (b) Cubase-owned UI Automation for dialogs. The broker normalizes every request, plans it (targets, file identities, preconditions), gets approval when needed without holding the mutation lease, then re-plans under the lease, journals `dispatching`, dispatches once and observes. See [architecture](docs/architecture.md).
+stdio MCP server → current-user named pipe (protocol 2) → singleton broker → (a) WinMM SysEx to the generated ES5 MIDI Remote driver, (b) Cubase-owned dialogs through their Win32 controls (file dialogs), verified-foreground keyboard input (Add Track) and OCR of question boxes (project activation), with UI Automation as a fallback. The broker normalizes every request, plans it (targets, file identities, preconditions), gets approval when needed without holding the mutation lease, then re-plans under the lease, journals `dispatching`, dispatches once and observes. See [architecture](docs/architecture.md).
 
 ## Build and test
 
