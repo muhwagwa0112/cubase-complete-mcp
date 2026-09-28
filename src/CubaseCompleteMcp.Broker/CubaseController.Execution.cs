@@ -150,14 +150,16 @@ public sealed partial class CubaseController
                 var value = data["read"] as JsonObject ?? data as JsonObject;
                 var process = ReadDouble(value?["process_value"]);
                 var display = value?["display_value"]?.GetValue<string>();
-                var satisfied = requestedProcess is { } desired ? PostconditionVerifier.WithinNormalized(process, desired)
+                var midiChannel = (data["target"]?["channel_type"] as JsonValue)?.GetValue<string>()?.StartsWith("MidiChannel", StringComparison.Ordinal) == true;
+                var satisfied = requestedProcess is { } desired
+                    ? midiChannel ? PostconditionVerifier.WithinMidiController(process, desired) : PostconditionVerifier.WithinNormalized(process, desired)
                     : requestedDisplay is not null && string.Equals(display?.Trim(), requestedDisplay.Trim(), StringComparison.Ordinal);
                 return new Observation(satisfied, new JsonObject
                 {
                     ["process_value"] = process, ["display_value"] = display, ["target"] = data["target"]?.DeepClone(), ["fresh"] = true
                 }, $"driver.{readOperation}(target)");
             };
-        }, _timings.TransportAndMixer, "abs(process_value) <= 1e-4; display_value exact",
+        }, _timings.TransportAndMixer, "abs(process_value) <= 1e-4 (MIDI channels: half a 7-bit step); display_value exact",
             cancellationToken, receipt => ReadDouble(receipt["after"]) is { } after && ReadDouble(receipt["before"]) is { } before
                 && Math.Abs(after - before) > 1e-9);
     }

@@ -108,6 +108,16 @@ public sealed class G03VerificationBatchTests
         Assert.Equal(PostconditionVerifier.CanonicalTimeText("5.1.1.0"), PostconditionVerifier.CanonicalTimeText("005.001.01.000"));
     }
 
+    [Fact]
+    public void MidiChannelValuesAreAcceptedWithinHalfASevenBitStep()
+    {
+        // Live on Cubase 15: pan 0.2 on a MIDI track reads back as 25/127.
+        Assert.True(PostconditionVerifier.WithinMidiController(25.0 / 127, 0.2));
+        Assert.True(PostconditionVerifier.WithinMidiController(102.0 / 127, 0.8));
+        Assert.False(PostconditionVerifier.WithinMidiController(26.0 / 127, 0.2));
+        Assert.False(PostconditionVerifier.WithinNormalized(25.0 / 127, 0.2));
+    }
+
     private static JsonObject Op(string id, string operation, JsonObject arguments, params string[]? dependsOn)
     {
         var item = new JsonObject { ["id"] = id, ["operation"] = operation, ["arguments"] = arguments };

@@ -72,6 +72,15 @@ public static class PostconditionVerifier
     public static bool WithinNormalized(double? observed, double desired) =>
         observed is { } value && double.IsFinite(value) && Math.Abs(value - desired) <= NormalizedTolerance;
 
+    /// <summary>
+    /// MIDI track volume and pan are 7-bit controller values (0..127), so a normalized write lands on the nearest
+    /// step; the observed value is accepted within half a step of the request.
+    /// </summary>
+    public const double MidiControllerTolerance = 0.5 / 127 + 1e-6;
+
+    public static bool WithinMidiController(double? observed, double desired) =>
+        observed is { } value && double.IsFinite(value) && Math.Abs(value - desired) <= MidiControllerTolerance;
+
     public static bool WithinTempo(double? observed, double desired) =>
         observed is { } value && double.IsFinite(value) && Math.Abs(value - desired) <= TempoToleranceBpm + 1e-9;
 
