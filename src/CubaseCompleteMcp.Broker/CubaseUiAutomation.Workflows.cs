@@ -236,13 +236,7 @@ public sealed partial class CubaseUiAutomation
         {
             var current = RefreshTarget(target);
             if (!current.IdentityVerified) return null;
-            foreach (var (handle, windowTitle) in ProcessWindows(current.ProcessId))
-            {
-                if (ClassName(handle) != "#32770" || !IsMidiImportDialogTitle(windowTitle) || FileNameEdit(handle) == IntPtr.Zero || !HasControl(handle, IdOk)) continue;
-                dialog = handle;
-                title = windowTitle;
-                break;
-            }
+            (dialog, title) = NativeFileDialog(current.ProcessId, midiImportOnly: true);
             if (dialog == IntPtr.Zero) await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         }
         if (dialog == IntPtr.Zero) return null;
@@ -265,6 +259,21 @@ public sealed partial class CubaseUiAutomation
             ["dialog_title"] = title, ["button"] = "IDOK", ["path"] = full, ["submitted"] = true, ["dialog_closed"] = closed,
             ["method"] = "win32_control_ids", ["unverified_reason"] = Core.MidiImportWorkflowPolicy.SubmissionUnverifiedReason(closed)
         };
+    }
+
+    /// <summary>
+    /// A visible common file dialog of the process (class #32770 with a file-name Edit and IDOK), optionally only the
+    /// MIDI import one. UI Automation does not list these dialogs on Cubase 15, so stage detection uses this.
+    /// </summary>
+    private static (IntPtr Handle, string Title) NativeFileDialog(int processId, bool midiImportOnly)
+    {
+        foreach (var (handle, windowTitle) in ProcessWindows(processId))
+        {
+            if (ClassName(handle) != "#32770" || FileNameEdit(handle) == IntPtr.Zero || !HasControl(handle, IdOk)) continue;
+            if (midiImportOnly && !IsMidiImportDialogTitle(windowTitle)) continue;
+            return (handle, windowTitle);
+        }
+        return (IntPtr.Zero, string.Empty);
     }
 
     // ---- native helpers ----------------------------------------------------------------------------------------

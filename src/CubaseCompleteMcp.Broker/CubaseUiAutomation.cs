@@ -23,6 +23,7 @@ public sealed partial class CubaseUiAutomation(CubaseProcessInspector processIns
     {
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) return false;
+        if (NativeFileDialog(process.ProcessId.Value, midiImportOnly: false).Handle != IntPtr.Zero) return true;
         try { return FindFileDialog(CreateTarget(process)) is not null; }
         catch (Exception ex) when (IsUnavailableElement(ex)) { return false; }
     }
@@ -31,6 +32,7 @@ public sealed partial class CubaseUiAutomation(CubaseProcessInspector processIns
     {
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) return false;
+        if (NativeFileDialog(process.ProcessId.Value, midiImportOnly: true).Handle != IntPtr.Zero) return true;
         try { return FindMidiImportFileDialog(CreateTarget(process)) is not null; }
         catch (Exception ex) when (IsUnavailableElement(ex)) { return false; }
     }
@@ -119,7 +121,8 @@ public sealed partial class CubaseUiAutomation(CubaseProcessInspector processIns
         {
             cancellationToken.ThrowIfCancellationRequested();
             var currentTarget = RefreshTarget(target);
-            if (FindMidiImportFileDialog(currentTarget) is not null
+            if (NativeFileDialog(currentTarget.ProcessId, midiImportOnly: true).Handle != IntPtr.Zero
+                || FindMidiImportFileDialog(currentTarget) is not null
                 || FindMidiImportProjectChoice(currentTarget) is not null)
             {
                 return new JsonObject
@@ -295,7 +298,8 @@ public sealed partial class CubaseUiAutomation(CubaseProcessInspector processIns
             var currentTarget = RefreshTarget(target);
             if (FindMidiImportProjectChoice(currentTarget) is not null)
                 return new JsonObject { ["stage"] = "project_choice", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
-            if (FindMidiImportFileDialog(currentTarget) is not null)
+            if (NativeFileDialog(currentTarget.ProcessId, midiImportOnly: true).Handle != IntPtr.Zero
+                || FindMidiImportFileDialog(currentTarget) is not null)
                 return new JsonObject { ["stage"] = "midi_file_dialog", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
             if (FindImportOptionsDialog(currentTarget) is not null)
                 return new JsonObject { ["stage"] = "import_options", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
