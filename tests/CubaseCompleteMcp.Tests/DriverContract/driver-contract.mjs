@@ -43,6 +43,7 @@ function makeChannel(n, title, params) {
 function createHost(options) {
   const opts = options || {};
   const outbox = [];
+  let loaded = false;
   const calls = { pulses: {}, surfaceWrites: [], slotAssignments: [], directWrites: [], tempo: [], setTime: [] };
   const bindingsByName = {};
   const device = { id: 'mock-device' };
@@ -107,6 +108,8 @@ function createHost(options) {
   };
 
   function makeDirectAccess(hostObject) {
+    // Real hosts only allow host objects to be created while the script loads; a runtime call destabilized Cubase.
+    if (loaded) { calls.runtimeHostObjectCreation = (calls.runtimeHostObjectCreation || 0) + 1; throw new Error('makeDirectAccess called after script load'); }
     if (hostObject === selectedChannel) { return accessFor(function () { return selectedIndex; }, 100, opts.api13 ? slotManager : null); }
     if (hostObject && hostObject.slot) {
       return accessFor(function () { return hostObject.slot.current ? hostObject.slot.current.index : null; },
@@ -171,7 +174,7 @@ function createHost(options) {
   };
   return {
     api: api, page: page, device: device, mapping: mapping, calls: calls, outbox: outbox, bindingsByName: bindingsByName,
-    setContext: function (value) { activeContext = value; }, slots: slots, state: state, midiInput: midiInput,
+    setContext: function (value) { activeContext = value; }, markLoaded: function () { loaded = true; }, bankChannels: bankChannels, slots: slots, state: state, midiInput: midiInput,
     selectedIndex: selectedIndex, timeDisplay: timeDisplay
   };
 }
@@ -185,9 +188,17 @@ function loadDriver(host) {
   const context = vm.createContext(sandbox);
   host.setContext(context);
   new vm.Script(driverSource, { filename: 'CBMCP_CompleteBridge.js' }).runInContext(context);
+  host.markLoaded();
   host.context = context;
   context.page.mOnActivate(host.device, host.mapping);
+  deliverTitles(host);
   return context;
+}
+// The host reports channel titles through each bank channel's mOnTitleChange callback.
+function deliverTitles(host) {
+  host.bankChannels.forEach(function (channel) {
+    if (channel.mOnTitleChange) { channel.mOnTitleChange(host.device, host.mapping, channel.slot.current ? channel.slot.current.tree.title : ''); }
+  });
 }
 
 function drain(host) {
@@ -237,7 +248,8 @@ function refused(host, name, operation, args, code) {
 }
 function pulses(host, name) { return host.calls.pulses[name] || 0; }
 function channelTarget(host, slot) { const c = host.slots[slot].current; return { unique_id: c.uid, runtime_id: c.runtimeId, bank_index: slot }; }
-function scenario(label, options, body) { const host = createHost(options || {}); loadDriver(host); group(label); body(host); }
+let runtimeCreations = 0;
+function scenario(label, options, body) { const host = createHost(options || {}); loadDriver(host); group(label); body(host); runtimeCreations += host.calls.runtimeHostObjectCreation || 0; }
 
 scenario('hello and capabilities', { api13: true }, function (host) {
   const hello = ok(host, 'hello', 'system.hello', { client_nonce: 'n1' });
@@ -312,6 +324,8 @@ scenario('TGT-06 track list scope', { channelCount: 4 }, function (host) {
   const list = ok(host, 'track.list', 'track.list', {});
   check('only occupied bank slots are listed', list && list.channels.length === 4 && list.available_channel_count === 4, list && list.channels.length);
   check('each channel carries identity and slot', list && list.channels.every(function (c) { return c.unique_id && typeof c.runtime_id === 'number' && typeof c.bank_index === 'number'; }), list && list.channels[0]);
+  check('titles come from host title callbacks', list && list.channels[2].title === 'Track 2', list && list.channels[2]);
+  check('listing never creates host objects at runtime', !host.calls.runtimeHostObjectCreation, host.calls.runtimeHostObjectCreation);
   check('EQ child objects are not listed as tracks', list && list.channels.every(function (c) { return c.unique_id.indexOf('uid-eq') !== 0; }));
   check('a partly filled bank is not truncated', list && list.bank_truncated === false, list);
 });
@@ -340,6 +354,7 @@ scenario('TGT-03 reorder and replacement', {}, function (host) {
   const b = host.slots[1].current;
   const a = host.slots[0].current;
   host.slots[1].current = a; host.slots[0].current = b; // Cubase reordered the bank
+  deliverTitles(host);
   const write = ok(host, 'write after reorder', 'mixer.set', { target: planned, parameter: 'pan', process_value: 0.2 });
   check('the write follows identity to the new slot', write && write.target.unique_id === b.uid && write.target.bank_index === 0 && write.target.relocated === true, write && write.target);
   check('the channel now at the old slot is untouched', findParam(a.tree, 1).value === 0 && findParam(b.tree, 1).value === 0.2);
@@ -432,5 +447,7 @@ scenario('F08 snapshot truncation', {}, function (host) {
   refused(host, 'direct.set without a target', 'direct.set', { root: 'mixer', object_id: 2000, parameter_tag: 0, process_value: 0.1 }, 'TARGET_REQUIRED');
 });
 
+group('host object lifetime');
+check('no scenario created a host object after script load', runtimeCreations === 0, runtimeCreations);
 console.log(JSON.stringify({ checks: checks, failures: failures, groups: groups }));
 process.exit(failures.length === 0 ? 0 : 1);

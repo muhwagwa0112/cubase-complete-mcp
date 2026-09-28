@@ -302,8 +302,14 @@ var timeDisplay = transport.mTimeDisplay;
 var selectedTrack = page.mHostAccess.mTrackSelection.mMixerChannel;
 var selectedValues = selectedTrack.mValue;
 var mixBank = page.mHostAccess.mMixConsole.makeMixerBankZone('Cubase Complete MCP Bank');
-var mixChannels = [], mixIndex;
-for (mixIndex = 0; mixIndex < 64; mixIndex += 1) { mixChannels.push(mixBank.makeMixerBankChannel()); }
+var mixChannels = [], mixChannelAccess = [], mixChannelTitles = [], mixIndex;
+// Every host object, including per-channel DirectAccess, is created here while the script loads. Creating host
+// access objects later, from a MIDI callback, destabilized Cubase 15.0.10 in a live run.
+for (mixIndex = 0; mixIndex < 64; mixIndex += 1) {
+    mixChannels.push(mixBank.makeMixerBankChannel());
+    mixChannelTitles.push(null);
+    mixChannelAccess.push(page.mHostAccess.makeDirectAccess ? page.mHostAccess.makeDirectAccess(mixChannels[mixIndex]) : null);
+}
 
 var surface = {
     play: deviceDriver.mSurface.makeCustomValueVariable('Play'), stop: deviceDriver.mSurface.makeCustomValueVariable('Stop'),
@@ -475,28 +481,24 @@ function channelIdentity(index) {
     var rid = channel && channel.getRuntimeID ? Number(channel.getRuntimeID(runtime.mapping)) : null;
     return {bank_index: index, unique_id: uid ? String(uid) : null, runtime_id: (rid === null || !isFinite(rid)) ? null : rid};
 }
+// Channel titles are mirrored from host callbacks registered at load time, so listing tracks never touches
+// DirectAccess. Unknown titles are null, not guessed.
+function bindChannelTitle(index) { mixChannels[index].mOnTitleChange = function (d, m, title) { mixChannelTitles[index] = title === undefined ? null : String(title); }; }
+for (mixIndex = 0; mixIndex < mixChannels.length; mixIndex += 1) { bindChannelTitle(mixIndex); }
 function mixerChannelRoot(index) {
-    var channel = mixChannels[index], cache = runtime.mixRoots[index];
-    if (!channel) { throw codedError('STALE_TARGET', 'mixer bank channel is unavailable at index ' + index); }
-    if (!page.mHostAccess.makeDirectAccess) { throw codedError('UNSUPPORTED_CAPABILITY', 'target-addressed mixer access requires MIDI Remote API 1.2 DirectAccess, which this host does not expose'); }
-    if (!cache) {
-        cache = {root: page.mHostAccess.makeDirectAccess(channel), mapping: runtime.mapping};
-        runtime.mixRoots[index] = cache;
-        if (cache.root.activate) { cache.root.activate(runtime.mapping); }
-    } else if (cache.mapping !== runtime.mapping) {
-        if (cache.root.activate) { cache.root.activate(runtime.mapping); }
-        cache.mapping = runtime.mapping;
-    }
-    if (cache.root.update) { cache.root.update(runtime.mapping); }
-    return cache.root;
+    var root = mixChannelAccess[index];
+    if (!mixChannels[index]) { throw codedError('STALE_TARGET', 'mixer bank channel is unavailable at index ' + index); }
+    if (!root) { throw codedError('UNSUPPORTED_CAPABILITY', 'target-addressed mixer access requires MIDI Remote API 1.2 DirectAccess, which this host does not expose'); }
+    if (!runtime.mapping) { throw codedError('DRIVER_OFFLINE', 'the driver page is not active'); }
+    if (root.update) { root.update(runtime.mapping); }
+    return root;
 }
 function trackList(args) {
-    var channels = [], i, identity, root, objectId;
+    var channels = [], i, identity;
     for (i = 0; i < mixChannels.length; i += 1) {
         identity = channelIdentity(i);
         if (!identity.unique_id) { continue; }
-        root = mixerChannelRoot(i); objectId = Number(root.getBaseObjectID(runtime.mapping));
-        identity.title = root.getObjectTitle(runtime.mapping, objectId); identity.object_id = objectId; identity.kind = 'mixer_channel';
+        identity.title = mixChannelTitles[i]; identity.kind = 'mixer_channel';
         channels.push(identity);
     }
     return {scope: 'mixer_bank', bank_size: mixChannels.length, channels: channels, available_channel_count: channels.length,
@@ -822,12 +824,12 @@ page.mOnActivate = function (activeDevice, activeMapping) {
     runtime.active = true; runtime.device = activeDevice; runtime.mapping = activeMapping; runtime.sessionId = makeSessionId(); runtime.completed = {}; runtime.pendingChunks = {}; runtime.revision += 1;
     resetMirror();
     for (name in runtime.directRoots) { if (runtime.directRoots.hasOwnProperty(name)) { runtime.directRoots[name].activate(activeMapping); } }
-    for (name in runtime.mixRoots) { if (runtime.mixRoots.hasOwnProperty(name) && runtime.mixRoots[name].root.activate) { runtime.mixRoots[name].root.activate(activeMapping); runtime.mixRoots[name].mapping = activeMapping; } }
+    for (name = 0; name < mixChannelAccess.length; name += 1) { if (mixChannelAccess[name] && mixChannelAccess[name].activate) { mixChannelAccess[name].activate(activeMapping); } }
 };
 page.mOnDeactivate = function (activeDevice, activeMapping) {
     var name;
     for (name in runtime.directRoots) { if (runtime.directRoots.hasOwnProperty(name)) { runtime.directRoots[name].deactivate(activeMapping); } }
-    for (name in runtime.mixRoots) { if (runtime.mixRoots.hasOwnProperty(name) && runtime.mixRoots[name].root.deactivate) { runtime.mixRoots[name].root.deactivate(activeMapping); } }
+    for (name = 0; name < mixChannelAccess.length; name += 1) { if (mixChannelAccess[name] && mixChannelAccess[name].deactivate) { mixChannelAccess[name].deactivate(activeMapping); } }
     runtime.active = false; runtime.device = null; runtime.mapping = null; runtime.sessionId = makeSessionId(); runtime.completed = {}; runtime.revision += 1;
     resetMirror();
 };
