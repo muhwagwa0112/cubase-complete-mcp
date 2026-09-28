@@ -302,14 +302,9 @@ var timeDisplay = transport.mTimeDisplay;
 var selectedTrack = page.mHostAccess.mTrackSelection.mMixerChannel;
 var selectedValues = selectedTrack.mValue;
 var mixBank = page.mHostAccess.mMixConsole.makeMixerBankZone('Cubase Complete MCP Bank');
-var mixChannels = [], mixChannelAccess = [], mixChannelTitles = [], mixIndex;
-// Every host object, including per-channel DirectAccess, is created here while the script loads. Creating host
-// access objects later, from a MIDI callback, destabilized Cubase 15.0.10 in a live run.
-for (mixIndex = 0; mixIndex < 64; mixIndex += 1) {
-    mixChannels.push(mixBank.makeMixerBankChannel());
-    mixChannelTitles.push(null);
-    mixChannelAccess.push(page.mHostAccess.makeDirectAccess ? page.mHostAccess.makeDirectAccess(mixChannels[mixIndex]) : null);
-}
+// Every host object is created here while the script loads. Track identity is read through DirectAccess only:
+// in a live run on Cubase 15.0.10, HostObject.getUniqueIDString/getRuntimeID called from a MIDI callback made Cubase
+// report itself unstable, while DirectAccess reads with the same mapping were stable.
 
 var surface = {
     play: deviceDriver.mSurface.makeCustomValueVariable('Play'), stop: deviceDriver.mSurface.makeCustomValueVariable('Stop'),
@@ -423,8 +418,8 @@ function directSnapshot(args) {
         limits: {max_nodes: maxNodes, max_depth: maxDepth, max_parameters: parameterLimit, include_parameters: includeParameters},
         truncation: {queued_nodes_unvisited: queue.length, node_limit_children: nodeLimited, depth_limit_children: depthLimited, nodes_with_truncated_parameters: parametersTruncated}};
 }
-function objectInTree(root, objectId, limit) {
-    var queue = [root.getBaseObjectID(runtime.mapping)], visited = 0, id, count, i;
+function objectInTree(root, objectId, limit, startId) {
+    var queue = [startId === undefined ? root.getBaseObjectID(runtime.mapping) : startId], visited = 0, id, count, i;
     while (queue.length && visited < limit) {
         id = queue.shift(); visited += 1;
         if (id === objectId) { return true; }
@@ -471,55 +466,56 @@ function applyParameter(root, objectId, tag, args) {
 }
 
 // ---- target identity ------------------------------------------------------------------------------------
-function selectedIdentity() {
-    return {kind: 'selected_track', unique_id: selectedTrack.getUniqueIDString ? (selectedTrack.getUniqueIDString(runtime.mapping) || null) : null,
-        runtime_id: selectedTrack.getRuntimeID ? Number(selectedTrack.getRuntimeID(runtime.mapping)) : null,
-        title: runtime.state.selectedTrack};
-}
-function channelIdentity(index) {
-    var channel = mixChannels[index], uid = channel && channel.getUniqueIDString ? channel.getUniqueIDString(runtime.mapping) : '';
-    var rid = channel && channel.getRuntimeID ? Number(channel.getRuntimeID(runtime.mapping)) : null;
-    return {bank_index: index, unique_id: uid ? String(uid) : null, runtime_id: (rid === null || !isFinite(rid)) ? null : rid};
-}
-// Channel titles are mirrored from host callbacks registered at load time, so listing tracks never touches
-// DirectAccess. Unknown titles are null, not guessed.
-function bindChannelTitle(index) { mixChannels[index].mOnTitleChange = function (d, m, title) { mixChannelTitles[index] = title === undefined ? null : String(title); }; }
-for (mixIndex = 0; mixIndex < mixChannels.length; mixIndex += 1) { bindChannelTitle(mixIndex); }
-function mixerChannelRoot(index) {
-    var root = mixChannelAccess[index];
-    if (!mixChannels[index]) { throw codedError('STALE_TARGET', 'mixer bank channel is unavailable at index ' + index); }
-    if (!root) { throw codedError('UNSUPPORTED_CAPABILITY', 'target-addressed mixer access requires MIDI Remote API 1.2 DirectAccess, which this host does not expose'); }
+// Identity comes from DirectAccess only. Channels are the child objects of the VST Mixer ('mixer' root); a channel's
+// identity is its unique ID plus its object ID in that root (the object ID changes when the object is replaced).
+// bank_index is the channel's position among those children, an address rather than an identity.
+var MAX_CHANNELS = 256;
+function mixerRoot() {
+    var root = runtime.directRoots.mixer;
+    if (!root) { throw codedError('UNSUPPORTED_CAPABILITY', 'target-addressed access requires MIDI Remote API 1.2 DirectAccess, which this host does not expose'); }
     if (!runtime.mapping) { throw codedError('DRIVER_OFFLINE', 'the driver page is not active'); }
-    if (root.update) { root.update(runtime.mapping); }
     return root;
 }
-function trackList(args) {
-    var channels = [], i, identity;
-    for (i = 0; i < mixChannels.length; i += 1) {
-        identity = channelIdentity(i);
-        if (!identity.unique_id) { continue; }
-        identity.title = mixChannelTitles[i]; identity.kind = 'mixer_channel';
-        channels.push(identity);
+function mixerChannels() {
+    var root = mixerRoot(), base = root.getBaseObjectID(runtime.mapping), count = root.getNumberOfChildObjects(runtime.mapping, base), channels = [], i, objectId, uid;
+    for (i = 0; i < count && i < MAX_CHANNELS; i += 1) {
+        objectId = Number(root.getChildObjectID(runtime.mapping, base, i));
+        uid = root.getObjectUniqueIDString(runtime.mapping, objectId);
+        if (!uid) { continue; }
+        channels.push({kind: 'mixer_channel', bank_index: i, unique_id: String(uid), runtime_id: objectId, object_id: objectId,
+            title: root.getObjectTitle(runtime.mapping, objectId), channel_type: root.getObjectUniqueName(runtime.mapping, objectId)});
     }
-    return {scope: 'mixer_bank', bank_size: mixChannels.length, channels: channels, available_channel_count: channels.length,
-        bank_truncated: channels.length >= mixChannels.length, selected: selectedIdentity(), session_id: runtime.sessionId};
+    return {channels: channels, total: count};
 }
-// Resolves the planned channel by identity inside the current host callback. A reordered bank is followed only
-// when exactly one slot carries the same unique ID and the runtime ID still matches; anything else is stale.
+function selectedIdentity() {
+    var root = runtime.directRoots.selected_track, base, uid = null, i, channels;
+    var identity = {kind: 'selected_track', unique_id: null, runtime_id: null, title: runtime.state.selectedTrack};
+    if (!root || !runtime.mapping) { return identity; }
+    base = Number(root.getBaseObjectID(runtime.mapping));
+    if (base >= 0) { uid = root.getObjectUniqueIDString(runtime.mapping, base) || null; }
+    if (!uid) { return identity; }
+    identity.unique_id = String(uid); identity.title = root.getObjectTitle(runtime.mapping, base);
+    // Report the object ID the same channel has in the mixer root, so identities are comparable across roots.
+    channels = mixerChannels().channels;
+    for (i = 0; i < channels.length; i += 1) { if (channels[i].unique_id === identity.unique_id) { identity.runtime_id = channels[i].runtime_id; identity.bank_index = channels[i].bank_index; break; } }
+    return identity;
+}
+function trackList(args) {
+    var listed = mixerChannels();
+    return {scope: 'vst_mixer', bank_size: MAX_CHANNELS, channels: listed.channels, available_channel_count: listed.channels.length,
+        bank_truncated: listed.total > MAX_CHANNELS, selected: selectedIdentity(), session_id: runtime.sessionId};
+}
+// Resolves the planned channel by identity inside the current host callback. A reordered mixer is followed when
+// exactly one channel carries the unique ID and its object ID still matches; anything else is stale.
 function resolveTarget(expected) {
-    var i, identity, matches = [];
+    var channels, i, matches = [], identity;
     if (!expected || typeof expected.unique_id !== 'string' || !expected.unique_id) { throw codedError('TARGET_REQUIRED', 'a resolved target identity (unique_id, runtime_id, bank_index) is required'); }
-    if (typeof expected.bank_index === 'number' && expected.bank_index >= 0 && expected.bank_index < mixChannels.length) {
-        identity = channelIdentity(expected.bank_index);
-        if (identity.unique_id === expected.unique_id) { matches.push(identity); }
-    }
-    if (matches.length === 0) {
-        for (i = 0; i < mixChannels.length; i += 1) { identity = channelIdentity(i); if (identity.unique_id === expected.unique_id) { matches.push(identity); } }
-    }
-    if (matches.length !== 1) { throw codedError('STALE_TARGET', matches.length === 0 ? 'the planned channel is no longer in the mixer bank' : 'the planned channel identity is ambiguous in the mixer bank', {expected: expected}); }
+    channels = mixerChannels().channels;
+    for (i = 0; i < channels.length; i += 1) { if (channels[i].unique_id === expected.unique_id) { matches.push(channels[i]); } }
+    if (matches.length !== 1) { throw codedError('STALE_TARGET', matches.length === 0 ? 'the planned channel is no longer in the mixer' : 'the planned channel identity is ambiguous in the mixer', {expected: expected}); }
     identity = matches[0];
     if (expected.runtime_id !== null && expected.runtime_id !== undefined && identity.runtime_id !== expected.runtime_id) {
-        throw codedError('STALE_TARGET', 'the planned channel object was replaced (runtime ID changed)', {expected: expected, observed: identity});
+        throw codedError('STALE_TARGET', 'the planned channel object was replaced (object ID changed)', {expected: expected, observed: identity});
     }
     identity.relocated = identity.bank_index !== expected.bank_index;
     return identity;
@@ -552,14 +548,13 @@ function findNamedParameter(root, objectId, requested) {
     throw codedError('PARAMETER_NOT_EXPOSED', 'parameter "' + requested + '" is not exposed on the target channel; observed titles: ' + samples.join(', '), {observed_titles: samples});
 }
 function targetParameter(args) {
-    var identity = resolveTarget(args.target), root = mixerChannelRoot(identity.bank_index), objectId = Number(root.getBaseObjectID(runtime.mapping)), found, tag;
-    identity.object_id = objectId;
+    var identity = resolveTarget(args.target), root = mixerRoot(), objectId = identity.object_id, found, tag;
     if (args.parameter_tag !== undefined && args.parameter_tag !== null) {
         tag = Number(args.parameter_tag);
         if (!isFinite(tag)) { throw codedError('INVALID_ARGUMENT', 'parameter_tag must be a number'); }
         if (args.object_id !== undefined && args.object_id !== null) {
             objectId = Number(args.object_id);
-            if (!objectInTree(root, objectId, 1024)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id ' + args.object_id + ' is not part of the resolved channel'); }
+            if (!objectInTree(root, objectId, 1024, identity.object_id)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id ' + args.object_id + ' is not part of the resolved channel'); }
         }
         found = {tag: tag, title: root.getParameterTitle(runtime.mapping, objectId, tag, 256)};
     } else { found = findNamedParameter(root, objectId, args.parameter); }
@@ -694,10 +689,10 @@ function getMixer(args) {
 function directSet(args) {
     var root, objectId = Number(args.object_id), tag = Number(args.parameter_tag), result, guard = null, identity = null;
     if (!isFinite(objectId) || !isFinite(tag)) { throw codedError('INVALID_ARGUMENT', 'object_id and parameter_tag are required numbers'); }
-    if (args.target) { identity = resolveTarget(args.target); root = mixerChannelRoot(identity.bank_index); }
+    if (args.target) { identity = resolveTarget(args.target); root = mixerRoot(); }
     else if (args.expected_selected && (args.root || 'selected_track') === 'selected_track') { guard = assertSelected(args.expected_selected); root = directRoot('selected_track'); }
     else { throw codedError('TARGET_REQUIRED', 'direct writes require a target channel or expected_selected on the selected_track root'); }
-    if (!objectInTree(root, objectId, 1024)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id ' + objectId + ' is not part of the resolved target'); }
+    if (!objectInTree(root, objectId, 1024, identity ? identity.object_id : undefined)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id ' + objectId + ' is not part of the resolved target'); }
     result = applyParameter(root, objectId, tag, args);
     result.target = identity || guard; result.object_id = objectId; result.parameter_tag = tag;
     return result;
@@ -707,14 +702,14 @@ function directSet(args) {
 function directGet(args) {
     var root, identity, objectId, tag;
     if (args.object_id !== undefined && args.parameter_tag !== undefined && (args.target || args.expected_selected)) {
-        if (args.target) { identity = resolveTarget(args.target); root = mixerChannelRoot(identity.bank_index); }
+        if (args.target) { identity = resolveTarget(args.target); root = mixerRoot(); }
         else { identity = assertSelected(args.expected_selected); root = directRoot('selected_track'); }
         objectId = Number(args.object_id); tag = Number(args.parameter_tag);
         if (!isFinite(objectId) || !isFinite(tag)) { throw codedError('INVALID_ARGUMENT', 'object_id and parameter_tag must be numbers'); }
-        if (!objectInTree(root, objectId, 1024)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id is not part of the resolved target'); }
+        if (!objectInTree(root, objectId, 1024, args.target ? identity.object_id : undefined)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id is not part of the resolved target'); }
         return {target: identity, object_id: objectId, read: readParameter(root, objectId, tag), fresh: true};
     }
-    if (args.target) { identity = resolveTarget(args.target); args.root = 'mixer'; }
+    if (args.target) { resolveTarget(args.target); args.root = 'mixer'; }
     return directSnapshot(args);
 }
 
@@ -728,8 +723,8 @@ function pluginSlotState(root, objectId) {
         child_objects: root.getNumberOfChildObjects(runtime.mapping, objectId)};
 }
 function pluginRoot(args) {
-    if (args.target) { return {root: mixerChannelRoot(resolveTarget(args.target).bank_index), guard: null}; }
-    if (args.expected_selected) { return {root: directRoot('selected_track'), guard: assertSelected(args.expected_selected)}; }
+    if (args.target) { return {root: mixerRoot(), guard: null, scope: resolveTarget(args.target).object_id}; }
+    if (args.expected_selected) { return {root: directRoot('selected_track'), guard: assertSelected(args.expected_selected), scope: undefined}; }
     throw codedError('TARGET_REQUIRED', 'plug-in slot operations require a target channel or expected_selected');
 }
 function pluginGet(args) {
@@ -756,7 +751,7 @@ function pluginSet(args) {
     if (!manager || !manager.trySetSlotPlugin) { throw codedError('UNSUPPORTED_CAPABILITY', 'plug-in slot assignment requires MIDI Remote API 1.3; this host does not expose mPluginManager.trySetSlotPlugin'); }
     if (!isFinite(objectId) || objectId < 0) { throw codedError('INVALID_ARGUMENT', 'object_id of the target plug-in slot is required'); }
     if (typeof args.plugin_uid !== 'string' || args.plugin_uid.length === 0) { throw codedError('INVALID_ARGUMENT', 'plugin_uid is required for plug-in slot assignment'); }
-    if (!objectInTree(located.root, objectId, 1024)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id is not a slot of the resolved target'); }
+    if (!objectInTree(located.root, objectId, 1024, located.scope)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id is not a slot of the resolved target'); }
     before = pluginSlotState(located.root, objectId);
     if (args.expected_slot_unique_id !== undefined && args.expected_slot_unique_id !== before.unique_id) { throw codedError('TARGET_CHANGED', 'the slot content changed after the assignment was planned; nothing was changed', {observed: before}); }
     runtime.revision += 1; dispatchRevision = runtime.revision;
@@ -771,7 +766,7 @@ function capabilities() {
         api_1_2_direct_access: !!page.mHostAccess.makeDirectAccess,
         api_1_3_command_can_perform: runtime.commandBindings.length > 0 && !!runtime.commandBindings[0].canPerform,
         api_1_3_plugin_manager: !!(runtime.directRoots.selected_track && runtime.directRoots.selected_track.mPluginManager),
-        plugin_catalog: false, target_identity: !!(mixChannels.length && mixChannels[0].getUniqueIDString),
+        plugin_catalog: false, target_identity: !!runtime.directRoots.mixer,
         command_count: runtime.commandIds.length,
         operations: ['status.get','capabilities.get','command.execute','command.can_perform','transport.get','transport.set','track.get','track.list','track.set','mixer.get','mixer.set','plugin.get','plugin.set','direct.get','direct.set']};
 }
@@ -824,12 +819,10 @@ page.mOnActivate = function (activeDevice, activeMapping) {
     runtime.active = true; runtime.device = activeDevice; runtime.mapping = activeMapping; runtime.sessionId = makeSessionId(); runtime.completed = {}; runtime.pendingChunks = {}; runtime.revision += 1;
     resetMirror();
     for (name in runtime.directRoots) { if (runtime.directRoots.hasOwnProperty(name)) { runtime.directRoots[name].activate(activeMapping); } }
-    for (name = 0; name < mixChannelAccess.length; name += 1) { if (mixChannelAccess[name] && mixChannelAccess[name].activate) { mixChannelAccess[name].activate(activeMapping); } }
 };
 page.mOnDeactivate = function (activeDevice, activeMapping) {
     var name;
     for (name in runtime.directRoots) { if (runtime.directRoots.hasOwnProperty(name)) { runtime.directRoots[name].deactivate(activeMapping); } }
-    for (name = 0; name < mixChannelAccess.length; name += 1) { if (mixChannelAccess[name] && mixChannelAccess[name].deactivate) { mixChannelAccess[name].deactivate(activeMapping); } }
     runtime.active = false; runtime.device = null; runtime.mapping = null; runtime.sessionId = makeSessionId(); runtime.completed = {}; runtime.revision += 1;
     resetMirror();
 };

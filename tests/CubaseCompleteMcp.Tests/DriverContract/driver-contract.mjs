@@ -56,6 +56,9 @@ function createHost(options) {
   const state = { selected: slots[0].current };
 
   const selectedTree = node(100, 'Selected', 'uid-selected-root', [param(0, 'Volume')]);
+  // The selected-track root reports the unique ID of whatever track is selected (empty when none is).
+  Object.defineProperty(selectedTree, 'uniqueId', { get: function () { return state.selected ? state.selected.uid : ''; } });
+  Object.defineProperty(selectedTree, 'title', { get: function () { return state.selected ? state.selected.tree.title : ''; } });
   selectedTree.children.push(node(102, 'Insert 1', 'uid-selected-insert', [param(0, 'Bypass')]));
   const selectedIndex = indexTree(selectedTree);
   const slotManager = {
@@ -96,29 +99,29 @@ function createHost(options) {
   const bankChannels = slots.map(function (slot) {
     return {
       slot: slot,
-      getUniqueIDString: function () { return slot.current ? slot.current.uid : ''; },
-      getRuntimeID: function () { return slot.current ? slot.current.runtimeId : 0; }
+      getUniqueIDString: function () { calls.hostIdGetter = (calls.hostIdGetter || 0) + 1; return slot.current ? slot.current.uid : ''; },
+      getRuntimeID: function () { calls.hostIdGetter = (calls.hostIdGetter || 0) + 1; return slot.current ? slot.current.runtimeId : 0; }
     };
   });
   let bankCursor = 0;
   const bankObject = { makeMixerBankChannel: function () { return bankChannels[bankCursor++]; } };
   const selectedChannel = {
-    mValue: {}, getUniqueIDString: function () { return state.selected ? state.selected.uid : ''; },
-    getRuntimeID: function () { return state.selected ? state.selected.runtimeId : 0; }
+    mValue: {}, getUniqueIDString: function () { calls.hostIdGetter = (calls.hostIdGetter || 0) + 1; return state.selected ? state.selected.uid : ''; },
+    getRuntimeID: function () { calls.hostIdGetter = (calls.hostIdGetter || 0) + 1; return state.selected ? state.selected.runtimeId : 0; }
   };
 
   function makeDirectAccess(hostObject) {
     // Real hosts only allow host objects to be created while the script loads; a runtime call destabilized Cubase.
     if (loaded) { calls.runtimeHostObjectCreation = (calls.runtimeHostObjectCreation || 0) + 1; throw new Error('makeDirectAccess called after script load'); }
-    if (hostObject === selectedChannel) { return accessFor(function () { return selectedIndex; }, 100, opts.api13 ? slotManager : null); }
+    if (hostObject === selectedChannel) { return accessFor(function () { return selectedIndex; }, function () { return state.selected ? 100 : -1; }, opts.api13 ? slotManager : null); }
     if (hostObject && hostObject.slot) {
       return accessFor(function () { return hostObject.slot.current ? hostObject.slot.current.index : null; },
         function () { return hostObject.slot.current ? hostObject.slot.current.tree.id : -1; }, null);
     }
     const empty = node(9000, 'Root', 'uid-root', []);
-    const bank = node(900, 'Bank', 'uid-bank', []);
-    for (let i = 0; i < 3; i += 1) { if (slots[i].current) { bank.children.push(slots[i].current.tree); } }
-    return hostObject === bankObject ? accessFor(function () { return indexTree(bank); }, 900, null) : accessFor(function () { return indexTree(empty); }, 9000, null);
+    // The mixer root is the VST Mixer: its children are the current channels, in mixer order.
+    function mixerTree() { const bank = node(900, 'VST Mixer', 'uid-vst-mixer', []); slots.forEach(function (slot) { if (slot.current) { bank.children.push(slot.current.tree); } }); return indexTree(bank); }
+    return hostObject === bankObject ? accessFor(mixerTree, 900, null) : accessFor(function () { return indexTree(empty); }, 9000, null);
   }
 
   function makeVariable(name) {
@@ -247,9 +250,12 @@ function refused(host, name, operation, args, code) {
   return error;
 }
 function pulses(host, name) { return host.calls.pulses[name] || 0; }
-function channelTarget(host, slot) { const c = host.slots[slot].current; return { unique_id: c.uid, runtime_id: c.runtimeId, bank_index: slot }; }
+function mixerIndex(host, slot) { return host.slots.slice(0, slot).filter(function (item) { return item.current; }).length; }
+function channelTarget(host, slot) { const c = host.slots[slot].current; return { unique_id: c.uid, runtime_id: c.tree.id, bank_index: mixerIndex(host, slot) }; }
+function selectedGuard(host) { return { unique_id: host.state.selected.uid, runtime_id: host.state.selected.tree.id }; }
 let runtimeCreations = 0;
-function scenario(label, options, body) { const host = createHost(options || {}); loadDriver(host); group(label); body(host); runtimeCreations += host.calls.runtimeHostObjectCreation || 0; }
+let hostIdGetterCalls = 0;
+function scenario(label, options, body) { const host = createHost(options || {}); loadDriver(host); group(label); body(host); runtimeCreations += host.calls.runtimeHostObjectCreation || 0; hostIdGetterCalls += host.calls.hostIdGetter || 0; }
 
 scenario('hello and capabilities', { api13: true }, function (host) {
   const hello = ok(host, 'hello', 'system.hello', { client_nonce: 'n1' });
@@ -324,14 +330,16 @@ scenario('TGT-06 track list scope', { channelCount: 4 }, function (host) {
   const list = ok(host, 'track.list', 'track.list', {});
   check('only occupied bank slots are listed', list && list.channels.length === 4 && list.available_channel_count === 4, list && list.channels.length);
   check('each channel carries identity and slot', list && list.channels.every(function (c) { return c.unique_id && typeof c.runtime_id === 'number' && typeof c.bank_index === 'number'; }), list && list.channels[0]);
-  check('titles come from host title callbacks', list && list.channels[2].title === 'Track 2', list && list.channels[2]);
+  check('titles come from DirectAccess object titles', list && list.channels[2].title === 'Track 2', list && list.channels[2]);
+  check('runtime_id is the object ID in the mixer root', list && list.channels[1].runtime_id === host.slots[1].current.tree.id, list && list.channels[1]);
   check('listing never creates host objects at runtime', !host.calls.runtimeHostObjectCreation, host.calls.runtimeHostObjectCreation);
   check('EQ child objects are not listed as tracks', list && list.channels.every(function (c) { return c.unique_id.indexOf('uid-eq') !== 0; }));
   check('a partly filled bank is not truncated', list && list.bank_truncated === false, list);
 });
-scenario('TGT-06 full bank is flagged', { channelCount: 64 }, function (host) {
+scenario('TGT-06 large mixer is not capped at 64', { channelCount: 64 }, function (host) {
   const list = ok(host, 'track.list', 'track.list', {});
-  check('a full 64-slot bank reports possible truncation', list && list.bank_truncated === true && list.bank_size === 64, list && list.bank_size);
+  check('all 64 channels are listed without truncation', list && list.channels.length === 64 && list.bank_truncated === false, list && list.channels.length);
+  check('listing scope is the VST Mixer', list && list.scope === 'vst_mixer', list && list.scope);
 });
 
 scenario('TGT-01 target-addressed mixer read and write', {}, function (host) {
@@ -358,12 +366,13 @@ scenario('TGT-03 reorder and replacement', {}, function (host) {
   const write = ok(host, 'write after reorder', 'mixer.set', { target: planned, parameter: 'pan', process_value: 0.2 });
   check('the write follows identity to the new slot', write && write.target.unique_id === b.uid && write.target.bank_index === 0 && write.target.relocated === true, write && write.target);
   check('the channel now at the old slot is untouched', findParam(a.tree, 1).value === 0 && findParam(b.tree, 1).value === 0.2);
-  b.runtimeId = 9999; // object replaced
+  const replaced = makeChannel(9, 'Replacement'); replaced.uid = b.uid; replaced.tree.uniqueId = b.uid; replaced.index = indexTree(replaced.tree);
+  host.slots[0].current = replaced; // object replaced: same unique ID, new object ID
   const writesBefore = host.calls.directWrites.length;
   refused(host, 'write after the object was replaced', 'mixer.set', { target: planned, parameter: 'pan', process_value: 0.9 }, 'STALE_TARGET');
   check('no write reached any channel', host.calls.directWrites.length === writesBefore);
   host.slots[0].current = null;
-  refused(host, 'write after the channel left the bank', 'mixer.set', { target: { unique_id: b.uid, runtime_id: 9999, bank_index: 0 }, parameter: 'pan', process_value: 0.9 }, 'STALE_TARGET');
+  refused(host, 'write after the channel left the mixer', 'mixer.set', { target: { unique_id: b.uid, runtime_id: replaced.tree.id, bank_index: 0 }, parameter: 'pan', process_value: 0.9 }, 'STALE_TARGET');
 });
 
 scenario('TGT-07 parameter resolution', {}, function (host) {
@@ -386,18 +395,18 @@ scenario('TGT-02 selection guard in the command callback', {}, function (host) {
   const count = host.context.runtime.commandIds.length;
   check('catalog commands are registered', count > 0);
   const id = host.context.runtime.commandIds[0];
-  const expected = { unique_id: host.state.selected.uid, runtime_id: host.state.selected.runtimeId };
+  const expected = selectedGuard(host);
   host.state.selected = host.slots[1].current; // the user selected another track after planning
   refused(host, 'guarded command after a selection change', 'command.execute', { id: id, requires_target: true, expected_selected: expected }, 'TARGET_CHANGED');
   check('no command pulse was sent', pulses(host, 'Command ' + id) === 0);
   refused(host, 'target-requiring command without a guard', 'command.execute', { id: id, requires_target: true }, 'TARGET_CONTEXT_UNSAFE');
-  const guarded = ok(host, 'guarded command with the right selection', 'command.execute', { id: id, requires_target: true, expected_selected: { unique_id: host.state.selected.uid, runtime_id: host.state.selected.runtimeId } });
+  const guarded = ok(host, 'guarded command with the right selection', 'command.execute', { id: id, requires_target: true, expected_selected: selectedGuard(host) });
   check('the guarded command pulses once', pulses(host, 'Command ' + id) === 1 && guarded.mutation_sent === true, guarded);
   refused(host, 'unknown command id', 'command.execute', { id: 'cmd-missing' }, 'COMMAND_NOT_FOUND');
 });
 
 scenario('selected-track mixer path', { autoToggle: {} }, function (host) {
-  const guard = { unique_id: host.state.selected.uid, runtime_id: host.state.selected.runtimeId };
+  const guard = selectedGuard(host);
   refused(host, 'toggle with unknown mute state', 'mixer.set', { expected_selected: guard, parameter: 'mute', value: true }, 'STATE_UNKNOWN');
   host.bindingsByName.mMute.mOnValueChange = host.bindingsByName.mMute.mOnValueChange || null;
   host.context.selectedValues.mMute.mOnProcessValueChange(host.device, host.mapping, 0);
@@ -410,7 +419,7 @@ scenario('selected-track mixer path', { autoToggle: {} }, function (host) {
 });
 
 scenario('plug-in slots on an API 1.3 host', { api13: true }, function (host) {
-  const guard = { unique_id: host.state.selected.uid, runtime_id: host.state.selected.runtimeId };
+  const guard = selectedGuard(host);
   const catalog = ok(host, 'catalog', 'plugin.get', { action: 'catalog' });
   check('no UID catalog is fabricated', catalog && catalog.available === false && catalog.entries.length === 0, catalog);
   const inspected = ok(host, 'inspect_slot', 'plugin.get', { action: 'inspect_slot', expected_selected: guard, object_id: 102 });
@@ -427,7 +436,7 @@ scenario('plug-in slots on an API 1.3 host', { api13: true }, function (host) {
 });
 
 scenario('API 1.2 host', { api13: false }, function (host) {
-  const guard = { unique_id: host.state.selected.uid, runtime_id: host.state.selected.runtimeId };
+  const guard = selectedGuard(host);
   check('API 1.3 plug-in manager is reported unavailable', host.context.capabilities().api_1_3_plugin_manager === false);
   refused(host, 'assign without a plug-in manager', 'plugin.set', { action: 'assign', expected_selected: guard, object_id: 102, plugin_uid: 'u1' }, 'UNSUPPORTED_CAPABILITY');
   const capability = ok(host, 'can_perform', 'command.can_perform', { id: host.context.runtime.commandIds[0] });
@@ -449,5 +458,6 @@ scenario('F08 snapshot truncation', {}, function (host) {
 
 group('host object lifetime');
 check('no scenario created a host object after script load', runtimeCreations === 0, runtimeCreations);
+check('no scenario called HostObject getUniqueIDString/getRuntimeID', hostIdGetterCalls === 0, hostIdGetterCalls);
 console.log(JSON.stringify({ checks: checks, failures: failures, groups: groups }));
 process.exit(failures.length === 0 ? 0 : 1);
