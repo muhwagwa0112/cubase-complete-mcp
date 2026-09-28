@@ -106,14 +106,14 @@ public sealed partial class CubaseController
         var selected = SelectedIdentity(reply.Data?["selected"]);
         var data = new JsonObject
         {
-            ["scope"] = "mixer_bank",
+            ["scope"] = reply.Data?["scope"]?.DeepClone() ?? "vst_mixer",
             ["bank_size"] = reply.Data?["bank_size"]?.DeepClone(),
             ["available_channel_count"] = channels.Count,
             ["bank_truncated"] = reply.Data?["bank_truncated"]?.DeepClone(),
             ["truncated"] = reply.Data?["bank_truncated"]?.DeepClone(),
             ["channels"] = channels,
             ["selected"] = selected.HasStableIdentity ? _targets.Issue(session, epochs, selected).ToPublicJson() : null,
-            ["note"] = "bank_index is the 0-63 MixConsole bank slot where a channel was observed. Handles bind the unique/runtime identity and expire after 5 minutes or on a driver/project change. Channels outside the 64-slot bank are not listed."
+            ["note"] = "Channels are the VST Mixer channels read through DirectAccess. bank_index is the channel's current position in the mixer (an address, not an identity). Handles bind the unique ID and mixer object ID and expire after 5 minutes or on a driver/project change."
         };
         return BrokerResponse.Success(request.Id, data, "midi_remote.mixer_bank", true, sessionRevision: reply.Revision,
             executionState: ExecutionState.NotApplicable);

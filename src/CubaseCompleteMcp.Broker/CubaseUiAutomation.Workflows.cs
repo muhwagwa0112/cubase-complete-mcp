@@ -1,42 +1,40 @@
 using System.Collections.Concurrent;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json.Nodes;
-using System.Windows.Automation;
 
 namespace CubaseCompleteMcp.Broker;
 
 /// <summary>
-/// Workflow dialog stages for tracks, projects and export. A dialog is accepted only when the window ownership
-/// policy accepts it for the declared stage AND both its title role and its control signature match; the found
-/// window is then bound to an opaque ID so later steps cannot drift to another window.
-/// Status: implemented against UI Automation, not validated on a live Cubase in this change (implemented_unvalidated).
+/// Workflow dialog stages for tracks, projects and export, driven through native window handles.
+/// Live findings on Cubase 15.0.10 (Korean Windows): the Windows common file dialogs expose their file-name field and
+/// Save/Open/Cancel buttons to UI Automation only as unnamed/localized panes, and Cubase's own dialogs (Add Track,
+/// Export Audio Mixdown) expose no controls at all. Common dialogs are therefore driven by their stable Win32 control IDs
+/// (file name 1001/1148, IDOK 1, IDCANCEL 2, IDYES 6, IDNO 7) with WM_SETTEXT/WM_COMMAND, which needs no focus; Cubase
+/// dialogs are driven by keyboard only while they are the verified foreground window. A dialog is accepted only when
+/// it belongs to the identity-verified Cubase process and its title matches the stage; it is then bound to an opaque ID.
 /// </summary>
 public sealed partial class CubaseUiAutomation
 {
     private readonly ConcurrentDictionary<string, OwnedDialog> _dialogs = new(StringComparer.Ordinal);
 
-    private sealed record OwnedDialog(string Id, string Kind, AutomationElement Element, IntPtr Handle, CubaseWindowTarget Target);
+    private sealed record OwnedDialog(string Id, string Kind, IntPtr Handle, CubaseWindowTarget Target, string Title);
 
-    private sealed record DialogSignature(CubaseDialogStage Stage, string[] TitleFragments, Func<AutomationElement, bool> Structure);
+    private sealed record DialogSignature(string[] TitleFragments, bool CommonDialog, Func<IntPtr, bool> Structure);
+
+    private const int IdOk = 1, IdCancel = 2, IdYes = 6, IdNo = 7;
 
     private static DialogSignature SignatureFor(string kind) => kind switch
     {
-        DialogKinds.FileOpen => new(CubaseDialogStage.FileDialog, ["Open Project", "프로젝트 열기", "Open", "열기"],
-            window => FindFileNameEdit(window) is not null && FindButton(window, ["open", "열기"]) is not null),
-        DialogKinds.FileSave => new(CubaseDialogStage.FileDialog, ["Save As", "다른 이름으로 저장", "Save Project", "프로젝트 저장"],
-            window => FindFileNameEdit(window) is not null && FindButton(window, ["save", "저장"]) is not null),
-        DialogKinds.ExportAudio => new(CubaseDialogStage.GenericModal, ["Export Audio Mixdown", "오디오 믹스다운 내보내기", "Audio Mixdown", "믹스다운"],
-            window => FindButton(window, ["export audio", "export", "오디오 내보내기", "내보내기"]) is not null),
-        DialogKinds.AddTrack => new(CubaseDialogStage.GenericModal, ["Add Track", "트랙 추가"],
-            window => FindButton(window, ["add track", "트랙 추가"]) is not null),
-        DialogKinds.OverwritePrompt => new(CubaseDialogStage.GenericModal, ["Replace", "already exists", "Confirm Save As", "바꾸", "이미 있", "덮어쓰"],
-            window => FindFileNameEdit(window) is null
-                && FindButton(window, ["replace", "yes", "바꾸기", "예"]) is not null
-                && FindButton(window, ["no", "cancel", "아니요", "취소"]) is not null),
-        DialogKinds.SaveChangesPrompt => new(CubaseDialogStage.GenericModal, ["Cubase", "Save", "저장"],
-            window => FindButton(window, ["don't save", "do not save", "저장 안 함", "저장하지 않음"]) is not null
-                && FindButton(window, ["save", "저장"]) is not null),
+        DialogKinds.FileOpen => new(["Open Project", "프로젝트 열기", "Open", "열기"], true, handle => FileNameEdit(handle) != IntPtr.Zero && HasControl(handle, IdOk)),
+        DialogKinds.FileSave => new(["Save As", "다른 이름으로 저장", "Save Project", "프로젝트 저장"], true, handle => FileNameEdit(handle) != IntPtr.Zero && HasControl(handle, IdOk)),
+        DialogKinds.OverwritePrompt => new(["Confirm Save As", "다른 이름으로 저장 확인", "Save As", "다른 이름으로 저장", "Replace", "바꾸"], true,
+            handle => FileNameEdit(handle) == IntPtr.Zero && HasControl(handle, IdYes) && HasControl(handle, IdNo)),
+        DialogKinds.ExportAudio => new(["Export Audio Mixdown", "오디오 믹스다운 내보내기"], false, _ => true),
+        DialogKinds.AddTrack => new(["Add Track", "트랙 추가"], false, _ => true),
+        DialogKinds.SaveChangesPrompt => new(["Cubase Pro", "Cubase"], false, handle => ClassName(handle) != "#32770" || !HasControl(handle, 1001)),
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unknown workflow dialog kind.")
     };
 
@@ -47,74 +45,66 @@ public sealed partial class CubaseUiAutomation
         if (!process.Running || process.ProcessId is null) return null;
         var target = CreateTarget(process);
         var clock = System.Diagnostics.Stopwatch.StartNew();
-        do
+        while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            try
+            var current = RefreshTarget(target);
+            if (current.IdentityVerified)
             {
-                var current = RefreshTarget(target);
-                var window = FindProcessWindowCandidates(current, signature.Stage, signature.TitleFragments, signature.Structure)
-                    .Where(candidate => MatchedTitleFragments(candidate.Current.Name, signature.TitleFragments).Count > 0
-                        && ProbeStructuralRole(signature.Structure, candidate))
-                    .LastOrDefault();
-                if (window is not null)
+                foreach (var (handle, title) in ProcessWindows(current.ProcessId))
                 {
+                    if (!TitleMatches(kind, title, signature) || !signature.Structure(handle)) continue;
+                    if (signature.CommonDialog && ClassName(handle) != "#32770") continue;
                     var id = "dlg_" + Convert.ToHexString(RandomNumberGenerator.GetBytes(12)).ToLowerInvariant();
-                    var dialog = new OwnedDialog(id, kind, window, new IntPtr(window.Current.NativeWindowHandle), current);
-                    _dialogs[id] = dialog;
-                    return new UiDialogRef(id, kind, window.Current.Name);
+                    _dialogs[id] = new OwnedDialog(id, kind, handle, current, title);
+                    return new UiDialogRef(id, kind, title);
                 }
             }
-            catch (Exception ex) when (IsUnavailableElement(ex)) { }
             if (clock.Elapsed >= timeout) return null;
             await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         }
-        while (true);
     }
 
+    private static bool TitleMatches(string kind, string title, DialogSignature signature) => kind == DialogKinds.SaveChangesPrompt
+        ? signature.TitleFragments.Any(fragment => title.Equals(fragment, StringComparison.Ordinal))
+        : signature.TitleFragments.Any(fragment => title.Contains(fragment, StringComparison.OrdinalIgnoreCase));
+
     public bool IsDialogOpen(UiDialogRef dialog) =>
-        _dialogs.TryGetValue(dialog.Id, out var owned) && owned.Handle != IntPtr.Zero && IsWindow(owned.Handle)
-        && IsWindowVisible(owned.Handle);
+        _dialogs.TryGetValue(dialog.Id, out var owned) && IsWindow(owned.Handle) && IsWindowVisible(owned.Handle);
 
     /// <summary>Re-validates that the bound window is still the same live dialog of the same Cubase process.</summary>
     private OwnedDialog? Revalidate(UiDialogRef dialog)
     {
         if (!_dialogs.TryGetValue(dialog.Id, out var owned) || owned.Kind != dialog.Kind) return null;
-        if (owned.Handle == IntPtr.Zero || !IsWindow(owned.Handle)) return null;
+        if (!IsWindow(owned.Handle) || !IsWindowVisible(owned.Handle)) return null;
         if (!RefreshTarget(owned.Target).IdentityVerified) return null;
-        try
-        {
-            return ProbeStructuralRole(SignatureFor(owned.Kind).Structure, owned.Element) ? owned : null;
-        }
-        catch (Exception ex) when (IsUnavailableElement(ex)) { return null; }
+        _ = GetWindowThreadProcessId(owned.Handle, out var pid);
+        return pid == owned.Target.ProcessId ? owned : null;
     }
 
     public async Task<UiStageResult> SubmitPathAsync(UiDialogRef dialog, string absolutePath, CancellationToken cancellationToken)
     {
         if (!Path.IsPathFullyQualified(absolutePath)) return UiStageResult.Failure("submit_path", "INVALID_ARGUMENT", "Path must be absolute.");
         var owned = Revalidate(dialog);
-        if (owned is null) return UiStageResult.Failure("submit_path", "WORKFLOW_DIALOG_LOST", "The bound file dialog is no longer open or no longer matches its stage.");
-        try
-        {
-            var edit = FindFileNameEdit(owned.Element);
-            var accept = dialog.Kind == DialogKinds.FileSave ? FindButton(owned.Element, ["save", "저장"]) : FindButton(owned.Element, ["open", "열기"]);
-            if (edit is null || accept is null)
-                return UiStageResult.Failure("submit_path", "WORKFLOW_CONTROL_MISSING", "The file dialog did not expose a file-name field and its accept button.");
-            ((ValuePattern)edit.GetCurrentPattern(ValuePattern.Pattern)).SetValue(Path.GetFullPath(absolutePath));
-            InvokeButton(accept);
-        }
-        catch (Exception ex) when (IsUnavailableElement(ex))
-        {
-            return UiStageResult.Failure("submit_path", "WORKFLOW_DIALOG_LOST", "The file dialog changed while the path was entered: " + ex.Message);
-        }
+        if (owned is null) return UiStageResult.Failure("submit_path", "WORKFLOW_DIALOG_LOST", "The bound file dialog is no longer open.");
+        var edit = FileNameEdit(owned.Handle);
+        if (edit == IntPtr.Zero || !HasControl(owned.Handle, IdOk))
+            return UiStageResult.Failure("submit_path", "WORKFLOW_CONTROL_MISSING", "The file dialog has no file-name field (1001/1148) or accept button (IDOK).");
+        var full = Path.GetFullPath(absolutePath);
+        _ = SendMessage(edit, 0x000C /* WM_SETTEXT */, IntPtr.Zero, full);
+        var echoed = WindowText(edit);
+        if (!string.Equals(echoed, full, StringComparison.Ordinal))
+            return UiStageResult.Failure("submit_path", "WORKFLOW_CONTROL_MISSING", "The file-name field did not accept the path.",
+                new JsonObject { ["field_text"] = echoed });
+        PressDialogButton(owned.Handle, IdOk);
         for (var attempt = 0; attempt < 50; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!IsWindow(owned.Handle) || !IsWindowVisible(owned.Handle))
-                return UiStageResult.Success("submit_path", new JsonObject { ["dialog_closed"] = true, ["path"] = Path.GetFullPath(absolutePath) });
+                return UiStageResult.Success("submit_path", new JsonObject { ["dialog_closed"] = true, ["path"] = full });
             await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         }
-        return UiStageResult.Success("submit_path", new JsonObject { ["dialog_closed"] = false, ["path"] = Path.GetFullPath(absolutePath) });
+        return UiStageResult.Success("submit_path", new JsonObject { ["dialog_closed"] = false, ["path"] = full });
     }
 
     public Task<UiStageResult> AnswerPromptAsync(UiDialogRef prompt, bool accept, CancellationToken cancellationToken)
@@ -122,47 +112,20 @@ public sealed partial class CubaseUiAutomation
         cancellationToken.ThrowIfCancellationRequested();
         var owned = Revalidate(prompt);
         if (owned is null) return Task.FromResult(UiStageResult.Failure("answer_prompt", "WORKFLOW_DIALOG_LOST", "The prompt is no longer open."));
-        try
-        {
-            var button = accept ? FindButton(owned.Element, ["replace", "yes", "바꾸기", "예"]) : FindButton(owned.Element, ["no", "cancel", "아니요", "취소"]);
-            if (button is null) return Task.FromResult(UiStageResult.Failure("answer_prompt", "WORKFLOW_CONTROL_MISSING", "The prompt did not expose the expected button."));
-            var name = button.Current.Name;
-            InvokeButton(button);
-            return Task.FromResult(UiStageResult.Success("answer_prompt", new JsonObject { ["button"] = name, ["accepted"] = accept }));
-        }
-        catch (Exception ex) when (IsUnavailableElement(ex))
-        {
-            return Task.FromResult(UiStageResult.Failure("answer_prompt", "WORKFLOW_DIALOG_LOST", ex.Message));
-        }
+        var button = accept ? IdYes : IdNo;
+        if (!HasControl(owned.Handle, button))
+            return Task.FromResult(UiStageResult.Failure("answer_prompt", "WORKFLOW_CONTROL_MISSING", "The prompt does not have the expected Yes/No buttons."));
+        PressDialogButton(owned.Handle, button);
+        return Task.FromResult(UiStageResult.Success("answer_prompt", new JsonObject { ["button_id"] = button, ["accepted"] = accept }));
     }
 
     public async Task<UiStageResult> FillAddTrackDialogAsync(UiDialogRef dialog, string name, CancellationToken cancellationToken)
     {
         var owned = Revalidate(dialog);
         if (owned is null) return UiStageResult.Failure("add_track", "WORKFLOW_DIALOG_LOST", "The Add Track dialog is no longer open.");
-        try
-        {
-            var edits = owned.Element.FindAll(TreeScope.Descendants,
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit)).Cast<AutomationElement>()
-                .Where(element => element.TryGetCurrentPattern(ValuePattern.Pattern, out _)).ToArray();
-            var nameEdit = edits.FirstOrDefault(element => element.Current.Name.Contains("name", StringComparison.OrdinalIgnoreCase)
-                || element.Current.Name.Contains("이름", StringComparison.OrdinalIgnoreCase))
-                ?? (edits.Length == 1 ? edits[0] : null);
-            if (nameEdit is null)
-                return UiStageResult.Failure("add_track", "WORKFLOW_CONTROL_MISSING",
-                    $"The Add Track dialog exposes {edits.Length} editable fields and none is identifiable as the name field.");
-            var countEdit = edits.FirstOrDefault(element => element.Current.Name.Contains("count", StringComparison.OrdinalIgnoreCase)
-                || element.Current.Name.Contains("개수", StringComparison.OrdinalIgnoreCase));
-            if (countEdit is not null) ((ValuePattern)countEdit.GetCurrentPattern(ValuePattern.Pattern)).SetValue("1");
-            ((ValuePattern)nameEdit.GetCurrentPattern(ValuePattern.Pattern)).SetValue(name);
-            var add = FindButton(owned.Element, ["add track", "트랙 추가"])
-                ?? throw new InvalidOperationException("The Add Track button disappeared.");
-            InvokeButton(add);
-        }
-        catch (Exception ex) when (IsUnavailableElement(ex))
-        {
-            return UiStageResult.Failure("add_track", "WORKFLOW_DIALOG_LOST", ex.Message);
-        }
+        // Cubase focuses the Name field when the dialog opens; Enter triggers the default Add Track button.
+        var typed = await TypeIntoForegroundAsync(owned.Handle, name, pressEnter: true, cancellationToken).ConfigureAwait(false);
+        if (!typed.Ok) return typed;
         for (var attempt = 0; attempt < 50 && IsWindow(owned.Handle) && IsWindowVisible(owned.Handle); attempt++)
             await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         return UiStageResult.Success("add_track", new JsonObject { ["dialog_closed"] = !IsWindow(owned.Handle) || !IsWindowVisible(owned.Handle) });
@@ -174,7 +137,7 @@ public sealed partial class CubaseUiAutomation
     /// </summary>
     public async Task<UiStageResult> TypeRenameTextAsync(string name, CancellationToken cancellationToken)
     {
-        await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+        await Task.Delay(300, cancellationToken).ConfigureAwait(false);
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) return UiStageResult.Failure("rename_text", "CUBASE_NOT_RUNNING", "Cubase is not running.");
         var target = CreateTarget(process);
@@ -189,54 +152,113 @@ public sealed partial class CubaseUiAutomation
         return UiStageResult.Success("rename_text", new JsonObject { ["characters"] = name.Length });
     }
 
-    public async Task<UiStageResult> ConfigureAndStartExportAsync(UiDialogRef dialog, string directory, string fileName,
+    /// <summary>
+    /// Cubase's Export Audio Mixdown dialog exposes no controls to UI Automation or Win32, so its path, name and format
+    /// cannot be set reliably. The stage fails explicitly instead of typing into unknown fields.
+    /// </summary>
+    public Task<UiStageResult> ConfigureAndStartExportAsync(UiDialogRef dialog, string directory, string fileName,
         CancellationToken cancellationToken)
     {
-        var owned = Revalidate(dialog);
-        if (owned is null) return UiStageResult.Failure("export_configure", "WORKFLOW_DIALOG_LOST", "The export dialog is no longer open.");
-        try
-        {
-            var edits = owned.Element.FindAll(TreeScope.Descendants,
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit)).Cast<AutomationElement>()
-                .Where(element => element.TryGetCurrentPattern(ValuePattern.Pattern, out _)).ToArray();
-            var nameEdit = edits.FirstOrDefault(element => element.Current.Name.Equals("Name", StringComparison.OrdinalIgnoreCase)
-                || element.Current.Name.Contains("이름", StringComparison.OrdinalIgnoreCase));
-            var pathEdit = edits.FirstOrDefault(element => element.Current.Name.Contains("path", StringComparison.OrdinalIgnoreCase)
-                || element.Current.Name.Contains("경로", StringComparison.OrdinalIgnoreCase));
-            if (nameEdit is null || pathEdit is null)
-                return UiStageResult.Failure("export_configure", "WORKFLOW_CONTROL_MISSING",
-                    "The export dialog did not expose identifiable name and path fields through UI Automation; format fields are verified from the WAV header afterwards.");
-            ((ValuePattern)pathEdit.GetCurrentPattern(ValuePattern.Pattern)).SetValue(directory);
-            ((ValuePattern)nameEdit.GetCurrentPattern(ValuePattern.Pattern)).SetValue(fileName);
-            var export = FindButton(owned.Element, ["export audio", "export", "오디오 내보내기", "내보내기"])
-                ?? throw new InvalidOperationException("The export button disappeared.");
-            InvokeButton(export);
-            await Task.Delay(200, cancellationToken).ConfigureAwait(false);
-            return UiStageResult.Success("export_started", new JsonObject { ["directory"] = directory, ["file_name"] = fileName });
-        }
-        catch (Exception ex) when (IsUnavailableElement(ex))
-        {
-            return UiStageResult.Failure("export_configure", "WORKFLOW_DIALOG_LOST", ex.Message);
-        }
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(Revalidate(dialog) is null
+            ? UiStageResult.Failure("export_configure", "WORKFLOW_DIALOG_LOST", "The export dialog is no longer open.")
+            : UiStageResult.Failure("export_configure", "WORKFLOW_CONTROL_MISSING",
+                "The Export Audio Mixdown dialog exposes no addressable controls, so the output path and format cannot be set safely; nothing was typed and no export was started."));
     }
 
     /// <summary>Cancels a dialog this workflow bound earlier. Any other window is refused.</summary>
-    public Task<UiStageResult> CancelDialogAsync(UiDialogRef dialog, CancellationToken cancellationToken)
+    public async Task<UiStageResult> CancelDialogAsync(UiDialogRef dialog, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
         var owned = Revalidate(dialog);
-        if (owned is null) return Task.FromResult(UiStageResult.Failure("cancel", "WORKFLOW_DIALOG_LOST", "The bound dialog is no longer open."));
-        try
+        if (owned is null) return UiStageResult.Failure("cancel", "WORKFLOW_DIALOG_LOST", "The bound dialog is no longer open.");
+        if (ClassName(owned.Handle) == "#32770" && HasControl(owned.Handle, IdCancel)) PressDialogButton(owned.Handle, IdCancel);
+        else
         {
-            var cancel = FindButton(owned.Element, ["cancel", "취소"]);
-            if (cancel is null) return Task.FromResult(UiStageResult.Failure("cancel", "WORKFLOW_CONTROL_MISSING", "The dialog has no Cancel button."));
-            InvokeButton(cancel);
-            _dialogs.TryRemove(dialog.Id, out _);
-            return Task.FromResult(UiStageResult.Success("cancel"));
+            var escaped = await TypeIntoForegroundAsync(owned.Handle, null, pressEnter: false, cancellationToken, escape: true).ConfigureAwait(false);
+            if (!escaped.Ok) return escaped;
         }
-        catch (Exception ex) when (IsUnavailableElement(ex))
-        {
-            return Task.FromResult(UiStageResult.Failure("cancel", "WORKFLOW_DIALOG_LOST", ex.Message));
-        }
+        _dialogs.TryRemove(dialog.Id, out _);
+        return UiStageResult.Success("cancel");
     }
+
+    private async Task<UiStageResult> TypeIntoForegroundAsync(IntPtr dialog, string? text, bool pressEnter, CancellationToken cancellationToken,
+        bool escape = false)
+    {
+        for (var attempt = 0; attempt < 10 && GetForegroundWindow() != dialog; attempt++)
+        {
+            _ = SetForegroundWindow(dialog);
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        if (GetForegroundWindow() != dialog)
+            return UiStageResult.Failure("keyboard", "FOREGROUND_NOT_DIALOG", "The owned dialog is not the foreground window; no keys were sent.");
+        if (escape) { SendKeyChord("escape"); return UiStageResult.Success("keyboard"); }
+        SendKeyChord("ctrl+a");
+        if (!string.IsNullOrEmpty(text)) SendUnicodeText(text);
+        if (pressEnter) SendKeyChord("enter");
+        return UiStageResult.Success("keyboard", new JsonObject { ["characters"] = text?.Length ?? 0 });
+    }
+
+    // ---- native helpers ----------------------------------------------------------------------------------------
+
+    private static List<(IntPtr Handle, string Title)> ProcessWindows(int processId)
+    {
+        var windows = new List<(IntPtr, string)>();
+        _ = EnumWindows((handle, parameter) =>
+        {
+            _ = GetWindowThreadProcessId(handle, out var owner);
+            if (owner == processId && IsWindowVisible(handle)) windows.Add((handle, WindowText(handle)));
+            return true;
+        }, IntPtr.Zero);
+        return windows;
+    }
+
+    private static List<IntPtr> ChildWindows(IntPtr parent)
+    {
+        var children = new List<IntPtr>();
+        _ = EnumChildWindows(parent, (handle, _) => { children.Add(handle); return true; }, IntPtr.Zero);
+        return children;
+    }
+
+    private static bool HasControl(IntPtr dialog, int id) => ChildWindows(dialog).Any(child => GetDlgCtrlID(child) == id && IsWindowVisible(child));
+
+    /// <summary>The Edit control of the common dialog file-name box (1001 in the item dialog, 1148 in the legacy one).</summary>
+    private static IntPtr FileNameEdit(IntPtr dialog)
+    {
+        var children = ChildWindows(dialog);
+        var direct = children.FirstOrDefault(child => ClassName(child) == "Edit" && GetDlgCtrlID(child) is 1001 or 1148 && IsWindowVisible(child));
+        if (direct != IntPtr.Zero) return direct;
+        foreach (var box in children.Where(child => GetDlgCtrlID(child) is 1001 or 1148 && ClassName(child).StartsWith("ComboBox", StringComparison.Ordinal)))
+        {
+            var edit = ChildWindows(box).FirstOrDefault(child => ClassName(child) == "Edit");
+            if (edit != IntPtr.Zero) return edit;
+        }
+        return IntPtr.Zero;
+    }
+
+    private static void PressDialogButton(IntPtr dialog, int id)
+    {
+        var button = ChildWindows(dialog).FirstOrDefault(child => GetDlgCtrlID(child) == id);
+        _ = PostMessage(dialog, 0x0111 /* WM_COMMAND */, new IntPtr(id), button); // BN_CLICKED (0) in the high word
+    }
+
+    private static string ClassName(IntPtr handle)
+    {
+        var builder = new StringBuilder(256);
+        _ = GetClassName(handle, builder, builder.Capacity);
+        return builder.ToString();
+    }
+
+    private static string WindowText(IntPtr handle)
+    {
+        var length = (int)SendMessage(handle, 0x000E /* WM_GETTEXTLENGTH */, IntPtr.Zero, IntPtr.Zero);
+        var builder = new StringBuilder(Math.Max(length + 1, 256));
+        _ = SendMessage(handle, 0x000D /* WM_GETTEXT */, new IntPtr(builder.Capacity), builder);
+        return builder.ToString();
+    }
+
+    private delegate bool EnumChildCallback(IntPtr handle, IntPtr parameter);
+    [DllImport("user32.dll")] private static extern bool EnumChildWindows(IntPtr parent, EnumChildCallback callback, IntPtr parameter);
+    [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr handle);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr handle, StringBuilder name, int max);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr SendMessage(IntPtr handle, uint message, IntPtr wParam, StringBuilder lParam);
 }
