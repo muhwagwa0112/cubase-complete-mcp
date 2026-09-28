@@ -373,7 +373,10 @@ makeDirectRoot('mixer', mixBank);
 makeDirectRoot('control_room', page.mHostAccess.mControlRoom);
 makeDirectRoot('focused_quick_controls', page.mHostAccess.mFocusedQuickControls);
 
-function directRoot(name) { var root = runtime.directRoots[name || 'selected_track']; if (!root) { throw codedError('UNSUPPORTED_CAPABILITY', 'DirectAccess root is unavailable: ' + name); } return root; }
+// DirectAccess trees are cached by the host; update() refreshes them so reads after a change (new track, reorder)
+// do not see a stale or partially updated child list.
+function refreshRoot(root) { if (root && root.update && runtime.mapping) { root.update(runtime.mapping); } return root; }
+function directRoot(name) { var root = runtime.directRoots[name || 'selected_track']; if (!root) { throw codedError('UNSUPPORTED_CAPABILITY', 'DirectAccess root is unavailable: ' + name); } return refreshRoot(root); }
 function intArg(value, fallback, minimum, maximum) {
     var parsed;
     if (value === undefined || value === null || value === '') { return fallback; }
@@ -474,21 +477,22 @@ function mixerRoot() {
     var root = runtime.directRoots.mixer;
     if (!root) { throw codedError('UNSUPPORTED_CAPABILITY', 'target-addressed access requires MIDI Remote API 1.2 DirectAccess, which this host does not expose'); }
     if (!runtime.mapping) { throw codedError('DRIVER_OFFLINE', 'the driver page is not active'); }
-    return root;
+    return refreshRoot(root);
 }
 function mixerChannels() {
-    var root = mixerRoot(), base = root.getBaseObjectID(runtime.mapping), count = root.getNumberOfChildObjects(runtime.mapping, base), channels = [], i, objectId, uid;
+    var root = mixerRoot(), base = root.getBaseObjectID(runtime.mapping), count = root.getNumberOfChildObjects(runtime.mapping, base), channels = [], seen = {}, i, objectId, uid;
     for (i = 0; i < count && i < MAX_CHANNELS; i += 1) {
         objectId = Number(root.getChildObjectID(runtime.mapping, base, i));
         uid = root.getObjectUniqueIDString(runtime.mapping, objectId);
-        if (!uid) { continue; }
+        if (!uid || seen[objectId]) { continue; }
+        seen[objectId] = true;
         channels.push({kind: 'mixer_channel', bank_index: i, unique_id: String(uid), runtime_id: objectId, object_id: objectId,
             title: root.getObjectTitle(runtime.mapping, objectId), channel_type: root.getObjectUniqueName(runtime.mapping, objectId)});
     }
     return {channels: channels, total: count};
 }
 function selectedIdentity() {
-    var root = runtime.directRoots.selected_track, base, uid = null, i, channels;
+    var root = refreshRoot(runtime.directRoots.selected_track), base, uid = null, i, channels;
     var identity = {kind: 'selected_track', unique_id: null, runtime_id: null, title: runtime.state.selectedTrack};
     if (!root || !runtime.mapping) { return identity; }
     base = Number(root.getBaseObjectID(runtime.mapping));
