@@ -159,9 +159,10 @@ public sealed partial class CubaseController
             }
             else if (!string.Equals(proposal.PlanHash, outerHash, StringComparison.Ordinal))
             {
-                return NotStarted(request, ErrorCodes.TargetChanged,
+                var current = outerPlan.ToJson(operation);
+                return NotStarted(request, PlanMismatchCode(proposal.Plan, current),
                     "The target, file or project conditions changed after approval. Nothing was sent and the approval was kept; request a new plan to see the current conditions.",
-                    new JsonObject { ["approved_plan"] = proposal.Plan?.DeepClone(), ["current_plan"] = outerPlan.ToJson(operation) });
+                    new JsonObject { ["approved_plan"] = proposal.Plan?.DeepClone(), ["current_plan"] = current });
             }
         }
 
@@ -178,7 +179,7 @@ public sealed partial class CubaseController
             }
             else if (proposal is not null && !string.Equals(proposal.PlanHash, hash, StringComparison.Ordinal))
             {
-                return NotStarted(request, ErrorCodes.TargetChanged,
+                return NotStarted(request, PlanMismatchCode(proposal.Plan, plan.ToJson(operation)),
                     "The target, file or project conditions changed while waiting for the mutation lease. Nothing was sent and the approval was kept.");
             }
             else if (proposal is null && plan.Risk == RiskLevel.Confirm)
@@ -239,6 +240,17 @@ public sealed partial class CubaseController
             }
             return response;
         }, refusal => NotStarted(request, refusal.ErrorCode, refusal.Message), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>FILE_CHANGED when only a bound file identity differs; TARGET_CHANGED for any other plan difference.</summary>
+    private static string PlanMismatchCode(JsonNode? approved, JsonNode current)
+    {
+        var approvedFile = approved?["preconditions"]?["file"];
+        var currentFile = current["preconditions"]?["file"];
+        var fileDiffers = approvedFile is not null && currentFile is not null
+            && CanonicalJson.Serialize(approvedFile, false) != CanonicalJson.Serialize(currentFile, false);
+        var restSame = CanonicalJson.Serialize(approved?["targets"], false) == CanonicalJson.Serialize(current["targets"], false);
+        return fileDiffers && restSame ? ErrorCodes.FileChanged : ErrorCodes.TargetChanged;
     }
 
     private static BrokerResponse? JournalShortCircuit(BrokerRequest request, JournalBeginResult begin) => begin.Kind switch

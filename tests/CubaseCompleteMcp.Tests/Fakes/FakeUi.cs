@@ -45,11 +45,19 @@ public sealed class FakeUi : IWorkflowUi
         return Task.FromResult(new JsonObject { ["opened"] = true });
     }
 
-    public Task<JsonObject?> DismissProjectFolderDialogAsync(CancellationToken cancellationToken) => Task.FromResult<JsonObject?>(null);
+    private bool _submittedThisImport;
+
+    /// <summary>Called at the start of every import workflow; resets the per-import stage script.</summary>
+    public Task<JsonObject?> DismissProjectFolderDialogAsync(CancellationToken cancellationToken)
+    {
+        _submittedThisImport = false;
+        return Task.FromResult<JsonObject?>(null);
+    }
 
     public Task<JsonObject> SubmitFileDialogAsync(string absolutePath, CancellationToken cancellationToken)
     {
         MidiSubmissions++;
+        _submittedThisImport = true;
         Actions.Add("midi_submit");
         OnMidiSubmit?.Invoke(absolutePath);
         return Task.FromResult(new JsonObject { ["dialog_closed"] = true, ["path"] = absolutePath });
@@ -60,8 +68,7 @@ public sealed class FakeUi : IWorkflowUi
 
     public Task<JsonObject> WaitForMidiImportStageAsync(int timeoutMilliseconds, CancellationToken cancellationToken)
     {
-        var stage = MidiSubmissions == 0 ? MidiStageAfterCommand : MidiStageAfterSubmit;
-        if (MidiSubmissions == 0 && MenuFallbacks > 0 && stage == "none") stage = "none";
+        var stage = _submittedThisImport ? MidiStageAfterSubmit : MidiStageAfterCommand;
         return Task.FromResult(new JsonObject { ["stage"] = stage });
     }
 

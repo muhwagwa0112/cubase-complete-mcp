@@ -14,6 +14,8 @@ namespace CubaseCompleteMcp.Broker;
 /// </summary>
 public sealed partial class CubaseController
 {
+    private static TimeSpan Min(TimeSpan left, TimeSpan right) => left < right ? left < TimeSpan.Zero ? TimeSpan.Zero : left : right < TimeSpan.Zero ? TimeSpan.Zero : right;
+
     private sealed class WorkflowLog
     {
         private readonly Stopwatch _clock = Stopwatch.StartNew();
@@ -418,6 +420,7 @@ public sealed partial class CubaseController
     {
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         budget.CancelAfter(_timings.MidiImportTotal);
+        var budgetClock = Stopwatch.StartNew();
         var token = budget.Token;
         var plan = context.Plan;
         var expectation = plan.Import!;
@@ -522,7 +525,8 @@ public sealed partial class CubaseController
             var titles = newChannels.Select(node => node?["title"]?.GetValue<string>()).ToArray();
             var all = expectedNames.All(name => titles.Count(title => title == name) == 1);
             return new Observation(all, new JsonObject { ["new_channels"] = newChannels.DeepClone() }, "driver.track.list");
-        }, _timings.TrackAndPlugin with { Deadline = TimeSpan.FromSeconds(Math.Min(10, _timings.MidiImportTotal.TotalSeconds)) }, token).ConfigureAwait(false);
+        }, _timings.TrackAndPlugin with { Deadline = Min(_timings.TrackAndPlugin.Deadline, _timings.MidiImportTotal - budgetClock.Elapsed - TimeSpan.FromMilliseconds(250)) },
+            token).ConfigureAwait(false);
         var mapping = new JsonArray(expectation.Tracks.Select(track =>
         {
             var created = newChannels.FirstOrDefault(node => node?["title"]?.GetValue<string>() == track.ImportedName);
