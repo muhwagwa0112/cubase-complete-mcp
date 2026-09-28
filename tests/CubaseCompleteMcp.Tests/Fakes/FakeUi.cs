@@ -28,6 +28,15 @@ public sealed class FakeUi : IWorkflowUi
     public Task<JsonObject> InspectAsync(JsonObject? arguments, string clientSessionId) =>
         Task.FromResult(new JsonObject { ["snapshot_id"] = "snap" });
 
+    public HashSet<string> LiveSnapshots { get; } = new(StringComparer.Ordinal) { "snap" };
+
+    public bool IsInputTargetValid(JsonObject arguments, string clientSessionId, out string reason)
+    {
+        var ok = arguments["snapshot_id"]?.GetValue<string>() is { } id && LiveSnapshots.Contains(id);
+        reason = ok ? string.Empty : "expired";
+        return ok;
+    }
+
     public JsonObject Invoke(JsonObject arguments, string clientSessionId)
     {
         Actions.Add("invoke:" + arguments["action"]);
@@ -54,13 +63,16 @@ public sealed class FakeUi : IWorkflowUi
         return Task.FromResult<JsonObject?>(null);
     }
 
-    public Task<JsonObject> SubmitFileDialogAsync(string absolutePath, CancellationToken cancellationToken)
+    public TimeSpan SubmitDelay { get; set; }
+
+    public async Task<JsonObject> SubmitFileDialogAsync(string absolutePath, CancellationToken cancellationToken)
     {
         MidiSubmissions++;
+        if (SubmitDelay > TimeSpan.Zero) await Task.Delay(SubmitDelay, cancellationToken);
         _submittedThisImport = true;
         Actions.Add("midi_submit");
         OnMidiSubmit?.Invoke(absolutePath);
-        return Task.FromResult(new JsonObject { ["dialog_closed"] = true, ["path"] = absolutePath });
+        return new JsonObject { ["dialog_closed"] = true, ["path"] = absolutePath };
     }
 
     public Task<JsonObject?> ChooseExistingProjectForMidiImportAsync(CancellationToken cancellationToken) =>

@@ -303,4 +303,47 @@ public sealed class G03VerificationBatchTests
         Assert.Equal((BatchOutcomeReducer.Next.Stop, "outcome_unknown"),
             BatchOutcomeReducer.AfterChild(Result(0, ResultStatus.Unverified, ExecutionState.Unknown, true), true));
     }
+
+    [Fact]
+    public async Task API01_TopStatusAndExecutionStateAreConsistent()
+    {
+        using var harness = new ControllerHarness();
+        var channel = harness.Driver.AddChannel("A");
+        harness.Driver.Select(channel);
+        var handle = await harness.HandleForAsync(channel);
+        var responses = new List<BrokerResponse>
+        {
+            await harness.SendAsync("status"),
+            await harness.SendAsync("transport", new JsonObject { ["action"] = "play" }),
+            await harness.SendAsync("transport", new JsonObject { ["action"] = "cycle", ["enabled"] = false }),
+            await harness.SendAsync("track", new JsonObject { ["action"] = "delete", ["target_scope"] = "selected" }),
+            await harness.SendAsync("mixer", new JsonObject { ["action"] = "set", ["target_handle"] = "tgt_unknown", ["parameter"] = "volume", ["value"] = 0.1 }),
+            await harness.SendAsync("mixer", new JsonObject { ["action"] = "set", ["target_handle"] = handle, ["parameter"] = "volume", ["value"] = 0.9 })
+        };
+        harness.Driver.LoseReplyAfterApply = true;
+        responses.Add(await harness.SendAsync("transport", new JsonObject { ["action"] = "stop" }));
+        foreach (var response in responses)
+        {
+            Assert.False(string.IsNullOrEmpty(response.ExecutionState));
+            switch (response.Status)
+            {
+                case ResultStatus.Ok:
+                    Assert.Contains(response.ExecutionState, new[] { ExecutionState.Applied, ExecutionState.NotApplied, ExecutionState.NotApplicable });
+                    Assert.Null(response.Error);
+                    break;
+                case ResultStatus.RequiresConfirmation:
+                    Assert.Equal(ExecutionState.NotStarted, response.ExecutionState);
+                    break;
+                case ResultStatus.Unverified:
+                    Assert.Contains(response.ExecutionState, new[] { ExecutionState.Applied, ExecutionState.Unknown, ExecutionState.NotApplied });
+                    if (response.Error?.Code == ErrorCodes.OutcomeUnknown) Assert.False(response.Error.Retryable);
+                    break;
+                default:
+                    Assert.NotNull(response.Error);
+                    Assert.NotEqual(ExecutionState.Applied, response.ExecutionState);
+                    break;
+            }
+        }
+        Assert.Contains(responses, response => response.Error?.Code == ErrorCodes.OutcomeUnknown);
+    }
 }

@@ -108,6 +108,32 @@ public sealed class G05ReleaseGateTests : IDisposable
         Assert.DoesNotContain("Get-Date -Format 'yyyyMMdd-HHmmss'\r\n$output", script, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task API02_UnavailableFeaturesAreReportedHonestly()
+    {
+        using var harness = new ControllerHarness();
+        var status = await harness.SendAsync("status");
+        Assert.False(status.Data!["api13_available"]!.GetValue<bool>());
+        Assert.Contains(status.Data["warnings"]!.AsArray(), warning => warning!.GetValue<string>().Contains("API 1.3", StringComparison.Ordinal));
+        var catalog = await harness.SendAsync("plugin", new JsonObject { ["action"] = "catalog" });
+        Assert.Equal(ResultStatus.Unsupported, catalog.Status);
+        Assert.EndsWith(".v2", CubaseConstants.BrokerMutexName, StringComparison.Ordinal);
+        Assert.EndsWith(".v2", CubaseConstants.PipeName, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void REL07_InstallationCheckRequiresBothFileHashAndLoadedBuildId()
+    {
+        var receipt = new InstallationReceipt(1, new string('a', 40), new string('b', 64), DateTimeOffset.UtcNow, new string('c', 64),
+            new string('d', 64), new string('e', 64), "build-new", null, "redacted", "backup");
+        Assert.True(InstallationCheck.Evaluate(receipt, new string('d', 64), "build-new", 2).Ok);
+        var oldLoaded = InstallationCheck.Evaluate(receipt, new string('d', 64), "build-old", 2);
+        Assert.True(oldLoaded.DriverFileMatches);
+        Assert.False(oldLoaded.Ok); // file installed but Cubase still runs the previous driver
+        Assert.False(InstallationCheck.Evaluate(receipt, new string('9', 64), "build-new", 2).Ok); // file replaced
+        Assert.False(InstallationCheck.Evaluate(receipt, new string('d', 64), null, null).Ok); // protocol-1 driver without build ID
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_root)) Directory.Delete(_root, true);

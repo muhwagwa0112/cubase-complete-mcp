@@ -289,4 +289,18 @@ public sealed class G02TargetSafetyTests
         Assert.Equal(ResultStatus.Ok, commit.Status);
         Assert.DoesNotContain(harness.Driver.Channels, channel => channel.UniqueId == a.UniqueId);
     }
+
+    [Fact]
+    public async Task SAFE04_ExpiredUiSnapshotIsNotRevivedByAnApproval()
+    {
+        using var harness = new ControllerHarness();
+        var args = new JsonObject { ["action"] = "click", ["snapshot_id"] = "snap", ["x"] = 10, ["y"] = 10 };
+        var proposal = await harness.SendAsync("ui.invoke", (JsonObject)args.DeepClone());
+        Assert.Equal(ResultStatus.RequiresConfirmation, proposal.Status);
+        harness.Ui.LiveSnapshots.Clear(); // the 30-second snapshot expired while the approval was pending
+        var commit = await harness.SendAsync("ui.invoke", (JsonObject)args.DeepClone(), proposal.Data!["confirmation_id"]!.GetValue<string>());
+        Assert.Equal("UI_SNAPSHOT_EXPIRED", commit.Error!.Code);
+        Assert.Equal(ExecutionState.NotStarted, commit.ExecutionState);
+        Assert.DoesNotContain(harness.Ui.Actions, action => action.StartsWith("invoke:", StringComparison.Ordinal));
+    }
 }

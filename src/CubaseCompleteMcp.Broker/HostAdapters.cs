@@ -37,6 +37,8 @@ public interface IWorkflowUi
 {
     Task<JsonObject> InspectAsync(JsonObject? arguments, string clientSessionId);
     JsonObject Invoke(JsonObject arguments, string clientSessionId);
+    /// <summary>Checks, without consuming anything, that the token/snapshot of a UI input is live and owned by the caller.</summary>
+    bool IsInputTargetValid(JsonObject arguments, string clientSessionId, out string reason);
     Task<JsonObject> ObserveProjectTextAsync(CancellationToken cancellationToken);
 
     bool HasOpenFileDialog();

@@ -275,6 +275,10 @@ public sealed partial class CubaseController
 
     private async Task<BrokerResponse> UiInvokeAsync(ExecutionContext context)
     {
+        // An expired or foreign snapshot is refused before the approval is consumed: an approval never revives
+        // stale coordinates or element tokens.
+        if (!_ui.IsInputTargetValid(context.Operation.Arguments, context.Session, out var reason))
+            return NotStarted(context.Request, "UI_SNAPSHOT_EXPIRED", reason + " Inspect the window again and plan a new input.");
         if (!context.BeforeDispatch()) return ApprovalRace(context);
         var data = _ui.Invoke(context.Operation.Arguments, context.Session);
         await Task.CompletedTask.ConfigureAwait(false);

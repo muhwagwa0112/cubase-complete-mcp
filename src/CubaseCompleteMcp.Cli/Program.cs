@@ -209,6 +209,7 @@ async Task<object> DoctorAsync()
             running_broker_processes = brokerProcesses,
             stale_server_processes = serverProcesses.Where(item => item.IsStale).ToArray(),
             latest_installation_receipt = LatestInstallationReceipt(),
+            installation_check = InstallationCheckFor(activeDriverHash, brokerStatus),
             loaded_driver_build_id = brokerStatus?.Data?["status"]?["data"]?["driver_build_id"]?.GetValue<string>(),
             loaded_driver_contract_version = brokerStatus?.Data?["status"]?["data"]?["driver_contract_version"]?.ToJsonString(),
             paths,
@@ -216,6 +217,18 @@ async Task<object> DoctorAsync()
             broker_error = brokerError
         };
     }
+}
+
+object? InstallationCheckFor(string? activeDriverHash, BrokerResponse? brokerStatus)
+{
+    var directory = Path.Combine(paths.LocalStateRoot, "installation-receipts");
+    var latest = Directory.Exists(directory)
+        ? Directory.EnumerateFiles(directory, "*.json").OrderByDescending(path => path, StringComparer.Ordinal).FirstOrDefault() : null;
+    if (latest is null) return new { ok = false, problems = new[] { "No installation receipt exists; run setup." } };
+    var receipt = JsonSerializer.Deserialize<InstallationReceipt>(File.ReadAllText(latest), JsonOptions())!;
+    var status = brokerStatus?.Data?["status"]?["data"];
+    var contract = status?["driver_contract_version"] is { } node && int.TryParse(node.ToJsonString(), out var parsed) ? parsed : (int?)null;
+    return InstallationCheck.Evaluate(receipt, activeDriverHash, status?["driver_build_id"]?.GetValue<string>(), contract);
 }
 
 object? LatestInstallationReceipt()

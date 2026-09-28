@@ -406,4 +406,20 @@ public sealed class G04WorkflowTests
         Assert.Equal(1, harness.Driver.WriteCount("transport.set"));
         Assert.False(harness.Driver.State["playing"]!.GetValue<bool>());
     }
+
+    [Fact]
+    public async Task MIDI06_WholeImportIsBoundedByTheWorkflowBudget()
+    {
+        var timings = ControllerHarness.FastTimings with { MidiImportTotal = TimeSpan.FromMilliseconds(400) };
+        using var harness = new ControllerHarness(timings: timings);
+        var created = await harness.SendAsync("midi.compose", new JsonObject { ["action"] = "create_document", ["name"] = "Budget" });
+        var documentId = created.Data!["document"]!["id"]!.GetValue<string>();
+        await harness.SendAsync("midi.compose", new JsonObject { ["action"] = "add_track", ["document_id"] = documentId, ["name"] = "Keys" });
+        harness.Ui.SubmitDelay = TimeSpan.FromSeconds(5); // the file dialog never finishes
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var result = await harness.SendAsync("midi.compose", new JsonObject { ["action"] = "import_to_cubase", ["document_id"] = documentId });
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(3), $"import took {clock.Elapsed}");
+        Assert.Equal(ExecutionState.Unknown, result.ExecutionState); // dispatched, then stopped by the budget; never retried
+        Assert.Equal(1, harness.Ui.MidiSubmissions);
+    }
 }

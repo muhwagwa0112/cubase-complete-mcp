@@ -210,3 +210,30 @@ public sealed record InstallationReceipt(
     string? ObservedDriverBuildId,
     string InstallPathRedacted,
     string? BackupId);
+
+public sealed record InstallationCheckResult(bool DriverFileMatches, bool LoadedBuildMatches, bool ContractMatches, string[] Problems)
+{
+    public bool Ok => DriverFileMatches && LoadedBuildMatches && ContractMatches;
+}
+
+/// <summary>
+/// Compares the installed driver file and the driver actually loaded by Cubase with the installation receipt. Both the
+/// file hash and the runtime build ID must match; a matching file with an old loaded driver (Cubase not restarted) fails.
+/// </summary>
+public static class InstallationCheck
+{
+    public static InstallationCheckResult Evaluate(InstallationReceipt receipt, string? activeDriverSha256, string? loadedBuildId,
+        int? loadedContractVersion)
+    {
+        var problems = new List<string>();
+        var fileMatches = activeDriverSha256 is not null && activeDriverSha256.Equals(receipt.InstalledDriverSha256, StringComparison.OrdinalIgnoreCase);
+        if (!fileMatches) problems.Add("The installed driver file differs from the installation receipt.");
+        var buildMatches = loadedBuildId is not null && loadedBuildId.Equals(receipt.ExpectedDriverBuildId, StringComparison.Ordinal);
+        if (!buildMatches) problems.Add(loadedBuildId is null
+            ? "No loaded driver build ID was observed (driver offline or an older driver without build IDs)."
+            : "Cubase has loaded a different driver build than the one installed; restart Cubase or reinstall.");
+        var contractMatches = loadedContractVersion == CubaseConstants.DriverContractVersion;
+        if (!contractMatches) problems.Add($"The loaded driver contract is {loadedContractVersion?.ToString() ?? "unknown"}, not {CubaseConstants.DriverContractVersion}.");
+        return new InstallationCheckResult(fileMatches, buildMatches, contractMatches, problems.ToArray());
+    }
+}

@@ -1013,6 +1013,27 @@ public sealed partial class CubaseUiAutomation(CubaseProcessInspector processIns
         return output;
     }
 
+    public bool IsInputTargetValid(JsonObject arguments, string clientSessionId, out string reason)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (arguments["element_token"]?.GetValue<string>() is { Length: > 0 } tokenValue)
+        {
+            var ok = _tokens.TryGetValue(tokenValue, out var token) && token.ExpiresAt >= now
+                && token.ClientSessionId.Equals(clientSessionId, StringComparison.Ordinal);
+            reason = ok ? string.Empty : "The UI element token is unknown, expired, used, or belongs to another client session.";
+            return ok;
+        }
+        if (arguments["snapshot_id"]?.GetValue<string>() is { Length: > 0 } snapshotValue)
+        {
+            var ok = _snapshots.TryGetValue(snapshotValue, out var snapshot) && snapshot.ExpiresAt >= now
+                && snapshot.ClientSessionId.Equals(clientSessionId, StringComparison.Ordinal);
+            reason = ok ? string.Empty : "The UI snapshot is unknown, expired, already used, or belongs to another client session.";
+            return ok;
+        }
+        reason = "element_token or snapshot_id is required.";
+        return false;
+    }
+
     public JsonObject Invoke(JsonObject arguments, string clientSessionId)
     {
         var action = arguments["action"]?.GetValue<string>()?.ToLowerInvariant()
