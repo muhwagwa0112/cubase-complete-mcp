@@ -248,6 +248,8 @@ try {
     const saved = join(fixture, 'acceptance-saved.cpr');
     const saveAs = await a.call('cubase_project', { action: 'save_as', path: saved });
     expect(0, saved, saveAs.data?.file_after, saveAs.status === 'Ok' && existsSync(saved));
+    // Cubase does not reopen the file of the active project, so the active project moves to a second file first.
+    await a.call('cubase_project', { action: 'save_as', path: join(fixture, 'acceptance-moved.cpr') });
     const reopened = await a.confirm('cubase_project', { action: 'open', path: saved });
     const list = await a.call('cubase_track', { action: 'list' });
     const titles = (list.data?.channels ?? []).map(channel => channel.title);
