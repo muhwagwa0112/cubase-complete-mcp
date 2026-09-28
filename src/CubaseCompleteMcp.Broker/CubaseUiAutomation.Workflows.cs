@@ -224,6 +224,49 @@ public sealed partial class CubaseUiAutomation
         return UiStageResult.Success("keyboard", new JsonObject { ["characters"] = text?.Length ?? 0 });
     }
 
+    /// <summary>
+    /// Submits the MIDI import file dialog through its Win32 controls. Returns null when no such dialog is found,
+    /// so the caller can fall back to UI Automation.
+    /// </summary>
+    private async Task<JsonObject?> SubmitMidiFileDialogNativeAsync(CubaseWindowTarget target, string absolutePath, CancellationToken cancellationToken)
+    {
+        IntPtr dialog = IntPtr.Zero;
+        string title = string.Empty;
+        for (var attempt = 0; attempt < 30 && dialog == IntPtr.Zero; attempt++)
+        {
+            var current = RefreshTarget(target);
+            if (!current.IdentityVerified) return null;
+            foreach (var (handle, windowTitle) in ProcessWindows(current.ProcessId))
+            {
+                if (ClassName(handle) != "#32770" || !IsMidiImportDialogTitle(windowTitle) || FileNameEdit(handle) == IntPtr.Zero || !HasControl(handle, IdOk)) continue;
+                dialog = handle;
+                title = windowTitle;
+                break;
+            }
+            if (dialog == IntPtr.Zero) await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        if (dialog == IntPtr.Zero) return null;
+        var full = Path.GetFullPath(absolutePath);
+        var edit = FileNameEdit(dialog);
+        _ = SendMessage(edit, 0x000C /* WM_SETTEXT */, IntPtr.Zero, full);
+        if (!string.Equals(WindowText(edit), full, StringComparison.Ordinal)) return null;
+        PressDialogButton(dialog, IdOk);
+        var consecutiveAbsent = 0;
+        for (var attempt = 0; attempt < 50; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            consecutiveAbsent = IsWindow(dialog) && IsWindowVisible(dialog) ? 0 : consecutiveAbsent + 1;
+            if (Core.MidiImportWorkflowPolicy.IsFileDialogClosureStable(consecutiveAbsent)) break;
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        var closed = !IsWindow(dialog) || !IsWindowVisible(dialog);
+        return new JsonObject
+        {
+            ["dialog_title"] = title, ["button"] = "IDOK", ["path"] = full, ["submitted"] = true, ["dialog_closed"] = closed,
+            ["method"] = "win32_control_ids", ["unverified_reason"] = Core.MidiImportWorkflowPolicy.SubmissionUnverifiedReason(closed)
+        };
+    }
+
     // ---- native helpers ----------------------------------------------------------------------------------------
 
     private static List<(IntPtr Handle, string Title)> ProcessWindows(int processId)

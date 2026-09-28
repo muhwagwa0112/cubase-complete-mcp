@@ -141,8 +141,16 @@ public sealed class CubaseMidiSession : ICubaseDriver
 
         var reply = await SendInternalAsync(operation, arguments ?? new JsonObject(), _filter.CurrentSessionId, null,
             timeout ?? TimeSpan.FromSeconds(4), cancellationToken).ConfigureAwait(false);
-        if (reply.Error?.Code == "STALE_SESSION") _filter.ForgetSession();
-        return reply;
+        if (reply.Error?.Code != "STALE_SESSION") return reply;
+        // The driver refused the request before executing it because its page was re-activated (for example after a
+        // project switch). A read may be sent again after a new handshake; a write never is, because it was planned
+        // against the previous driver epoch.
+        _filter.ForgetSession();
+        if (MidiOperations.IsWrite(operation)
+            || !await TryHandshakeAsync(TimeSpan.FromMilliseconds(900), cancellationToken).ConfigureAwait(false))
+            return reply;
+        return await SendInternalAsync(operation, arguments ?? new JsonObject(), _filter.CurrentSessionId, null,
+            timeout ?? TimeSpan.FromSeconds(4), cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<DriverReply> SendInternalAsync(string operation, JsonObject arguments, uint sessionId,

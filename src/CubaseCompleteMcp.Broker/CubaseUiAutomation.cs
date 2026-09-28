@@ -187,6 +187,10 @@ public sealed partial class CubaseUiAutomation(CubaseProcessInspector processIns
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) throw new InvalidOperationException("Cubase is not running.");
         var target = CreateTarget(process);
+        // Native path first: live on Cubase 15.0.10 the common dialog's controls are not usable through UI Automation,
+        // while the Win32 file-name field and IDOK button are (see CubaseUiAutomation.Workflows.cs).
+        var native = await SubmitMidiFileDialogNativeAsync(target, absolutePath, cancellationToken).ConfigureAwait(false);
+        if (native is not null) return native;
         Exception? unavailable = null;
         for (var attempt = 0; attempt < 40; attempt++)
         {
