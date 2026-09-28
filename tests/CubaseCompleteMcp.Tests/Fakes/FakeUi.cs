@@ -149,6 +149,20 @@ public sealed class FakeUi : IWorkflowUi
             : UiStageResult.Failure("export_configure", "WORKFLOW_CONTROL_MISSING", "no fields"));
     }
 
+    public string? PromptText { get; set; }
+
+    public Task<string?> ReadDialogTextAsync(UiDialogRef dialog, CancellationToken cancellationToken) => Task.FromResult(PromptText);
+
+    public Task<UiStageResult> PressDefaultButtonAsync(UiDialogRef dialog, CancellationToken cancellationToken)
+    {
+        Actions.Add("default_button:" + PromptText);
+        _open.Remove(dialog.Id);
+        OnDefaultButton?.Invoke();
+        return Task.FromResult(UiStageResult.Success("default_button"));
+    }
+
+    public Action? OnDefaultButton { get; set; }
+
     public Task<UiStageResult> CancelDialogAsync(UiDialogRef dialog, CancellationToken cancellationToken)
     {
         if (!_open.Remove(dialog.Id)) return Task.FromResult(UiStageResult.Failure("cancel", "WORKFLOW_DIALOG_LOST", "not owned"));

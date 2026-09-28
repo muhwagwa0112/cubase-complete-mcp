@@ -15,7 +15,8 @@ public static class DialogKinds
     public const string ExportAudio = "export_audio";
     public const string AddTrack = "add_track";
     public const string OverwritePrompt = "overwrite_prompt";
-    public const string SaveChangesPrompt = "save_changes_prompt";
+    /// <summary>A Cubase-rendered question box (title "Cubase Pro"); its text is read by OCR before any answer.</summary>
+    public const string CubasePrompt = "cubase_prompt";
 }
 
 /// <summary>A dialog found for a workflow stage. The ID is bound to that native window; it is not a coordinate.</summary>
@@ -59,6 +60,10 @@ public interface IWorkflowUi
     Task<UiStageResult> ConfigureAndStartExportAsync(UiDialogRef dialog, string directory, string fileName,
         CancellationToken cancellationToken);
     Task<UiStageResult> CancelDialogAsync(UiDialogRef dialog, CancellationToken cancellationToken);
+    /// <summary>Recognized text of a bound dialog (PrintWindow + Windows OCR); null when it cannot be read.</summary>
+    Task<string?> ReadDialogTextAsync(UiDialogRef dialog, CancellationToken cancellationToken);
+    /// <summary>Presses the default button (Enter) of a bound dialog while it is the verified foreground window.</summary>
+    Task<UiStageResult> PressDefaultButtonAsync(UiDialogRef dialog, CancellationToken cancellationToken);
 }
 
 public sealed record PluginCatalogEntry(string Uid, string Name, string? Vendor, string? Category, bool Available);

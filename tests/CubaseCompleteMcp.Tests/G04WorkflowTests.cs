@@ -422,4 +422,24 @@ public sealed class G04WorkflowTests
         Assert.Equal(ExecutionState.Unknown, result.ExecutionState); // dispatched, then stopped by the budget; never retried
         Assert.Equal(1, harness.Ui.MidiSubmissions);
     }
+
+    [Theory]
+    [InlineData("Do you want to activate the project?", true)]
+    [InlineData("프로젝트를 활성화하시겠습니까?", true)]
+    [InlineData("Do you want to save this project?", false)]
+    public async Task WFL02_OpenAnswersOnlyTheActivationQuestion(string promptText, bool answered)
+    {
+        using var harness = new ControllerHarness();
+        var directory = FixtureDirectory(harness);
+        var path = Path.Combine(directory, "Song.cpr");
+        File.WriteAllBytes(path, [1, 2, 3]);
+        harness.Ui.AvailableDialogs.Add(DialogKinds.FileOpen);
+        harness.Ui.AvailableDialogs.Add(DialogKinds.CubasePrompt);
+        harness.Ui.PromptText = promptText;
+        harness.Ui.OnDefaultButton = () => harness.Process.Title = "Cubase Pro Project - Song";
+        var result = await harness.ConfirmAndCommitAsync("project", new JsonObject { ["action"] = "open", ["path"] = path });
+        Assert.Equal(answered ? ResultStatus.Ok : ResultStatus.Unverified, result.Status);
+        Assert.Equal(answered, harness.Ui.Actions.Contains("default_button:" + promptText));
+        if (!answered) Assert.Equal(promptText, result.Data!["pending_user_dialog"]!.GetValue<string>());
+    }
 }

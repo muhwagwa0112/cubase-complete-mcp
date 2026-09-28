@@ -281,17 +281,36 @@ public sealed partial class CubaseController
                     "Save As was submitted once, but both the new file and the project title were not observed. The file (if any) was left in place.");
         }
 
-        // open
-        var opened = await PostconditionVerifier.ObserveAsync(token =>
+        // open: Cubase asks whether to activate the opened project. Its question box has no addressable controls,
+        // so the text is read by OCR and only the activation question (part of the approved plan) is answered with its
+        // default button. Any other question, such as saving unsaved changes, is left for the user.
+        string? pendingPrompt = null;
+        var activationAnswered = false;
+        var opened = await PostconditionVerifier.ObserveAsync(async token =>
         {
+            if (!activationAnswered && pendingPrompt is null
+                && await _ui.WaitForDialogAsync(DialogKinds.CubasePrompt, TimeSpan.Zero, token).ConfigureAwait(false) is { } prompt)
+            {
+                var text = await _ui.ReadDialogTextAsync(prompt, token).ConfigureAwait(false) ?? string.Empty;
+                if (IsActivationQuestion(text))
+                {
+                    var pressed = await _ui.PressDefaultButtonAsync(prompt, token).ConfigureAwait(false);
+                    activationAnswered = pressed.Ok;
+                    log.Add(pressed.Ok ? "activation_confirmed" : "activation_prompt_unanswered", new JsonObject { ["prompt_text"] = text, ["error"] = pressed.ErrorCode });
+                }
+                else
+                {
+                    pendingPrompt = text;
+                    log.Add("foreign_prompt_left_open", new JsonObject { ["prompt_text"] = text });
+                }
+            }
             var title = NormalizeProjectTitle(_processes.Inspect().WindowTitle);
             var ok = !string.Equals(title, titleBefore, StringComparison.Ordinal)
                 && title.Contains(Path.GetFileNameWithoutExtension(file.Path), StringComparison.OrdinalIgnoreCase);
-            return Task.FromResult(new Observation(ok, new JsonObject { ["project_title"] = title }, "process.window_title"));
+            return new Observation(ok, new JsonObject { ["project_title"] = title }, "process.window_title");
         }, _timings.Project, cancellationToken).ConfigureAwait(false);
         data["observation"] = opened.ToJson(Path.GetFileName(file.Path), "project title changed and names the file");
-        var pendingPrompt = await _ui.WaitForDialogAsync(DialogKinds.SaveChangesPrompt, TimeSpan.Zero, cancellationToken).ConfigureAwait(false);
-        if (pendingPrompt is not null) data["pending_user_dialog"] = pendingPrompt.Title;
+        if (pendingPrompt is not null) data["pending_user_dialog"] = pendingPrompt;
         log.Add(opened.Verified ? "project_opened" : "project_open_not_observed");
         return opened.Verified
             ? WorkflowResult(context, ResultStatus.Ok, ExecutionState.Applied, data, log, "command+ui+window_title")
@@ -300,6 +319,10 @@ public sealed partial class CubaseController
                     ? "Cubase is waiting on a user dialog (for example unsaved changes); the broker does not answer it."
                     : "The opened project was not observed in the Cubase window title.");
     }
+
+    internal static bool IsActivationQuestion(string text) =>
+        (text.Contains("activate", StringComparison.OrdinalIgnoreCase) || text.Contains("활성화", StringComparison.Ordinal))
+        && !text.Contains("save", StringComparison.OrdinalIgnoreCase) && !text.Contains("저장", StringComparison.Ordinal);
 
     private sealed record FileObservation(bool Ok, FileIdentity? Identity);
 

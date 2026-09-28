@@ -34,7 +34,7 @@ public sealed partial class CubaseUiAutomation
             handle => FileNameEdit(handle) == IntPtr.Zero && HasControl(handle, IdYes) && HasControl(handle, IdNo)),
         DialogKinds.ExportAudio => new(["Export Audio Mixdown", "오디오 믹스다운 내보내기"], false, _ => true),
         DialogKinds.AddTrack => new(["Add Track", "트랙 추가"], false, _ => true),
-        DialogKinds.SaveChangesPrompt => new(["Cubase Pro", "Cubase"], false, handle => ClassName(handle) != "#32770" || !HasControl(handle, 1001)),
+        DialogKinds.CubasePrompt => new(["Cubase Pro", "Cubase"], false, handle => ClassName(handle) != "#32770"),
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unknown workflow dialog kind.")
     };
 
@@ -65,7 +65,7 @@ public sealed partial class CubaseUiAutomation
         }
     }
 
-    private static bool TitleMatches(string kind, string title, DialogSignature signature) => kind == DialogKinds.SaveChangesPrompt
+    private static bool TitleMatches(string kind, string title, DialogSignature signature) => kind == DialogKinds.CubasePrompt
         ? signature.TitleFragments.Any(fragment => title.Equals(fragment, StringComparison.Ordinal))
         : signature.TitleFragments.Any(fragment => title.Contains(fragment, StringComparison.OrdinalIgnoreCase));
 
@@ -179,6 +179,32 @@ public sealed partial class CubaseUiAutomation
         }
         _dialogs.TryRemove(dialog.Id, out _);
         return UiStageResult.Success("cancel");
+    }
+
+    public async Task<string?> ReadDialogTextAsync(UiDialogRef dialog, CancellationToken cancellationToken)
+    {
+        var owned = Revalidate(dialog);
+        if (owned is null) return null;
+        var path = CaptureWindow(owned.Handle, "prompt-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(6)).ToLowerInvariant());
+        if (path is null) return null;
+        cancellationToken.ThrowIfCancellationRequested();
+        var lines = await RecognizeTextAsync(path).ConfigureAwait(false);
+        return string.Join(" ", lines.OfType<JsonObject>().Select(line => line["text"]?.GetValue<string>()).Where(text => !string.IsNullOrWhiteSpace(text)));
+    }
+
+    public async Task<UiStageResult> PressDefaultButtonAsync(UiDialogRef dialog, CancellationToken cancellationToken)
+    {
+        var owned = Revalidate(dialog);
+        if (owned is null) return UiStageResult.Failure("default_button", "WORKFLOW_DIALOG_LOST", "The bound dialog is no longer open.");
+        for (var attempt = 0; attempt < 10 && GetForegroundWindow() != owned.Handle; attempt++)
+        {
+            _ = SetForegroundWindow(owned.Handle);
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        if (GetForegroundWindow() != owned.Handle)
+            return UiStageResult.Failure("default_button", "FOREGROUND_NOT_DIALOG", "The owned dialog is not the foreground window; no key was sent.");
+        SendKeyChord("enter");
+        return UiStageResult.Success("default_button");
     }
 
     private async Task<UiStageResult> TypeIntoForegroundAsync(IntPtr dialog, string? text, bool pressEnter, CancellationToken cancellationToken,

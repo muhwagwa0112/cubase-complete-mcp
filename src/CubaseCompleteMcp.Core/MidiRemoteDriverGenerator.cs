@@ -340,6 +340,15 @@ function registerCommand(id, category, name) {
     private const string HostMappingCallbacksAndDispatch = """
 function setSurface(value, number) { value.setProcessValue(runtime.device, number); }
 function pulse(value) { setSurface(value, 1); setSurface(value, 0); }
+// Live on Cubase 15.0.10 an immediate 1->0 pulse did not toggle the metronome: the host only saw the final value.
+// Latched presses keep the value at 1 and release it on the next idle callback.
+var pendingReleases = [];
+function pressLatched(value) { setSurface(value, 1); pendingReleases.push(value); }
+page.mOnIdle = function (activeDevice, activeMapping) {
+    var releases = pendingReleases, i;
+    pendingReleases = [];
+    for (i = 0; i < releases.length; i += 1) { releases[i].setProcessValue(activeDevice, 0); }
+};
 function stateSnapshot() {
     return {host_version: hostVersion(), driver_version: DRIVER_VERSION, protocol_version: PROTOCOL_VERSION,
         driver_contract_version: DRIVER_CONTRACT_VERSION, driver_build_id: DRIVER_BUILD_ID, session_id: runtime.sessionId,
@@ -576,7 +585,7 @@ function toggleTo(action, key, surfaceValue, desired) {
     if (before === null || before === undefined) { throw codedError('STATE_UNKNOWN', 'the ' + key + ' state has not been reported by Cubase in this driver session, so a toggle cannot be aimed at the requested state; nothing was sent'); }
     if (before === desired) { return receipt(action, false, {state_key: key, before: before, desired: desired}); }
     runtime.revision += 1; dispatchRevision = runtime.revision;
-    pulse(surfaceValue);
+    if (key === 'cycle' || key === 'metronome') { pressLatched(surfaceValue); } else { pulse(surfaceValue); }
     return receipt(action, true, {state_key: key, before: before, desired: desired, dispatch_revision: dispatchRevision});
 }
 function setTime(action, key, locator, args) {
