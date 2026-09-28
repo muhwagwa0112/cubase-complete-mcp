@@ -556,9 +556,29 @@ function findNamedParameter(root, objectId, requested) {
         if (aliases.indexOf(normalizeTitle(title)) >= 0) { matches.push({tag: tag, title: title}); }
         if (samples.length < 12) { samples.push(title); }
     }
+    if (matches.length === 0 && requested === 'pan') { return findPannerParameter(root, objectId, aliases, samples); }
     if (matches.length === 1) { return matches[0]; }
     if (matches.length > 1) { throw codedError('PARAMETER_AMBIGUOUS', 'parameter "' + requested + '" matches more than one exposed parameter on the target; use parameter_tag', {candidates: matches}); }
     throw codedError('PARAMETER_NOT_EXPOSED', 'parameter "' + requested + '" is not exposed on the target channel; observed titles: ' + samples.join(', '), {observed_titles: samples});
+}
+// Audio, instrument and group channels keep their pan in a child object whose unique name is "Panner"
+// ("Standard Panner": "Pan Left-Right"); only that child is searched, never other children such as an
+// instrument track's MIDI Channel, whose "Pan" is a different parameter.
+function findPannerParameter(root, objectId, aliases, samples) {
+    var count = root.getNumberOfChildObjects(runtime.mapping, objectId), i, child, total, j, tag, title, matches = [];
+    for (i = 0; i < count; i += 1) {
+        child = root.getChildObjectID(runtime.mapping, objectId, i);
+        if (String(root.getObjectUniqueName(runtime.mapping, child) || '') !== 'Panner') { continue; }
+        total = root.getNumberOfParameters(runtime.mapping, child);
+        for (j = 0; j < total; j += 1) {
+            tag = root.getParameterTagByIndex(runtime.mapping, child, j);
+            title = String(root.getParameterTitle(runtime.mapping, child, tag, 256) || '');
+            if (aliases.indexOf(normalizeTitle(title)) >= 0) { matches.push({tag: tag, title: title, objectId: child}); }
+        }
+    }
+    if (matches.length === 1) { return matches[0]; }
+    if (matches.length > 1) { throw codedError('PARAMETER_AMBIGUOUS', 'parameter "pan" matches more than one panner parameter on the target; use object_id and parameter_tag', {candidates: matches}); }
+    throw codedError('PARAMETER_NOT_EXPOSED', 'parameter "pan" is not exposed on the target channel or its panner; observed titles: ' + samples.join(', '), {observed_titles: samples});
 }
 function targetParameter(args) {
     var identity = resolveTarget(args.target), root = mixerRoot(), objectId = identity.object_id, found, tag;
@@ -570,7 +590,7 @@ function targetParameter(args) {
             if (!objectInTree(root, objectId, 1024, identity.object_id)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id ' + args.object_id + ' is not part of the resolved channel'); }
         }
         found = {tag: tag, title: root.getParameterTitle(runtime.mapping, objectId, tag, 256)};
-    } else { found = findNamedParameter(root, objectId, args.parameter); }
+    } else { found = findNamedParameter(root, objectId, args.parameter); if (found.objectId !== undefined) { objectId = found.objectId; } }
     return {identity: identity, root: root, objectId: objectId, tag: found.tag, title: found.title};
 }
 

@@ -215,6 +215,7 @@ try {
     const start = await a.confirm('cubase_transport', { action: 'record_start' });
     await new Promise(done => setTimeout(done, 2000));
     const stop = await a.confirm('cubase_transport', { action: 'record_stop' });
+    await a.call('cubase_transport', { action: 'stop' }); // Cubase keeps playing after recording ends
     expect(1, 'record <= 3 s', [start.status, stop.status], start.status === 'Ok' && stop.status === 'Ok');
     expect(2, 'no physical input used', 'operator-configured fixture with no input bus (record_test.physical_audio_input=none)', true);
   });

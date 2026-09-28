@@ -389,6 +389,14 @@ scenario('TGT-07 parameter resolution', {}, function (host) {
   refused(host, 'out-of-range value', 'mixer.set', { target: channelTarget(host, 0), parameter: 'volume', process_value: 1.5 }, 'INVALID_ARGUMENT');
   refused(host, 'plain value without a host converter', 'mixer.set', { target: channelTarget(host, 0), parameter: 'volume', plain_value: -6 }, 'UNSUPPORTED_CAPABILITY');
   refused(host, 'object outside the target', 'mixer.set', { target: channelTarget(host, 0), object_id: 2011, parameter_tag: 0, process_value: 0.1 }, 'TARGET_SCOPE_MISMATCH');
+  // Cubase 15 instrument/audio channel: pan lives in the "Panner" child; the MIDI Channel child's "Pan" is not it.
+  const synth = makeChannel(2, 'Synth', [param(0, 'Volume'), param(1, 'Mute')]);
+  synth.tree.children.push(node(2025, 'MIDI Channel', 'MidiChannel', [param(7, 'Pan')]));
+  synth.tree.children.push(node(2026, 'Standard Panner', 'Panner', [param(4201, 'Pan Left-Right'), param(4204, 'Pan Left-Right2')]));
+  synth.index = indexTree(synth.tree);
+  host.slots[2].current = synth;
+  const panned = ok(host, 'pan on a channel whose panner is a child object', 'mixer.set', { target: channelTarget(host, 2), parameter: 'pan', process_value: 0.25 });
+  check('pan resolves to the Panner child, not the MIDI Channel child', panned && panned.object_id === 2026 && panned.parameter_tag === 4201, panned);
 });
 
 scenario('TGT-02 selection guard in the command callback', {}, function (host) {
