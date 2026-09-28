@@ -585,7 +585,7 @@ function toggleTo(action, key, surfaceValue, desired) {
     if (before === null || before === undefined) { throw codedError('STATE_UNKNOWN', 'the ' + key + ' state has not been reported by Cubase in this driver session, so a toggle cannot be aimed at the requested state; nothing was sent'); }
     if (before === desired) { return receipt(action, false, {state_key: key, before: before, desired: desired}); }
     runtime.revision += 1; dispatchRevision = runtime.revision;
-    if (key === 'cycle' || key === 'metronome') { pressLatched(surfaceValue); } else { pulse(surfaceValue); }
+    if (key === 'cycle' || key === 'metronome' || key === 'recording') { pressLatched(surfaceValue); } else { pulse(surfaceValue); }
     return receipt(action, true, {state_key: key, before: before, desired: desired, dispatch_revision: dispatchRevision});
 }
 function setTime(action, key, locator, args) {
