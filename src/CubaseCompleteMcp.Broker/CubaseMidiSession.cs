@@ -42,7 +42,9 @@ public sealed class CubaseMidiSession : ICubaseDriver
     private readonly MidiFrameReassembler _reassembler = new();
     private readonly SemaphoreSlim _helloGate = new(1, 1);
     private readonly object _stateGate = new();
-    private int _requestCounter;
+    // Random start per broker instance: the driver caches request IDs per session, and a restarted broker reusing the
+    // same session must not collide with IDs the previous broker already used (the driver would refuse them).
+    private int _requestCounter = System.Security.Cryptography.RandomNumberGenerator.GetInt32(1, int.MaxValue / 2);
     private int _sequenceCounter;
     private DateTimeOffset _lastReplyAt;
     private JsonObject _eventState = new();
