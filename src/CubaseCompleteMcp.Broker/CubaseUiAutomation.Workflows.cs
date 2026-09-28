@@ -91,10 +91,28 @@ public sealed partial class CubaseUiAutomation
         if (edit == IntPtr.Zero || !HasControl(owned.Handle, IdOk))
             return UiStageResult.Failure("submit_path", "WORKFLOW_CONTROL_MISSING", "The file dialog has no file-name field (1001/1148) or accept button (IDOK).");
         var full = Path.GetFullPath(absolutePath);
-        _ = SendMessage(edit, 0x000C /* WM_SETTEXT */, IntPtr.Zero, full);
-        var echoed = WindowText(edit);
+        // Live on Cubase 15.0.10 the Save As item dialog ignores text set with WM_SETTEXT and saves under its prefilled
+        // name, so the path is typed while the file-name field itself has keyboard focus, then read back before IDOK.
+        for (var attempt = 0; attempt < 10 && GetForegroundWindow() != owned.Handle; attempt++)
+        {
+            _ = SetForegroundWindow(owned.Handle);
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        if (GetForegroundWindow() != owned.Handle)
+            return UiStageResult.Failure("submit_path", "FOREGROUND_NOT_DIALOG", "The file dialog is not the foreground window; nothing was typed or submitted.");
+        if (FocusedWindow(owned.Handle) != edit)
+            return UiStageResult.Failure("submit_path", "FILE_NAME_NOT_FOCUSED", "The file-name field does not have keyboard focus; nothing was typed or submitted.");
+        SendKeyChord("ctrl+a");
+        SendUnicodeText(full);
+        string echoed = string.Empty;
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            echoed = WindowText(edit);
+            if (string.Equals(echoed, full, StringComparison.Ordinal)) break;
+            await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+        }
         if (!string.Equals(echoed, full, StringComparison.Ordinal))
-            return UiStageResult.Failure("submit_path", "WORKFLOW_CONTROL_MISSING", "The file-name field did not accept the path.",
+            return UiStageResult.Failure("submit_path", "WORKFLOW_CONTROL_MISSING", "The file-name field did not show the typed path; it was not submitted.",
                 new JsonObject { ["field_text"] = echoed });
         PressDialogButton(owned.Handle, IdOk);
         for (var attempt = 0; attempt < 50; attempt++)
@@ -334,6 +352,29 @@ public sealed partial class CubaseUiAutomation
         return builder.ToString();
     }
 
+    /// <summary>The window with keyboard focus in the dialog's GUI thread, or zero.</summary>
+    private static IntPtr FocusedWindow(IntPtr dialog)
+    {
+        var thread = GetWindowThreadProcessId(dialog, out _);
+        var info = new GuiThreadInfo { Size = Marshal.SizeOf<GuiThreadInfo>() };
+        return GetGUIThreadInfo(thread, ref info) ? info.Focus : IntPtr.Zero;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GuiThreadInfo
+    {
+        public int Size;
+        public int Flags;
+        public IntPtr Active;
+        public IntPtr Focus;
+        public IntPtr Capture;
+        public IntPtr MenuOwner;
+        public IntPtr MoveSize;
+        public IntPtr Caret;
+        public int CaretLeft, CaretTop, CaretRight, CaretBottom;
+    }
+
+    [DllImport("user32.dll")] private static extern bool GetGUIThreadInfo(uint threadId, ref GuiThreadInfo info);
     private delegate bool EnumChildCallback(IntPtr handle, IntPtr parameter);
     [DllImport("user32.dll")] private static extern bool EnumChildWindows(IntPtr parent, EnumChildCallback callback, IntPtr parameter);
     [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr handle);
