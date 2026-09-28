@@ -37,6 +37,7 @@ public static class MidiOperations
         ["transport.set"] = 31,
         ["track.get"] = 40,
         ["track.set"] = 41,
+        ["track.list"] = 42,
         ["mixer.get"] = 50,
         ["mixer.set"] = 51,
         ["plugin.get"] = 60,
@@ -61,6 +62,10 @@ public static class MidiOperations
         : throw new InvalidDataException($"Unknown MIDI opcode: {opcode}.");
 
     public static IReadOnlyDictionary<string, ushort> All => NameToOpcode;
+
+    /// <summary>Driver operations that can change Cubase. A lost reply to one of these is an unknown outcome.</summary>
+    public static bool IsWrite(string operation) =>
+        operation.EndsWith(".set", StringComparison.Ordinal) || operation == "command.execute";
 }
 
 public static class MidiProtocolV2

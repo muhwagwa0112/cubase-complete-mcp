@@ -14,18 +14,23 @@ public static class CapabilityRegistry
             ? ["CompleteBridge active", "Matching Cubase context"]
             : new[] { "CompleteBridge active", "Matching Cubase context", "Execution context cannot be preflighted on Cubase before 15.0.20" };
         var classified = TryClassifyCommand(command, out var risk);
+        if (!classified) risk = RiskLevel.Confirm;
         return new CommandCapabilityDescriptor(command.Id, command.Category, command.Name, command.Index,
             "midi_remote.command_binding", risk, "command_backed", preconditions,
             api13Available, false, classified);
     }
 
+    /// <summary>
+    /// Effective risk of executing a catalog command. A command no explicit rule classifies is
+    /// <see cref="RiskLevel.Confirm"/>: an unreviewed command can do anything, so it needs a confirmed plan.
+    /// </summary>
     public static RiskLevel ClassifyCommand(KeyCommandDescriptor command) =>
-        TryClassifyCommand(command, out var risk) ? risk : RiskLevel.Low;
+        TryClassifyCommand(command, out var risk) ? risk : RiskLevel.Confirm;
 
     /// <summary>
-    /// Classifies a catalog command against the explicit risk rules. Returns false when no rule matched, in
-    /// which case the command falls through to <see cref="RiskLevel.Low"/> and still needs review. The catalog
-    /// summary reports that fall-through count as <c>unclassified_commands</c>.
+    /// Classifies a catalog command against the explicit risk rules. Returns false when no rule matched; the
+    /// effective risk is then <see cref="RiskLevel.Confirm"/>. The catalog summary reports that count as
+    /// <c>unclassified_commands</c>.
     /// </summary>
     public static bool TryClassifyCommand(KeyCommandDescriptor command, out RiskLevel risk)
     {
@@ -55,8 +60,32 @@ public static class CapabilityRegistry
             return true;
         }
 
-        risk = RiskLevel.Low;
+        if (LowRiskCommands.Contains((category, name)))
+        {
+            risk = RiskLevel.Low;
+            return true;
+        }
+
+        risk = RiskLevel.Confirm;
         return false;
+    }
+
+    private static readonly HashSet<(string, string)> LowRiskCommands = new(new CommandKeyComparer())
+    {
+        ("Transport", "Start"), ("Transport", "Stop"), ("Transport", "Start/Stop"), ("Transport", "Cycle"),
+        ("Transport", "Metronome On"), ("Transport", "Return to Zero"), ("Transport", "Locate Next Marker"),
+        ("Transport", "Locate Previous Marker"), ("Navigate", "Up"), ("Navigate", "Down"),
+        ("AddTrack", "Audio"), ("AddTrack", "Instrument"), ("AddTrack", "MIDI"), ("Edit", "Rename First Selected Track"),
+        ("Project", "Duplicate Tracks"), ("File", "Open"), ("File", "Export Audio Mixdown"), ("File", "Import MIDI File"),
+        ("File", "Export MIDI File")
+    };
+
+    private sealed class CommandKeyComparer : IEqualityComparer<(string, string)>
+    {
+        public bool Equals((string, string) x, (string, string) y) =>
+            StringComparer.OrdinalIgnoreCase.Equals(x.Item1, y.Item1) && StringComparer.OrdinalIgnoreCase.Equals(x.Item2, y.Item2);
+        public int GetHashCode((string, string) value) =>
+            HashCode.Combine(StringComparer.OrdinalIgnoreCase.GetHashCode(value.Item1), StringComparer.OrdinalIgnoreCase.GetHashCode(value.Item2));
     }
 
     public static DirectRootDescriptor[] DirectRoots() =>

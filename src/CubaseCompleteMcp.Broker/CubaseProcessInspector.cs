@@ -8,7 +8,7 @@ namespace CubaseCompleteMcp.Broker;
 public sealed record CubaseProcessState(bool Running, int? ProcessId, string? Version, string? WindowTitle,
     IntPtr WindowHandle, DateTimeOffset? StartTime);
 
-public sealed class CubaseProcessInspector
+public sealed class CubaseProcessInspector : IHostProcessProbe
 {
     public CubaseProcessState Inspect()
     {

@@ -108,6 +108,7 @@ public sealed class MidiCompositionService
             "replace_range" => ReplaceRange(arguments, clientSessionId),
             "render" or "render_file" or "export_file" => Render(arguments, clientSessionId),
             "inspect_file" => InspectFile(arguments),
+            "compare_file" => CompareFile(arguments, clientSessionId),
             "import_file" => ImportFile(arguments, clientSessionId),
             _ => throw new ArgumentOutOfRangeException(nameof(action), action, "Unsupported MIDI composition action.")
         };
@@ -447,6 +448,38 @@ public sealed class MidiCompositionService
         reply["source_path"] = path;
         reply["source_sha256"] = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
         return reply;
+    }
+
+    public MidiCompositionDocument LoadDocument(string documentId, string clientSessionId) => Load(documentId, clientSessionId);
+
+    /// <summary>Writes a render of a transient (not stored) document copy, e.g. a verification-tagged import file.</summary>
+    public (string Path, byte[] Bytes) RenderTransient(MidiCompositionDocument document, string clientSessionId, string suffix)
+    {
+        var bytes = StandardMidiFile.Write(document);
+        var path = Path.Combine(SessionRoot(clientSessionId), "renders",
+            SafeFileName(document.Name) + "-" + document.Id + "-" + SafeFileName(suffix) + ".mid");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        WriteAtomic(path, bytes);
+        return (path, bytes);
+    }
+
+    /// <summary>
+    /// Compares a stored document with a Standard MIDI File exported back from Cubase (the official export path),
+    /// using canonical note/CC/timing content. This is the content_roundtrip_verified evidence for an import.
+    /// </summary>
+    private JsonObject CompareFile(JsonObject arguments, string session)
+    {
+        var document = LoadForUpdate(arguments, session);
+        var path = ValidateMidiPath(RequireString(arguments, "path"), requireExisting: true);
+        var bytes = File.ReadAllBytes(path);
+        var exported = StandardMidiFile.Read(bytes, Path.GetFileNameWithoutExtension(path));
+        var comparison = MidiImportCausality.Compare(document, exported);
+        comparison["document_id"] = document.Id;
+        comparison["exported_path"] = path;
+        comparison["exported_sha256"] = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+        comparison["source_sha256"] = Convert.ToHexString(SHA256.HashData(StandardMidiFile.Write(document))).ToLowerInvariant();
+        comparison["source_digest"] = MidiImportCausality.CanonicalDigest(document);
+        return comparison;
     }
 
     private MidiCompositionDocument LoadForUpdate(JsonObject arguments, string session) => Load(RequireDocumentId(arguments), session);

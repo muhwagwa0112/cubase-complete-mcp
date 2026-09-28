@@ -15,7 +15,7 @@ public sealed record SessionCleanupResult(string ConfirmationId, int DeletedSess
 
 public sealed class SessionCleanupService
 {
-    private const string BrokerMutexName = @"Local\CubaseCompleteMcp.Broker.v1";
+    private const string BrokerMutexName = CubaseConstants.BrokerMutexName;
     private readonly string _compositionRoot;
     private readonly string _proposalRoot;
     private readonly Func<bool> _brokerActive;

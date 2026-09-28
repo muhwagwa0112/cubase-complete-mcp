@@ -14,7 +14,7 @@ using Windows.Storage;
 
 namespace CubaseCompleteMcp.Broker;
 
-public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, CubasePaths paths)
+public sealed partial class CubaseUiAutomation(CubaseProcessInspector processInspector, CubasePaths paths) : IWorkflowUi
 {
     private readonly ConcurrentDictionary<string, UiToken> _tokens = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, UiSnapshot> _snapshots = new(StringComparer.Ordinal);

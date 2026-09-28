@@ -8,11 +8,14 @@ public static class CubaseConstants
     public const string ProductName = "Cubase Complete MCP";
     public const string DeviceVendor = "CBMCP";
     public const string DeviceName = "CompleteBridge";
-    public const string PipeName = "CubaseCompleteMcp.v1";
+    public const string PipeName = "CubaseCompleteMcp.v2";
+    public const string BrokerMutexName = @"Local\CubaseCompleteMcp.Broker.v2";
     public const string InputPortName = "CubaseMCP To Cubase";
     public const string OutputPortName = "CubaseMCP From Cubase";
     public const string ServerName = "cubase-complete";
-    public const int PipeProtocolVersion = 1;
+    public const int PipeProtocolVersion = 2;
+    public const int MidiWireProtocolVersion = 2;
+    public const int DriverContractVersion = 2;
     public const int MinimumCubaseBuildForApi13 = 20;
 }
 
@@ -43,28 +46,46 @@ public sealed record BrokerRequest(
     string? ConfirmationId = null,
     string? ClientSessionId = null,
     int? ClientProtocolVersion = null,
-    string? ClientReleaseId = null);
+    string? ClientReleaseId = null,
+    string? OperationId = null);
 
 public sealed record BrokerResponse(
     string Id,
     ResultStatus Status,
     JsonNode? Data = null,
     BrokerError? Error = null,
-    OperationMetadata? Metadata = null)
+    OperationMetadata? Metadata = null,
+    string? ExecutionState = null,
+    string? OperationId = null)
 {
+    /// <summary>
+    /// Builds a read or verified-write result. A write that could not be verified must say whether the change
+    /// was observed (<see cref="Core.ExecutionState.Applied"/>) or is unknown; the default for an unverified write
+    /// is <see cref="Core.ExecutionState.Applied"/> only when the caller passes it explicitly.
+    /// </summary>
     public static BrokerResponse Success(string id, JsonNode? data, string path, bool verified = true,
         JsonNode? before = null, JsonNode? after = null, IReadOnlyList<string>? warnings = null,
-        long sessionRevision = 0) =>
+        long sessionRevision = 0, string? executionState = null) =>
         new(id, verified ? ResultStatus.Ok : ResultStatus.Unverified, data, null,
-            new OperationMetadata(path, verified, before, after, warnings ?? [], sessionRevision));
+            new OperationMetadata(path, verified, before, after, warnings ?? [], sessionRevision),
+            executionState ?? (verified ? Core.ExecutionState.NotApplicable : Core.ExecutionState.Unknown));
 
     public static BrokerResponse Failure(string id, ResultStatus status, string code, string message,
-        JsonNode? details = null, string path = "broker") =>
-        new(id, status, null, new BrokerError(code, message, details),
-            new OperationMetadata(path, false, null, null, [], 0));
+        JsonNode? details = null, string path = "broker", string executionState = Core.ExecutionState.NotStarted,
+        bool retryable = false) =>
+        new(id, status, null, new BrokerError(code, message, details, retryable),
+            new OperationMetadata(path, false, null, null, [], 0), executionState);
+
+    /// <summary>A write was handed to the host (or may have been) and its effect could not be established.</summary>
+    public static BrokerResponse OutcomeUnknown(string id, string message, JsonNode? details = null,
+        string path = "broker") =>
+        new(id, ResultStatus.Unverified, null, new BrokerError(ErrorCodes.OutcomeUnknown, message, details, false),
+            new OperationMetadata(path, false, null, null,
+                ["The change may or may not have been applied. It was not re-sent. Read the current state before deciding what to do."], 0),
+            Core.ExecutionState.Unknown);
 }
 
-public sealed record BrokerError(string Code, string Message, JsonNode? Details = null);
+public sealed record BrokerError(string Code, string Message, JsonNode? Details = null, bool Retryable = false);
 
 public sealed record OperationMetadata(
     string PathUsed,
@@ -143,7 +164,12 @@ public sealed record CubaseStatusSnapshot(
     bool CubaseRestartRequired,
     string? ClientReleaseId,
     string? BrokerReleaseId,
-    bool ReleaseMismatch);
+    bool ReleaseMismatch,
+    int PipeProtocolVersion = CubaseConstants.PipeProtocolVersion,
+    int? DriverContractVersion = null,
+    string? DriverBuildId = null,
+    long DriverEpoch = 0,
+    JsonNode? DriverFeatures = null);
 
 public sealed record MidiPortSnapshot(uint Id, string Name, bool IsInput);
 
@@ -155,4 +181,7 @@ public sealed record ConfirmationProposal(
     RiskLevel Risk,
     string Summary,
     DateTimeOffset ExpiresAt,
-    string ArgumentsHash);
+    string ArgumentsHash,
+    string? OperationId = null,
+    string? PlanHash = null,
+    JsonNode? Plan = null);
