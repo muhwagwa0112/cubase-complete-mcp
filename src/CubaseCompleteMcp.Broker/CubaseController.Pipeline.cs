@@ -245,8 +245,7 @@ public sealed partial class CubaseController
     /// <summary>Exception type and the innermost project frame, so a workflow failure can be located from its result.</summary>
     internal static string Origin(Exception error)
     {
-        var frame = (error.StackTrace ?? string.Empty).Split('
-')
+        var frame = (error.StackTrace ?? string.Empty).Split('\n')
             .Select(line => line.Trim())
             .FirstOrDefault(line => line.Contains("CubaseCompleteMcp.", StringComparison.Ordinal));
         if (frame is not null)
