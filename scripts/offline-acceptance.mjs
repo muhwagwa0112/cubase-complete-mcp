@@ -165,8 +165,8 @@ const refusal = run('node', [join(root, 'scripts', 'live-acceptance.mjs'), 'run'
   '--authorization', template, '--fixture', fixtureRoot, '--installation-receipt', template, '--cases', join(packageRoot, 'acceptance', 'cases.json'),
   '--evidence', join(evidence, 'live-refused'), '--candidate-sha', head]);
 const base03Log = writeLog('BASE-03.log', ['$ ' + refusal.command, `exit=${refusal.status}`, refusal.stdout, refusal.stderr,
-  `live-refused evidence directory created: ${existsSync(join(evidence, 'live-refused', 'receipts'))}`]);
-const liveRefused = refusal.status === 4 && refusal.stderr.includes('unfilled template') && !existsSync(join(evidence, 'live-refused', 'receipts'));
+  `live evidence directory created: ${existsSync(join(evidence, 'live-refused'))}`]);
+const liveRefused = refusal.status === 4 && refusal.stderr.includes('unfilled template') && !existsSync(join(evidence, 'live-refused'));
 
 // ---- receipts -------------------------------------------------------------------------------------------------------
 const results = [];

@@ -51,7 +51,6 @@ const receiptPath = required('--installation-receipt');
 const installation = JSON.parse(readFileSync(receiptPath, 'utf8'));
 const cases = JSON.parse(readFileSync(required('--cases'), 'utf8')).cases;
 const evidence = resolve(required('--evidence'));
-mkdirSync(evidence, { recursive: false });
 const runId = 'live-' + new Date().toISOString().replace(/[:.]/g, '') + '-' + randomBytes(3).toString('hex');
 
 const scope = authorization.scope ?? {};
@@ -64,6 +63,7 @@ if (authorization.fixture_id !== marker.fixture_id) refusals.push('authorization
 if (!authorization.fixture_root || realpathSync(authorization.fixture_root) !== fixture) refusals.push('authorization fixture_root does not match');
 if (marker.kind !== 'cubase_complete_mcp_owned_fixture') refusals.push('fixture marker is not a harness-created marker');
 if (refusals.length) { process.stderr.write(JSON.stringify({ refused: refusals }, null, 2) + '\n'); process.exit(4); }
+mkdirSync(evidence, { recursive: false }); // created only after every refusal check passed
 
 // ---- MCP client ---------------------------------------------------------------------------------------------
 const trace = [];
