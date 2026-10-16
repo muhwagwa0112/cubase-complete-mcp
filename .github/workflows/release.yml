@@ -57,7 +57,8 @@ jobs:
           $zip = "$env:RUNNER_TEMP/cubase-complete-mcp-$env:VERSION-windows.zip"
           Compress-Archive -Path (Join-Path $release.FullName '*') -DestinationPath $zip
           $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$zipHash  $(Split-Path $zip -Leaf)" | Set-Content -Encoding ascii "$zip.sha256"
+          # LF, no BOM: the file must be readable by sha256sum -c as well as by Get-FileHash users.
+          [IO.File]::WriteAllText("$zip.sha256", "$zipHash  $(Split-Path $zip -Leaf)`n", [Text.Encoding]::ASCII)
           # Release notes: the CHANGELOG section of this version plus the integrity values.
           $changelog = Get-Content CHANGELOG.md -Raw
           $section = [regex]::Match($changelog, "(?ms)^## $([regex]::Escape($env:VERSION))\b.*?(?=^## |\z)").Value.Trim()
