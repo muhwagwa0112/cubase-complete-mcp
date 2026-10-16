@@ -364,7 +364,10 @@ public sealed partial class CubaseController
                     throw new PlanException(ErrorCodes.InvalidArgument,
                         "expected_duration_seconds (the locator range length) is required to verify the rendered WAV.");
                 plan.Command = RequireCommand("File", "Export Audio Mixdown");
+                plan.Targets["perform_command"] = RequireCommand("Audio Export", "Perform Audio Export").Id;
                 plan.Targets["profile"] = "wav_pcm_stereo_48000_24";
+                plan.Impact = $"Open Export Audio Mixdown, name the file '{Path.GetFileNameWithoutExtension(wavPath)}', verify by read-back that it is a "
+                    + "48 kHz/24-bit WAV in the project Mixdown folder, then export the locator range once.";
                 break;
             case "new":
                 plan.Command = RequireCommand("File", "New");

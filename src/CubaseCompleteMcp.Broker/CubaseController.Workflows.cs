@@ -232,12 +232,25 @@ public sealed partial class CubaseController
 
         if (action == "export_audio")
         {
-            var configure = await _ui.ConfigureAndStartExportAsync(dialog, Path.GetDirectoryName(file.Path)!,
+            var configure = await _ui.ConfigureExportAsync(dialog, Path.GetDirectoryName(file.Path)!,
                 Path.GetFileNameWithoutExtension(file.Path), cancellationToken).ConfigureAwait(false);
-            log.Add(configure.Ok ? "export_started" : "export_configuration_failed", configure.Evidence);
+            log.Add(configure.Ok ? "export_configured" : "export_configuration_failed", configure.Evidence);
             if (!configure.Ok)
+            {
+                var closed = _ui.IsDialogOpen(dialog) ? await _ui.CancelDialogAsync(dialog, cancellationToken).ConfigureAwait(false) : null;
+                if (closed is not null) log.Add(closed.Ok ? "export_dialog_cancelled" : "export_dialog_left_open", closed.Evidence);
                 return WorkflowResult(context, ResultStatus.Error, ExecutionState.NotApplied, data, log, "command+ui",
-                    configure.ErrorCode, configure.Message + " The export dialog was left open; no export was started.");
+                    configure.ErrorCode, configure.Message + " No export was started.");
+            }
+            // "Perform Audio Export" runs the export of the open dialog with the settings just read back.
+            var perform = await _driver.SendAsync("command.execute", new JsonObject { ["id"] = context.Plan.Targets["perform_command"]!.GetValue<string>() },
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            log.Add(perform.Ok ? "export_started" : "export_start_refused", new JsonObject { ["error"] = perform.Error?.Code });
+            if (!perform.Ok)
+            {
+                if (_ui.IsDialogOpen(dialog)) await _ui.CancelDialogAsync(dialog, cancellationToken).ConfigureAwait(false);
+                return DriverFailure(context.Request, perform);
+            }
             return await ObserveExportAsync(context, file, started, data, log, cancellationToken).ConfigureAwait(false);
         }
 

@@ -14,7 +14,7 @@ public sealed class ControllerHarness : IDisposable
         ("AddTrack", "MIDI"), ("AddTrack", "Instrument"), ("AddTrack", "Audio"), ("AddTrack", "Marker"),
         ("Edit", "Rename First Selected Track"), ("Project", "Remove Selected Tracks"), ("Project", "Duplicate Tracks"),
         ("Edit", "Freeze/Unfreeze Selected Tracks"), ("Audio", "Disable/Enable Track"),
-        ("File", "Open"), ("File", "Save"), ("File", "Save As"), ("File", "Export Audio Mixdown"),
+        ("File", "Open"), ("File", "Save"), ("File", "Save As"), ("File", "Export Audio Mixdown"), ("Audio Export", "Perform Audio Export"),
         ("File", "Import MIDI File"), ("File", "New"), ("File", "Close"), ("Edit", "Mystery Command")
     ];
 

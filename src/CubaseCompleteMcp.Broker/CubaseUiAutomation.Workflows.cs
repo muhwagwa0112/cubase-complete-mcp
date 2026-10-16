@@ -171,17 +171,28 @@ public sealed partial class CubaseUiAutomation
     }
 
     /// <summary>
-    /// Cubase's Export Audio Mixdown dialog exposes no controls to UI Automation or Win32, so its path, name and format
-    /// cannot be set reliably. The stage fails explicitly instead of typing into unknown fields.
+    /// Cubase's Export Audio Mixdown dialog exposes no controls to UI Automation or Win32. On Cubase 15 it opens with the
+    /// Name field focused and its text selected, so the file name is typed there while the dialog is the verified
+    /// foreground window. The settings are then read back by OCR of the dialog and compared with a 48 kHz/24-bit WAV at
+    /// the requested directory (Path follows "Use Project Mixdown Folder"). Nothing is started here.
     /// </summary>
-    public Task<UiStageResult> ConfigureAndStartExportAsync(UiDialogRef dialog, string directory, string fileName,
+    public async Task<UiStageResult> ConfigureExportAsync(UiDialogRef dialog, string directory, string fileName,
         CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(Revalidate(dialog) is null
-            ? UiStageResult.Failure("export_configure", "WORKFLOW_DIALOG_LOST", "The export dialog is no longer open.")
-            : UiStageResult.Failure("export_configure", "WORKFLOW_CONTROL_MISSING",
-                "The Export Audio Mixdown dialog exposes no addressable controls, so the output path and format cannot be set safely; nothing was typed and no export was started."));
+        var owned = Revalidate(dialog);
+        if (owned is null) return UiStageResult.Failure("export_configure", "WORKFLOW_DIALOG_LOST", "The export dialog is no longer open.");
+        var typed = await TypeIntoForegroundAsync(owned.Handle, fileName, pressEnter: false, cancellationToken).ConfigureAwait(false);
+        if (!typed.Ok) return typed;
+        SendKeyChord("tab"); // commits the name without pressing the dialog's default button
+        await Task.Delay(400, cancellationToken).ConfigureAwait(false);
+        if (Revalidate(dialog) is null) return UiStageResult.Failure("export_configure", "WORKFLOW_DIALOG_LOST", "The export dialog closed while it was being configured.");
+        var capture = CaptureWindow(owned.Handle, "export-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(6)).ToLowerInvariant());
+        if (capture is null) return UiStageResult.Failure("export_configure", "EXPORT_SETTINGS_UNREADABLE", "The export dialog could not be captured for read-back.");
+        var reading = ExportDialogReading.Verify(await RecognizeTextAsync(capture, scale: 2).ConfigureAwait(false), directory, fileName);
+        reading.Evidence["capture"] = capture;
+        return reading.Ok
+            ? UiStageResult.Success("export_configured", reading.Evidence)
+            : UiStageResult.Failure("export_configure", "EXPORT_SETTINGS_MISMATCH", reading.Message!, reading.Evidence);
     }
 
     /// <summary>Cancels a dialog this workflow bound earlier. Any other window is refused.</summary>

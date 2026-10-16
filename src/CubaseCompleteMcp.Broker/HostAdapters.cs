@@ -57,7 +57,8 @@ public interface IWorkflowUi
     Task<UiStageResult> AnswerPromptAsync(UiDialogRef prompt, bool accept, CancellationToken cancellationToken);
     Task<UiStageResult> FillAddTrackDialogAsync(UiDialogRef dialog, string name, CancellationToken cancellationToken);
     Task<UiStageResult> TypeRenameTextAsync(string name, CancellationToken cancellationToken);
-    Task<UiStageResult> ConfigureAndStartExportAsync(UiDialogRef dialog, string directory, string fileName,
+    /// <summary>Sets the export file name and verifies the dialog's settings by read-back; starts nothing.</summary>
+    Task<UiStageResult> ConfigureExportAsync(UiDialogRef dialog, string directory, string fileName,
         CancellationToken cancellationToken);
     Task<UiStageResult> CancelDialogAsync(UiDialogRef dialog, CancellationToken cancellationToken);
     /// <summary>Recognized text of a bound dialog (PrintWindow + Windows OCR); null when it cannot be read.</summary>

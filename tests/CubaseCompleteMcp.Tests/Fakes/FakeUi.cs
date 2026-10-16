@@ -14,7 +14,6 @@ public sealed class FakeUi : IWorkflowUi
     public Func<string, string, bool>? OnSubmitPath { get; set; }
     public Func<string, bool>? OnFillAddTrack { get; set; }
     public Func<string, bool>? OnRenameText { get; set; }
-    public Func<string, string, bool>? OnExport { get; set; }
     public bool OverwritePromptOnSave { get; set; }
     public bool? LastPromptAnswer { get; private set; }
     public string MidiStageAfterCommand { get; set; } = "midi_file_dialog";
@@ -142,12 +141,15 @@ public sealed class FakeUi : IWorkflowUi
             : UiStageResult.Failure("rename_text", "FOREGROUND_NOT_CUBASE", "not foreground"));
     }
 
-    public Task<UiStageResult> ConfigureAndStartExportAsync(UiDialogRef dialog, string directory, string fileName, CancellationToken cancellationToken)
+    public Task<UiStageResult> ConfigureExportAsync(UiDialogRef dialog, string directory, string fileName, CancellationToken cancellationToken)
     {
-        Actions.Add("export_start");
-        return Task.FromResult(OnExport?.Invoke(directory, fileName) != false ? UiStageResult.Success("export_started")
-            : UiStageResult.Failure("export_configure", "WORKFLOW_CONTROL_MISSING", "no fields"));
+        Actions.Add("export_configure");
+        return Task.FromResult(OnExportConfigure?.Invoke(directory, fileName) != false ? UiStageResult.Success("export_configured")
+            : UiStageResult.Failure("export_configure", "EXPORT_SETTINGS_MISMATCH", "settings differ"));
     }
+
+    /// <summary>Read-back of the export settings; false models settings that differ from the request.</summary>
+    public Func<string, string, bool>? OnExportConfigure { get; set; }
 
     public string? PromptText { get; set; }
 
