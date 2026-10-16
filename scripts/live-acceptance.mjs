@@ -325,7 +325,8 @@ try {
     if (right.status !== 'Ok') return blockedEnv(`right locator could not be set in Bars+Beats: ${right.error?.code ?? right.status}`);
     const left = await setLocator(a, 'left_locator', '1.1.1.0', '2.1.1.0');
     if (left.status !== 'Ok') return blockedEnv(`left locator could not be set in Bars+Beats: ${left.error?.code ?? left.status}`);
-    // Export Audio Mixdown writes to the project Mixdown folder.
+    // Export Audio Mixdown writes to the project Mixdown folder, which Cubase creates only on its first export.
+    mkdirSync(join(fixture, 'Mixdown'), { recursive: true });
     const wav = join(fixture, 'Mixdown', 'mixdown.wav');
     const exported = await a.call('cubase_project', { action: 'export_audio', path: wav, expected_duration_seconds: 4.0 });
     if (exported.status === 'Ok') attach(wav, 'mixdown.wav');

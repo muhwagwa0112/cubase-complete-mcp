@@ -171,6 +171,46 @@ public sealed partial class CubaseUiAutomation
     }
 
     /// <summary>
+    /// Brings the identity-verified Cubase main window to the foreground before a keyboard stage. Windows refuses
+    /// SetForegroundWindow to a background process, so the broker briefly attaches its input queue to the current
+    /// foreground thread; no keystrokes are sent. Fails when Cubase is still not in front afterwards.
+    /// </summary>
+    public async Task<UiStageResult> ActivateCubaseAsync(CancellationToken cancellationToken)
+    {
+        var process = processInspector.Inspect();
+        if (!process.Running || process.ProcessId is null) return UiStageResult.Failure("activate", "CUBASE_NOT_RUNNING", "Cubase is not running.");
+        if (!CreateTarget(process).IdentityVerified || process.WindowHandle == IntPtr.Zero)
+            return UiStageResult.Failure("activate", "FOREGROUND_NOT_CUBASE", "The Cubase main window could not be identified; no focus change was attempted.");
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            var foreground = GetForegroundWindow();
+            var foregroundThread = GetWindowThreadProcessId(foreground, out var foregroundProcess);
+            if (foregroundProcess == process.ProcessId)
+                return UiStageResult.Success("activate", new JsonObject { ["attempts"] = attempt });
+            var current = GetCurrentThreadId();
+            var attached = foregroundThread != 0 && foregroundThread != current && AttachThreadInput(current, foregroundThread, true);
+            try
+            {
+                if (IsIconic(process.WindowHandle)) _ = ShowWindow(process.WindowHandle, 9 /* SW_RESTORE */);
+                _ = BringWindowToTop(process.WindowHandle);
+                _ = SetForegroundWindow(process.WindowHandle);
+            }
+            finally
+            {
+                if (attached) _ = AttachThreadInput(current, foregroundThread, false);
+            }
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        return UiStageResult.Failure("activate", "FOREGROUND_NOT_CUBASE", "Cubase did not become the foreground window; no keys were sent.");
+    }
+
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr handle);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr handle);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr handle, int command);
+
+    /// <summary>
     /// Cubase's Export Audio Mixdown dialog exposes no controls to UI Automation or Win32. On Cubase 15 it opens with the
     /// Name field focused and its text selected, so the file name is typed there while the dialog is the verified
     /// foreground window. The settings are then read back by OCR of the dialog and compared with a 48 kHz/24-bit WAV at

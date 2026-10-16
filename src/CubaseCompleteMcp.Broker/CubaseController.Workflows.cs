@@ -150,6 +150,10 @@ public sealed partial class CubaseController
         WorkflowLog log, CancellationToken cancellationToken)
     {
         var command = RequireCommand("Edit", "Rename First Selected Track");
+        // The rename field opens in Cubase's own window and takes keys only while Cubase is in front.
+        var activated = await _ui.ActivateCubaseAsync(cancellationToken).ConfigureAwait(false);
+        log.Add(activated.Ok ? "cubase_activated" : "cubase_not_activated", activated.Evidence);
+        if (!activated.Ok) return activated;
         var reply = await _driver.SendAsync("command.execute", new JsonObject
         {
             ["id"] = command.Id, ["requires_target"] = true,

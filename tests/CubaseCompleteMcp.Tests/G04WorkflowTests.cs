@@ -56,6 +56,16 @@ public sealed class G04WorkflowTests
         Assert.Equal(ResultStatus.Ok, rename.Status);
         Assert.Equal("Lead 2", created.Title);
         Assert.Equal("Existing", existing.Title);
+        Assert.True(harness.Ui.Actions.IndexOf("activate_cubase") < harness.Ui.Actions.LastIndexOf("rename_text")); // Cubase is brought to front first
+
+        // When Cubase cannot be brought to the front, the rename command is not even sent.
+        harness.Ui.CubaseActivates = false;
+        var commandsBefore = harness.Driver.WriteCount("command.execute");
+        var background = await harness.SendAsync("track", new JsonObject { ["action"] = "rename", ["target_scope"] = "selected", ["name"] = "Lead 3" });
+        Assert.Equal("FOREGROUND_NOT_CUBASE", background.Error!.Code);
+        Assert.Equal(commandsBefore, harness.Driver.WriteCount("command.execute"));
+        Assert.Equal("Lead 2", created.Title);
+        harness.Ui.CubaseActivates = true;
 
         var notSelected = await harness.SendAsync("track", new JsonObject { ["action"] = "rename", ["target_handle"] = await harness.HandleForAsync(existing), ["name"] = "X" });
         Assert.Equal(ErrorCodes.TargetNotSelected, notSelected.Error!.Code);

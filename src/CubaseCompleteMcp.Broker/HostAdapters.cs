@@ -57,6 +57,8 @@ public interface IWorkflowUi
     Task<UiStageResult> AnswerPromptAsync(UiDialogRef prompt, bool accept, CancellationToken cancellationToken);
     Task<UiStageResult> FillAddTrackDialogAsync(UiDialogRef dialog, string name, CancellationToken cancellationToken);
     Task<UiStageResult> TypeRenameTextAsync(string name, CancellationToken cancellationToken);
+    /// <summary>Brings the verified Cubase main window to the foreground; sends no keys.</summary>
+    Task<UiStageResult> ActivateCubaseAsync(CancellationToken cancellationToken);
     /// <summary>Sets the export file name and verifies the dialog's settings by read-back; starts nothing.</summary>
     Task<UiStageResult> ConfigureExportAsync(UiDialogRef dialog, string directory, string fileName,
         CancellationToken cancellationToken);

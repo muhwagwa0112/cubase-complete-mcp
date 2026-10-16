@@ -134,6 +134,15 @@ public sealed class FakeUi : IWorkflowUi
             : UiStageResult.Failure("add_track", "WORKFLOW_CONTROL_MISSING", "no name field"));
     }
 
+    public bool CubaseActivates { get; set; } = true;
+
+    public Task<UiStageResult> ActivateCubaseAsync(CancellationToken cancellationToken)
+    {
+        Actions.Add("activate_cubase");
+        return Task.FromResult(CubaseActivates ? UiStageResult.Success("activate")
+            : UiStageResult.Failure("activate", "FOREGROUND_NOT_CUBASE", "not foreground"));
+    }
+
     public Task<UiStageResult> TypeRenameTextAsync(string name, CancellationToken cancellationToken)
     {
         Actions.Add("rename_text");
