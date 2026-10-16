@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/muhwagwa0112/cubase-complete-mcp/security/advisories/new
+    about: Report exploitable security issues privately, never in a public issue.
+  - name: Usage guide
+    url: https://github.com/muhwagwa0112/cubase-complete-mcp/blob/main/docs/USAGE.md
+    about: Installation, Cubase setup, MCP client registration and troubleshooting.

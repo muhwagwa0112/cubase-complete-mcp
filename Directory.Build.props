@@ -7,5 +7,9 @@
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
     <LangVersion>latest</LangVersion>
+    <Version>1.0.0</Version>
+    <Authors>muhwagwa0112</Authors>
+    <Product>Cubase Complete MCP</Product>
+    <Copyright>Copyright (c) 2026 muhwagwa0112</Copyright>
   </PropertyGroup>
 </Project>

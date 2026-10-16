@@ -64,6 +64,11 @@ try {
         $path = Join-Path $root "src\$project\$project.csproj"
         Invoke-Logged "publish-$project" { dotnet publish $path -c $Configuration --no-restore -o $staging } | Out-Null
     }
+    # License, notices and the user documentation travel with the binaries (listed in the manifest as payload).
+    foreach ($document in @('LICENSE', 'README.md', 'CHANGELOG.md', 'SECURITY.md')) {
+        Copy-Item -LiteralPath (Join-Path $root $document) -Destination $staging
+    }
+    Copy-Item -LiteralPath (Join-Path $root 'docs\USAGE.md') -Destination (Join-Path $staging 'USAGE.md')
     $cli = Join-Path $staging 'CubaseCompleteMcp.Cli.dll'
     $catalog = Join-Path $root 'catalog\reference-key-commands.xml'
     $manifestOutput = & dotnet $cli release-manifest $staging --release-id $releaseId --candidate-sha $gitSha `

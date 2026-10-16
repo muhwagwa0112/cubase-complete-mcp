@@ -1,6 +1,30 @@
 # Cubase Complete MCP
 
+<p align="center">
+  <strong>If Cubase Complete MCP saves you time, consider supporting its continued development, testing, and maintenance.</strong>
+</p>
+
+<p align="center">
+  <a href="https://ko-fi.com/muhwagwa0112">
+    <img src="docs/assets/kofi-support-red.png"
+         alt="Support Muhwagwa0112 on Ko-fi"
+         width="420">
+  </a>
+</p>
+
 `Cubase Complete MCP` is a local, Windows-only MCP server for Cubase 15. It exposes a compact set of MCP tools instead of one tool per Key Command and routes all Cubase ownership through a single per-user broker.
+
+## Quick start
+
+Requirements: Windows 10/11, Cubase 15 (15.0.30 or later for plug-in tools), the [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) and [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html).
+
+1. Download `cubase-complete-mcp-<version>-windows.zip` from the [latest release](https://github.com/muhwagwa0112/cubase-complete-mcp/releases/latest) and extract it to a permanent folder.
+2. In loopMIDI, create the ports `CubaseMCP To Cubase` and `CubaseMCP From Cubase`.
+3. Close Cubase, run `CubaseCompleteMcp.Cli.exe setup`, start Cubase and open a project.
+4. Register `CubaseCompleteMcp.Server.exe` with your MCP client (`CubaseCompleteMcp.Cli.exe register-codex --release .` for Codex, `claude mcp add` for Claude Code, or `claude_desktop_config.json` for Claude Desktop).
+5. Ask your agent to "check the Cubase connection" (`cubase_status`) and to "list the tracks".
+
+The [usage guide](docs/USAGE.md) covers every step, the tools, result handling, WAV export setup, updating and troubleshooting.
 
 ## Status of this version (pipe protocol 2, driver contract 2)
 
@@ -81,3 +105,13 @@ The Key Command catalog is generated from the local `Key Commands.xml` (69 categ
 MIDI composition: see [MIDI composition](docs/midi-composition.md), including import verification levels (`submitted`, `targets_observed`, `parts_observed`, `content_roundtrip_verified`).
 
 To remove stale session-scoped composition documents, preview with `cleanup-sessions --older-than-days <N>` and repeat with the returned `--confirmation-id`.
+
+## Support
+
+Questions and bug reports: [issues](https://github.com/muhwagwa0112/cubase-complete-mcp/issues) (use a new empty project and remove private data). Security problems: see [SECURITY.md](SECURITY.md).
+
+If the project is useful to you, you can support it on [Ko-fi](https://ko-fi.com/muhwagwa0112).
+
+## License
+
+[MIT](LICENSE). Cubase and Steinberg are trademarks of Steinberg Media Technologies GmbH; this project is not affiliated with or endorsed by Steinberg. loopMIDI is a product of Tobias Erichsen.
