@@ -4,6 +4,10 @@
 //   node scripts/live-acceptance.mjs run --release <release-dir> --manifest-sha256 <hash>
 //        --authorization <authorization.json> --fixture <fixture-dir> --installation-receipt <receipt.json>
 //        --cases <package>/acceptance/cases.json --evidence <new-evidence-dir> --candidate-sha <sha>
+//        [--join-results <offline-evidence-dir>/results.json]
+//
+// The gate evaluator binds every receipt to one run_id. With --join-results the live receipts carry the run_id of the
+// offline run of the same candidate and release, so scripts/merge-acceptance.mjs can combine both into one result.
 //
 // Safety rules (refuses to run otherwise):
 //  * the authorization file must grant owned_fixture_live_mutations, name an authorization_reference, not be
@@ -20,6 +24,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { argument, selectRelease, sha256File } from './release-candidate.mjs';
+import { attachArtifact, joinedRunId } from './acceptance-evidence.mjs';
 
 const mode = process.argv[2];
 const MARKER = '.cbmcp-fixture.json';
@@ -51,7 +56,10 @@ const receiptPath = required('--installation-receipt');
 const installation = JSON.parse(readFileSync(receiptPath, 'utf8'));
 const cases = JSON.parse(readFileSync(required('--cases'), 'utf8')).cases;
 const evidence = resolve(required('--evidence'));
-const runId = 'live-' + new Date().toISOString().replace(/[:.]/g, '') + '-' + randomBytes(3).toString('hex');
+const joinResults = argument('--join-results');
+const runId = joinResults
+  ? joinedRunId(JSON.parse(readFileSync(joinResults, 'utf8')), { candidateSha, manifestSha256: release.manifestSha256 })
+  : 'live-' + new Date().toISOString().replace(/[:.]/g, '') + '-' + randomBytes(3).toString('hex');
 
 const scope = authorization.scope ?? {};
 const refusals = [];
@@ -121,11 +129,18 @@ async function runCase(id, body) {
   const started = new Date().toISOString();
   const traceStart = trace.length;
   const assertions = [];
+  const artifacts = [];
   const expect = (index, expected, actual, passed) => assertions.push({ id: spec.assertion_ids[index], expected, actual, passed: passed === true });
+  // Raw evidence beyond the trace: a copy of each produced file, hashed. A missing file fails the case.
+  const attach = (source, name, kind = 'file_artifact', expectedSha256 = null) => {
+    const ref = attachArtifact(evidence, source, `${id}-${name}`, kind, expectedSha256);
+    artifacts.push(ref);
+    return ref;
+  };
   let outcome = 'PASS';
   let reason = null;
   try {
-    const blocked = await body(expect);
+    const blocked = await body(expect, attach);
     if (blocked) { outcome = blocked.outcome; reason = blocked.reason; }
   } catch (error) { outcome = 'FAIL'; reason = error.stack || String(error); }
   if (outcome === 'PASS' && (assertions.length !== spec.assertion_ids.length || assertions.some(item => !item.passed))) {
@@ -142,7 +157,7 @@ async function runCase(id, body) {
   mkdirSync(join(evidence, 'receipts'), { recursive: true });
   writeFileSync(join(evidence, `receipts/${id}.json`), JSON.stringify(receipt, null, 2));
   results.push({ case_id: id, status: outcome, reason, receipt: { path: `receipts/${id}.json`, sha256: sha256File(join(evidence, `receipts/${id}.json`)), kind: 'receipt' },
-    evidence: [{ path: tracePath, sha256: sha256File(join(evidence, tracePath)), kind: spec.required_evidence_kinds.includes('host_trace') ? 'host_trace' : 'protocol_trace' }] });
+    evidence: [{ path: tracePath, sha256: sha256File(join(evidence, tracePath)), kind: spec.required_evidence_kinds.includes('host_trace') ? 'host_trace' : 'protocol_trace' }, ...artifacts] });
 }
 const blockedAuth = reason => ({ outcome: 'BLOCKED_AUTH', reason });
 const blockedEnv = reason => ({ outcome: 'BLOCKED_ENV', reason });
@@ -167,7 +182,8 @@ try {
   const projectMatches = String(project.data?.project_title ?? '').includes('acceptance');
   if (!projectMatches) throw new Error(`The open project is not the fixture project (title: ${project.data?.project_title}). Nothing was changed.`);
 
-  await runCase('LIVE-01', async expect => {
+  await runCase('LIVE-01', async (expect, attach) => {
+    attach(receiptPath, 'installation-receipt.json', 'installation_receipt');
     expect(0, 'Windows interactive desktop with Cubase window', runtimeFacts, runtimeFacts.os === 'Windows' && runtimeFacts.interactive_desktop);
     expect(1, installation.expected_driver_build_id, runtimeFacts.driver_build_id, runtimeFacts.driver_build_id === installation.expected_driver_build_id && runtimeFacts.driver_contract_version === 2);
     expect(2, 'fixture marker + authorization + project identity', { fixture: marker.fixture_id, title: project.data?.project_title }, projectMatches);
@@ -221,33 +237,36 @@ try {
   });
 
   let importDocument = null;
-  await runCase('LIVE-05', async expect => {
+  await runCase('LIVE-05', async (expect, attach) => {
     const doc = await a.call('cubase_midi', { action: 'create_document', name: `Acceptance ${tag}` });
     importDocument = doc.data?.document?.id;
     const track = await a.call('cubase_midi', { action: 'add_track', document_id: importDocument, name: 'Keys' });
     await a.call('cubase_midi', { action: 'add_notes', document_id: importDocument, track_id: track.data?.target_id,
       options: { events: [{ tick: 0, duration_ticks: 480, note: 60, velocity: 100 }, { tick: 480, duration_ticks: 480, note: 64, velocity: 96 }] } });
     const imported = await a.call('cubase_midi', { action: 'import_to_cubase', document_id: importDocument });
+    if (imported.data?.rendered_path) attach(imported.data.rendered_path, 'import.mid', 'file_artifact', imported.data.rendered_sha256 ?? null);
     expect(0, 'targets_observed with new identities', imported.data?.verification_level, imported.data?.verification_level === 'targets_observed');
     return imported.data?.verification_level === 'targets_observed'
       ? blockedEnv('parts cannot be observed through MIDI Remote; export the new track to <fixture>/roundtrip.mid for E2E-02')
       : undefined;
   });
 
-  await runCase('LIVE-07', async expect => {
+  await runCase('LIVE-07', async (expect, attach) => {
     await a.call('cubase_transport', { action: 'left_locator', position_text: '1.1.1.0', time_format: 'Bars+Beats' });
     const right = await a.call('cubase_transport', { action: 'right_locator', position_text: '3.1.1.0', time_format: 'Bars+Beats' });
     if (right.status !== 'Ok') return blockedEnv(`locators could not be set in Bars+Beats: ${right.error?.code}`);
     const wav = join(fixture, 'mixdown.wav');
     const exported = await a.call('cubase_project', { action: 'export_audio', path: wav, expected_duration_seconds: 4.0 });
+    if (exported.status === 'Ok') attach(wav, 'mixdown.wav');
     expect(0, 'valid WAV header/data', exported.data?.wav, exported.status === 'Ok');
     expect(1, '4.0 s +- 20 ms', exported.data?.wav?.duration_seconds, exported.status === 'Ok');
     expect(2, 'single export', exported.data?.workflow_stages?.filter(stage => stage.stage === 'export_started').length, true);
   });
 
-  await runCase('LIVE-06', async expect => {
+  await runCase('LIVE-06', async (expect, attach) => {
     const saved = join(fixture, 'acceptance-saved.cpr');
     const saveAs = await a.call('cubase_project', { action: 'save_as', path: saved });
+    if (saveAs.status === 'Ok') attach(saved, 'acceptance-saved.cpr');
     expect(0, saved, saveAs.data?.file_after, saveAs.status === 'Ok' && existsSync(saved));
     // Cubase does not reopen the file of the active project, so the active project moves to a second file first.
     await a.call('cubase_project', { action: 'save_as', path: join(fixture, 'acceptance-moved.cpr') });
@@ -301,16 +320,20 @@ try {
     expect(1, 'each step verified before the next', chain, chain.every(status => status === 'PASS'));
   });
 
-  await runCase('E2E-02', async expect => {
+  await runCase('E2E-02', async (expect, attach) => {
     const roundtrip = join(fixture, 'roundtrip.mid');
     if (!existsSync(roundtrip)) return blockedEnv('operator export of the imported track to <fixture>/roundtrip.mid is required');
+    attach(roundtrip, 'roundtrip.mid');
     const compared = await a.call('cubase_midi', { action: 'compare_file', document_id: importDocument, path: roundtrip });
     expect(0, 'content_equal', compared.data?.content_equal, compared.data?.content_equal === true);
     expect(1, 'hashes recorded', [compared.data?.source_sha256, compared.data?.exported_sha256], Boolean(compared.data?.exported_sha256));
   });
 
-  await runCase('E2E-03', async expect => {
+  await runCase('E2E-03', async (expect, attach) => {
     const chain = results.filter(item => ['LIVE-07', 'LIVE-06'].includes(item.case_id)).map(item => item.status);
+    for (const [file, name] of [[join(fixture, 'mixdown.wav'), 'mixdown.wav'], [join(fixture, 'acceptance-saved.cpr'), 'acceptance-saved.cpr']]) {
+      if (existsSync(file)) attach(file, name);
+    }
     expect(0, 'WAV valid', chain[0], chain[0] === 'PASS');
     expect(1, 'reopen preserved tracks/values/parts', chain[1], chain[1] === 'PASS');
   });

@@ -15,10 +15,33 @@ Live gates prove the workflows on a real Cubase with an **owned fixture**. They 
 ```powershell
 node scripts/live-acceptance.mjs run --release <release-dir> --manifest-sha256 <hash> `
   --authorization <authorization.json> --fixture <fixture-dir> --installation-receipt <receipt.json> `
-  --cases <package>/acceptance/cases.json --evidence <new-evidence-dir> --candidate-sha <sha>
+  --cases <package>/acceptance/cases.json --evidence <new-evidence-dir> --candidate-sha <sha> `
+  --join-results <offline-evidence-dir>/results.json
 ```
 
-The harness refuses to start if any authorization, marker, project identity, release or driver build check fails. It writes one receipt per case (`receipts/<ID>.json`), a JSONL trace per case (`traces/<ID>.jsonl`) and `live-results.json`, which merge into the package results for `evaluate_gates.py --profile workflow_release`.
+The harness refuses to start if any authorization, marker, project identity, release or driver build check fails. It writes one receipt per case (`receipts/<ID>.json`), a JSONL trace per case (`traces/<ID>.jsonl`), hashed copies of the files a case produced or relied on (`artifacts/<ID>-<name>`), and `live-results.json`.
+
+| Case | Raw evidence besides the trace |
+|---|---|
+| LIVE-01 | `installation_receipt`: the `--installation-receipt` file |
+| LIVE-05 | `file_artifact`: the rendered MIDI file that was imported (hash checked against the broker's `rendered_sha256`) |
+| LIVE-06 | `file_artifact`: the saved `acceptance-saved.cpr` |
+| LIVE-07 | `file_artifact`: `mixdown.wav` |
+| E2E-02 | `file_artifact`: the operator's `roundtrip.mid` |
+| E2E-03 | `file_artifact`: `mixdown.wav` and `acceptance-saved.cpr` as they are at the end of the run |
+
+An artifact is never overwritten. A file that is missing when its case needs it fails the case.
+
+### One run for the gate evaluator
+
+`evaluate_gates.py` checks every receipt against the single `run_id` of `results.json`. `--join-results` makes the live receipts carry the run_id of the offline run, which must be for the same candidate and the same release manifest (the release the live run installed) and from a clean tree. Then merge both into a new directory:
+
+```powershell
+node scripts/merge-acceptance.mjs --base <offline-evidence-dir> --live <live-evidence-dir> --out <new-dir>
+python <package>/tools/evaluate_gates.py --results <new-dir>/results.json --evidence-root <new-dir> --profile workflow_release
+```
+
+The merge replaces the offline rows of the live cases with the live rows and takes the live runtime facts. It refuses, without writing anything, when the live run did not join the offline run, the candidate or release differ, a referenced file is missing or changed, a path exists in both runs with different content, or the output directory exists. A live run without `--join-results` cannot be merged; its receipts are never rewritten, so the live run is repeated with `--join-results`.
 
 ## What is automated and what is not
 
