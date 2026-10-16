@@ -46,6 +46,20 @@ public sealed class ExportDialogReadingTests
     }
 
     [Fact]
+    public void AFieldMissedInOnePass_IsAcceptedFromAnotherPass()
+    {
+        // Live 2026-10-16: at 2x the preview "mixdown.wav" was not recognized at all, at 2.5x it was.
+        var missed = LiveDialog(preview: "accepta nce.wav");
+        missed.Remove(missed.Single(line => line!["text"]!.GetValue<string>() == "accepta nce.wav"));
+        Assert.False(ExportDialogReading.Verify(missed, Directory, "mixdown").Ok);
+        var result = ExportDialogReading.Verify(new List<JsonArray> { missed, LiveDialog(preview: "mixdown.wav") }, Directory, "mixdown");
+        Assert.True(result.Ok, result.Message);
+        Assert.Equal(1, result.Evidence["preview"]!["pass"]!.GetValue<int>());
+        // A pass that reads another name does not outvote nothing: no pass reads the expected value.
+        Assert.False(ExportDialogReading.Verify(new List<JsonArray> { missed, LiveDialog(preview: "other.wav") }, Directory, "mixdown").Ok);
+    }
+
+    [Fact]
     public void OnlyAnotherFileName_IsReportedSoTheNameCanBeSet()
     {
         Assert.True(ExportDialogReading.Verify(LiveDialog(preview: "other.wav"), Directory, "acceptance").OnlyNameDiffers);

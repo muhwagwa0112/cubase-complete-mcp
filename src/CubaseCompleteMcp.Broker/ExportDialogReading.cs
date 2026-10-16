@@ -53,18 +53,27 @@ public static class ExportDialogReading
             .OrderBy(line => line.X).FirstOrDefault()?.Text;
     }
 
-    public static Result Verify(JsonArray ocr, string directory, string fileName)
+    public static Result Verify(JsonArray ocr, string directory, string fileName) => Verify(new List<JsonArray> { ocr }, directory, fileName);
+
+    /// <summary>
+    /// Verifies against several OCR passes of the same capture (different upscales recognize different words). A field
+    /// matches when any pass reads the expected value; OCR noise cannot produce the exact expected text by chance.
+    /// </summary>
+    public static Result Verify(IReadOnlyList<JsonArray> passes, string directory, string fileName)
     {
-        var lines = Lines(ocr);
+        var passLines = passes.Select(Lines).ToList();
         var evidence = new JsonObject();
         var problems = new List<string>();
         var differing = new List<string>();
         void Expect(string field, string labelKey, Func<string, bool> matches, string expected)
         {
-            var value = ValueFor(lines, labelKey);
-            evidence[field] = new JsonObject { ["read"] = value, ["expected"] = expected };
+            var reads = passLines.Select(lines => ValueFor(lines, labelKey)).ToList();
+            var matched = reads.FirstOrDefault(value => value is not null && matches(Normalize(value)));
+            var value = matched ?? reads.FirstOrDefault(read => read is not null);
+            evidence[field] = new JsonObject { ["read"] = value, ["expected"] = expected, ["pass"] = matched is null ? null : reads.IndexOf(matched) };
+            if (matched is not null) return;
             if (value is null) problems.Add($"{field} could not be read");
-            else if (!matches(Normalize(value))) { problems.Add($"{field} reads '{value}', expected {expected}"); differing.Add(field); }
+            else { problems.Add($"{field} reads '{value}', expected {expected}"); differing.Add(field); }
         }
         Expect("file_type", "File Type", value => value.Contains("wave", StringComparison.Ordinal), "Wave");
         Expect("sample_rate", "Sample Rate", value => value.StartsWith(Normalize("48.0 kHz"), StringComparison.Ordinal) || value.StartsWith(Normalize("48 kHz"), StringComparison.Ordinal), "48.0 kHz");
@@ -77,7 +86,8 @@ public static class ExportDialogReading
             var truncated = shown.Length < value.Length;
             return shown.Length >= 8 && (truncated ? expectedDirectory.StartsWith(shown, StringComparison.Ordinal) : shown.TrimEnd('\\') == expectedDirectory);
         }, directory);
-        evidence["ocr_line_count"] = lines.Count;
+        evidence["ocr_line_count"] = passLines.Sum(lines => lines.Count);
+        evidence["ocr_passes"] = passLines.Count;
         var onlyName = problems.Count == 1 && differing.SequenceEqual(["preview"]);
         evidence["only_name_differs"] = onlyName;
         return problems.Count == 0

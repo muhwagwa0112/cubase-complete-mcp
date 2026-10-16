@@ -223,7 +223,15 @@ public sealed partial class CubaseUiAutomation
         await Task.Delay(300, cancellationToken).ConfigureAwait(false); // let the dialog finish painting
         var capture = CaptureWindow(owned.Handle, "export-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(6)).ToLowerInvariant());
         if (capture is null) return UiStageResult.Failure("export_read", "EXPORT_SETTINGS_UNREADABLE", "The export dialog could not be captured for read-back.");
-        var reading = ExportDialogReading.Verify(await RecognizeTextAsync(capture, scale: 2).ConfigureAwait(false), directory, fileName);
+        // Short English words on Cubase's grey fields are recognized at some upscales and missed at others.
+        var passes = new List<JsonArray>();
+        ExportDialogReading.Result reading = null!;
+        foreach (var scale in new[] { 2.0, 2.5, 3.0, 4.0 })
+        {
+            passes.Add(await RecognizeTextAsync(capture, scale).ConfigureAwait(false));
+            reading = ExportDialogReading.Verify(passes, directory, fileName);
+            if (reading.Ok) break;
+        }
         reading.Evidence["capture"] = capture;
         return reading.Ok
             ? UiStageResult.Success("export_read", reading.Evidence)
