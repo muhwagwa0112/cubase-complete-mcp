@@ -410,10 +410,11 @@ public sealed partial class CubaseUiAutomation(CubaseProcessInspector processIns
 
     private AutomationElement? FindFileDialog(CubaseWindowTarget target)
     {
-        // Windows file dialogs are native #32770 windows. Plug-in editors that Cubase opens after loading a plug-in
-        // (SteinbergWindowClass, e.g. "01 - <channel>") can expose an edit field and buttons too and are not file dialogs.
+        // Windows file dialogs are native top-level #32770 windows. Plug-in editors that Cubase opens after loading a
+        // plug-in (SteinbergWindowClass, e.g. "01 - <channel>") can host #32770 child panes with an edit field and buttons;
+        // their top-level root is not a dialog, so they are not file dialogs.
         var candidates = FindProcessWindowCandidates(target, CubaseDialogStage.FileDialog, [],
-            window => ClassName(new IntPtr(window.Current.NativeWindowHandle)) == "#32770"
+            window => ClassName(GetAncestor(new IntPtr(window.Current.NativeWindowHandle), 2 /* GA_ROOT */)) == "#32770"
                 && FindFileNameEdit(window) is not null && FindAcceptButton(window) is not null);
         return candidates.Count == 0 ? null : candidates[^1];
     }

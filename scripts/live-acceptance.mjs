@@ -224,13 +224,19 @@ try {
   await a.init();
   await b.init();
   const status = await a.call('cubase_status', {});
+  // The broker is a singleton that outlives Cubase restarts; a broker of another release would serve this candidate's
+  // requests with other code. Nothing has been changed yet when this refuses.
+  if (status.data?.broker_release_id !== release.manifest.release_id || status.data?.release_mismatch !== false) {
+    throw new Error(`The running broker belongs to release ${status.data?.broker_release_id}, not ${release.manifest.release_id}; stop it and run again. Nothing was changed.`);
+  }
   const project = await a.call('cubase_project', { action: 'get' });
   runtimeFacts = {
     os: process.platform === 'win32' ? 'Windows' : process.platform, candidate_sha: candidateSha,
     interactive_desktop: Boolean(status.data?.window_title), fixture_owned: true, fixture_id: marker.fixture_id,
     authorization_reference: authorization.authorization_reference, cubase_version: status.data?.cubase_version ?? null,
     driver_contract_version: status.data?.driver_contract_version ?? null, driver_build_id: status.data?.driver_build_id ?? null,
-    expected_driver_build_id: installation.expected_driver_build_id, installation_receipt_sha256: sha256File(receiptPath)
+    expected_driver_build_id: installation.expected_driver_build_id, installation_receipt_sha256: sha256File(receiptPath),
+    broker_release_id: status.data?.broker_release_id ?? null
   };
   const projectMatches = String(project.data?.project_title ?? '').includes('acceptance');
   if (!projectMatches) throw new Error(`The open project is not the fixture project (title: ${project.data?.project_title}). Nothing was changed.`);
