@@ -90,7 +90,6 @@ public sealed class G05ReleaseGateTests : IDisposable
         var capabilities = await harness.SendAsync("capabilities.list");
         var levels = capabilities.Data!["capabilities"]!.AsArray().Select(node => node!["support_level"]!.GetValue<string>()).ToHashSet();
         Assert.Contains("mock_validated", levels);
-        Assert.Contains("blocked_environment", levels);
         Assert.Contains("best_effort", levels);
         Assert.DoesNotContain("live_validated", levels); // nothing is claimed as live-validated without live evidence
         Assert.Equal("Confirm", capabilities.Data["summary"]!["unclassified_effective_risk"]!.GetValue<string>());

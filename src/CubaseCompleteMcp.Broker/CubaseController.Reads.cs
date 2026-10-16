@@ -161,7 +161,10 @@ public sealed partial class CubaseController
     {
         if (operation.Action == "catalog")
         {
-            var catalog = await _plugins.GetCatalogAsync(cancellationToken).ConfigureAwait(false);
+            TargetIdentity? catalogTarget = null;
+            if (operation.Arguments["target_handle"] is not null || operation.Arguments["target_scope"] is not null || operation.Arguments["bank_index"] is not null)
+                catalogTarget = (await ResolveSelectorAsync(operation.Arguments, session, true, cancellationToken).ConfigureAwait(false))!.Value.Identity;
+            var catalog = await PluginCatalogAsync(catalogTarget, ReadLong(operation.Arguments["object_id"]), cancellationToken).ConfigureAwait(false);
             var data = JsonSerializer.SerializeToNode(catalog, PipeProtocol.JsonOptions);
             return catalog.Available
                 ? BrokerResponse.Success(request.Id, data, catalog.Source, true, executionState: ExecutionState.NotApplicable)
@@ -381,7 +384,7 @@ public sealed partial class CubaseController
         new("transport", "Play/stop/record, cycle, metronome, tempo, positions with explicit time_format; observed postconditions", "transport", "midi_remote", RiskLevel.Low, "mock_validated", ["CompleteBridge online", "State reported in this driver session"], false),
         new("track", "64-slot mixer bank listing with target handles; guarded selected-track commands; create/rename workflows", "track", "midi_remote+command+ui", RiskLevel.Low, "mock_validated", ["Project open"], false),
         new("mixer", "Target-handle parameter reads and writes with fresh read-back", "mixer", "midi_remote", RiskLevel.Low, "mock_validated", ["Project open", "MIDI Remote API 1.2 DirectAccess"], false),
-        new("plugin", "Plug-in slot inspection and parameters; catalog and assignment need a verifiable UID source", "plugin", "midi_remote", RiskLevel.Confirm, "blocked_environment", ["MIDI Remote API 1.3", "Installed plug-in catalog"], false),
+        new("plugin", "Plug-in slot inspection and parameters; installed catalog, slot assignment and UID read-back through MIDI Remote API 1.3", "plugin", "midi_remote", RiskLevel.Confirm, "mock_validated", ["MIDI Remote API 1.3"], false),
         new("direct", "Target-bound DirectAccess reads and writes", "direct", "midi_remote", RiskLevel.Low, "mock_validated", ["MIDI Remote API 1.2+"], false),
         new("midi-compose", "Structured MIDI composition, SMF import/export, content comparison", "composition", "smf", RiskLevel.Low, "implemented", [], true),
         new("midi-import", "Causal import into Cubase with unique tagged track names (targets_observed); parts/content need owned-fixture export", "composition", "smf+command+ui", RiskLevel.Low, "implemented", ["Cubase running", "Transport stopped"], false),

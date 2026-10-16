@@ -609,7 +609,10 @@ function toggleTo(action, key, surfaceValue, desired) {
     return receipt(action, true, {state_key: key, before: before, desired: desired, dispatch_revision: dispatchRevision});
 }
 function setTime(action, key, locator, args) {
+    // Position and both locators belong to the same primary time display, so a format reported for one of them is the
+    // format of the others; a locator that has not moved since the driver activated reports no value of its own.
     var current = runtime.state[key], format = runtime.timeFormats[key], dispatchRevision;
+    if (format === null || format === undefined) { format = runtime.timeFormats.position || runtime.timeFormats.leftLocator || runtime.timeFormats.rightLocator; }
     if (args.value !== undefined) { throw codedError('INVALID_ARGUMENT', action + ' requires position_text with an explicit time_format; the numeric value field is ambiguous and not accepted'); }
     if (typeof args.position_text !== 'string' || !args.position_text) { throw codedError('INVALID_ARGUMENT', action + ' requires position_text'); }
     if (typeof args.time_format !== 'string' || !args.time_format) { throw codedError('INVALID_ARGUMENT', action + ' requires time_format'); }
@@ -747,13 +750,61 @@ function directGet(args) {
 }
 
 // ---- plug-ins ---------------------------------------------------------------------------------------------
+function loadedPlugin(root, slotId) {
+    var count = root.getNumberOfChildObjects(runtime.mapping, slotId), childId, name, match;
+    if (count < 1) { return null; }
+    childId = root.getChildObjectID(runtime.mapping, slotId, 0);
+    name = String(root.getObjectUniqueName(runtime.mapping, childId) || '');
+    match = /^([0-9A-Fa-f]{32})(-\d+)?$/.exec(name);
+    return {object_id: childId, unique_name: name, title: root.getObjectTitle(runtime.mapping, childId), plugin_uid: match ? match[1].toUpperCase() : null};
+}
 function pluginSlotState(root, objectId) {
     return {object_id: objectId, unique_name: root.getObjectUniqueName(runtime.mapping, objectId),
         unique_id: root.getObjectUniqueIDString(runtime.mapping, objectId),
         title: root.getObjectTitle(runtime.mapping, objectId),
         type: root.getObjectTypeName ? root.getObjectTypeName(runtime.mapping, objectId) : null,
         parameter_total: root.getNumberOfParameters(runtime.mapping, objectId),
-        child_objects: root.getNumberOfChildObjects(runtime.mapping, objectId)};
+        child_objects: root.getNumberOfChildObjects(runtime.mapping, objectId),
+        loaded: loadedPlugin(root, objectId)};
+}
+// First insert slot below a channel object: the child titled "Inserts" holds one "Slot" child per insert.
+function firstInsertSlot(root, channelId) {
+    var count = root.getNumberOfChildObjects(runtime.mapping, channelId), i, childId;
+    for (i = 0; i < count; i += 1) {
+        childId = root.getChildObjectID(runtime.mapping, channelId, i);
+        if (root.getObjectUniqueName(runtime.mapping, childId) === 'Inserts' && root.getNumberOfChildObjects(runtime.mapping, childId) > 0) {
+            return root.getChildObjectID(runtime.mapping, childId, 0);
+        }
+    }
+    return null;
+}
+function pluginCatalog(args) {
+    var located, manager, slotId, collections, index, collection, entries, offset, limit, i, entry, page = [];
+    if (args.target || args.expected_selected) { located = pluginRoot(args); }
+    else { located = {root: directRoot('selected_track'), guard: null, scope: undefined}; }
+    manager = located.root.mPluginManager;
+    if (!manager || typeof manager.getPluginCollectionByIndex !== 'function') {
+        return {available: false, reason: 'PLUGIN_CATALOG_UNAVAILABLE', plugin_manager_present: !!manager, entries: []};
+    }
+    slotId = args.object_id !== undefined && args.object_id !== null ? Number(args.object_id)
+        : firstInsertSlot(located.root, located.scope === undefined ? located.root.getBaseObjectID(runtime.mapping) : located.scope);
+    if (slotId === null || !isFinite(slotId)) { throw codedError('TARGET_SCOPE_MISMATCH', 'no insert slot was found for the plug-in catalog'); }
+    if (located.scope !== undefined && !objectInTree(located.root, slotId, 1024, located.scope)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id is not a slot of the resolved target'); }
+    collections = manager.getNumberOfPluginCollections(runtime.mapping, slotId);
+    index = args.collection_index !== undefined && args.collection_index !== null ? Number(args.collection_index)
+        : manager.getIndexOfActivePluginCollection(runtime.mapping, slotId);
+    if (!(index >= 0 && index < collections)) { index = manager.getIndexOfDefaultPluginCollection(runtime.mapping, slotId); }
+    collection = manager.getPluginCollectionByIndex(runtime.mapping, slotId, index);
+    entries = collection && collection.mEntries ? collection.mEntries : [];
+    offset = intArg(args.offset, 0, 0, 100000); limit = intArg(args.limit, 100, 1, 500);
+    for (i = offset; i < entries.length && page.length < limit; i += 1) {
+        entry = entries[i];
+        page.push({uid: String(entry.mPluginUID), name: entry.mPluginName, vendor: entry.mPluginVendor, version: entry.mPluginVersion,
+            format_version: entry.mFormatVersion, sub_categories: entry.mSubCategories, collection_path: entry.mCollectionPath});
+    }
+    return {available: true, source: 'midi_remote_api_1_3_plugin_manager', slot_object_id: slotId, target: located.guard,
+        collection: {index: index, name: collection ? collection.mName : null, count: collections}, total: entries.length,
+        offset: offset, entries: page};
 }
 function pluginRoot(args) {
     if (args.target) { return {root: mixerRoot(), guard: null, scope: resolveTarget(args.target).object_id}; }
@@ -763,10 +814,9 @@ function pluginRoot(args) {
 function pluginGet(args) {
     var located, manager;
     if (args.action === 'catalog') {
-        // No enumeration member of a plug-in manager is declared by the installed MIDI Remote API, so no UID list
-        // can be produced. UIDs are never synthesised from names.
-        manager = runtime.directRoots.selected_track ? runtime.directRoots.selected_track.mPluginManager : null;
-        return {available: false, reason: 'PLUGIN_CATALOG_UNAVAILABLE', plugin_manager_present: !!manager, entries: []};
+        // API 1.3 lists the plug-ins a slot can hold, with their class UIDs. Without it no UID list exists, and UIDs
+        // are never synthesised from names.
+        return pluginCatalog(args);
     }
     if (args.action === 'inspect_slot') {
         located = pluginRoot(args);
@@ -792,14 +842,16 @@ function pluginSet(args) {
     after = pluginSlotState(located.root, objectId);
     return receipt('assign', true, {accepted: assigned, dont_ask_discard: args.confirm_replace === true, prior_slot: before, slot: after,
         requested_plugin_uid: args.plugin_uid, target: located.guard, dispatch_revision: dispatchRevision,
-        note: 'The host does not report the loaded plug-in UID back through this API; the broker decides verification.'});
+        note: 'The slot child object names the loaded plug-in class UID; the broker decides verification.'});
 }
 function capabilities() {
     return {host_version: hostVersion(), driver_contract_version: DRIVER_CONTRACT_VERSION, driver_build_id: DRIVER_BUILD_ID,
         api_1_2_direct_access: !!page.mHostAccess.makeDirectAccess,
         api_1_3_command_can_perform: runtime.commandBindings.length > 0 && !!runtime.commandBindings[0].canPerform,
         api_1_3_plugin_manager: !!(runtime.directRoots.selected_track && runtime.directRoots.selected_track.mPluginManager),
-        plugin_catalog: false, target_identity: !!runtime.directRoots.mixer,
+        plugin_catalog: !!(runtime.directRoots.selected_track && runtime.directRoots.selected_track.mPluginManager
+            && typeof runtime.directRoots.selected_track.mPluginManager.getPluginCollectionByIndex === 'function'),
+        target_identity: !!runtime.directRoots.mixer,
         command_count: runtime.commandIds.length,
         operations: ['status.get','capabilities.get','command.execute','command.can_perform','transport.get','transport.set','track.get','track.list','track.set','mixer.get','mixer.set','plugin.get','plugin.set','direct.get','direct.set']};
 }

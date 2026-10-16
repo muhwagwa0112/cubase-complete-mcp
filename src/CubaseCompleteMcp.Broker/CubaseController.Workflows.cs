@@ -413,8 +413,9 @@ public sealed partial class CubaseController
         string? observedUid = null;
         var outcome = await PostconditionVerifier.ObserveAsync(async token =>
         {
-            observedUid = await _plugins.ObserveSlotPluginUidAsync(target, slotId, token).ConfigureAwait(false);
-            return new Observation(observedUid is not null && observedUid == uid, new JsonObject { ["slot_plugin_uid"] = observedUid }, "plugin_catalog_provider");
+            observedUid = await ObserveSlotPluginUidAsync(target, slotId, token).ConfigureAwait(false);
+            return new Observation(observedUid is not null && NormalizePluginUid(observedUid) == NormalizePluginUid(uid),
+                new JsonObject { ["slot_plugin_uid"] = observedUid }, DriverListsPlugins ? "slot_child_unique_name" : "plugin_catalog_provider");
         }, _timings.TrackAndPlugin, cancellationToken).ConfigureAwait(false);
         data["verification"] = outcome.ToJson(uid, "exact plug-in UID");
         if (outcome.Verified)

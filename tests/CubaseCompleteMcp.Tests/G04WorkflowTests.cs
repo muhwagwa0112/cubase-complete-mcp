@@ -157,6 +157,48 @@ public sealed class G04WorkflowTests
         Assert.Equal("Assigned", harness.Driver.SlotTitle); // the title changed in every case; it never decides the result
     }
 
+    [Theory]
+    [InlineData("946051208E29496E804F64A825C8A047", null, ResultStatus.Ok)]
+    [InlineData("94605120-8e29-496e-804f-64a825c8a047", null, ResultStatus.Ok)]
+    [InlineData("946051208E29496E804F64A825C8A047", "5B38F28281144FFE80285FF7CCF20483", ResultStatus.Error)]
+    public async Task WFL05_Api13Host_CatalogAndUidReadBackComeFromTheDriver(string requested, string? hostLoads, ResultStatus expected)
+    {
+        using var harness = new ControllerHarness();
+        harness.Driver.DriverPluginCatalog =
+        [
+            new JsonObject { ["uid"] = "946051208E29496E804F64A825C8A047", ["name"] = "StudioEQ", ["vendor"] = "Steinberg Media Technologies", ["sub_categories"] = "Fx|EQ" },
+            new JsonObject { ["uid"] = "5B38F28281144FFE80285FF7CCF20483", ["name"] = "Compressor", ["vendor"] = "Steinberg Media Technologies", ["sub_categories"] = "Fx|Dynamics" }
+        ];
+        harness.Driver.LoadedUidOverride = hostLoads;
+        var target = harness.Driver.AddChannel("Bus");
+        harness.Driver.Select(target);
+
+        var catalog = await harness.SendAsync("plugin", new JsonObject { ["action"] = "catalog" });
+        Assert.Equal(ResultStatus.Ok, catalog.Status);
+        Assert.Equal("midi_remote_api_1_3_plugin_manager", catalog.Data!["source"]!.GetValue<string>());
+        Assert.Equal(2, catalog.Data["entries"]!.AsArray().Count);
+
+        var result = await harness.ConfirmAndCommitAsync("plugin", new JsonObject { ["action"] = "assign", ["target_scope"] = "selected", ["object_id"] = 7, ["plugin_uid"] = requested });
+        Assert.Equal(expected, result.Status);
+        Assert.Equal(1, harness.Driver.WriteCount("plugin.set"));
+        var verification = result.Data!["verification"]!;
+        Assert.Equal("slot_child_unique_name", verification["observation_source"]!.GetValue<string>());
+        Assert.Equal(hostLoads ?? "946051208E29496E804F64A825C8A047", verification["observed"]!["slot_plugin_uid"]!.GetValue<string>());
+        if (expected == ResultStatus.Error) Assert.Equal("PLUGIN_MISMATCH", result.Error!.Code);
+    }
+
+    [Fact]
+    public async Task WFL05_Api13Host_UidOutsideTheDriverCatalog_IsRefusedBeforeDispatch()
+    {
+        using var harness = new ControllerHarness();
+        harness.Driver.DriverPluginCatalog = [new JsonObject { ["uid"] = "946051208E29496E804F64A825C8A047", ["name"] = "StudioEQ" }];
+        var target = harness.Driver.AddChannel("Bus");
+        harness.Driver.Select(target);
+        var unknown = await harness.SendAsync("plugin", new JsonObject { ["action"] = "assign", ["target_scope"] = "selected", ["object_id"] = 7, ["plugin_uid"] = "00000000000000000000000000000000" });
+        Assert.Equal(ErrorCodes.InvalidArgument, unknown.Error!.Code);
+        Assert.Equal(0, harness.Driver.WriteCount("plugin.set"));
+    }
+
     [Fact]
     public async Task WFL05_SlotChangedAfterApproval_IsRefused()
     {
