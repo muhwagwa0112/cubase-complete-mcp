@@ -164,7 +164,7 @@ var PENDING_TIMEOUT_MS = 10000;
 var runtime = {
     active: false, device: null, mapping: null, sessionId: 0, sequence: 0, revision: 0,
     pendingChunks: {}, completed: {}, commandIds: [], commandValues: [], commandBindings: [], commandIndex: {},
-    directRoots: {}, mixRoots: {}, state: {}, stateRevision: {}, timeFormats: {}
+    directRoots: {}, mixRoots: {}, state: {}, stateRevision: {}, timeFormats: {}, assignments: {}
 };
 function resetMirror() {
     // Unknown until the host reports a value in the current activation; online does not mean 'false'.
@@ -348,6 +348,7 @@ page.mOnIdle = function (activeDevice, activeMapping) {
     var releases = pendingReleases, i;
     pendingReleases = [];
     for (i = 0; i < releases.length; i += 1) { releases[i].setProcessValue(activeDevice, 0); }
+    if (pendingAssignments.length > 0 && runtime.active) { runAssignment(pendingAssignments.shift(), activeMapping); }
 };
 function stateSnapshot() {
     return {host_version: hostVersion(), driver_version: DRIVER_VERSION, protocol_version: PROTOCOL_VERSION,
@@ -355,8 +356,28 @@ function stateSnapshot() {
         command_count: runtime.commandIds.length, active: runtime.active, state: runtime.state,
         state_revision: runtime.stateRevision, time_formats: runtime.timeFormats, revision: runtime.revision};
 }
-function updateState(key, value) { if (runtime.state[key] !== value || runtime.stateRevision[key] === undefined) { runtime.state[key] = value; emitState(key, value); } }
-function updateTime(key, value, format) { runtime.timeFormats[key] = (format === undefined || format === null) ? null : String(format); updateState(key, value); }
+// A host report that arrives while the page is not active (for example while a reloaded script's page activates) is a
+// report for the coming activation. mOnActivate resets the mirror, so such reports are kept here and applied after
+// the reset instead of being lost: Cubase reports the primary time format only together with a time change.
+var earlyReports = {};
+function updateState(key, value) {
+    if (!runtime.active) { earlyReports[key] = {value: value, time: false}; return; }
+    if (runtime.state[key] !== value || runtime.stateRevision[key] === undefined) { runtime.state[key] = value; emitState(key, value); }
+}
+function updateTime(key, value, format) {
+    format = (format === undefined || format === null) ? null : String(format);
+    if (!runtime.active) { earlyReports[key] = {value: value, time: true, format: format}; return; }
+    runtime.timeFormats[key] = format; updateState(key, value);
+}
+function applyEarlyReports() {
+    var reports = earlyReports, key;
+    earlyReports = {};
+    for (key in reports) {
+        if (Object.prototype.hasOwnProperty.call(reports, key)) {
+            if (reports[key].time) { updateTime(key, reports[key].value, reports[key].format); } else { updateState(key, reports[key].value); }
+        }
+    }
+}
 
 bindings.play.mOnValueChange = function (d, m, value) { updateState('playing', value >= 0.5); };
 bindings.record.mOnValueChange = function (d, m, value) { updateState('recording', value >= 0.5); };
@@ -393,16 +414,25 @@ function intArg(value, fallback, minimum, maximum) {
     if (!isFinite(parsed)) { return fallback; }
     return Math.max(minimum, Math.min(maximum, Math.floor(parsed)));
 }
-function directObject(root, objectId, includeParameters, parameterLimit) {
+// Every parameter costs several host calls. Live on Cubase 15.0.30 a snapshot of a 12-channel mixer with parameters
+// (up to 256 nodes x 128 parameters) ran past the script's execution budget and the script went offline, so one call
+// reads at most max_total_parameters parameters and stops at time_budget_ms; the reply then names a continuation.
+function readBudget(args, parameters) {
+    return {remaining: parameters, read: 0, exhausted: null, deadline: new Date().getTime() + intArg(args.time_budget_ms, 1000, 20, 3000)};
+}
+function outOfTime(budget) { if (budget.exhausted === null && new Date().getTime() >= budget.deadline) { budget.exhausted = 'time'; } return budget.exhausted === 'time'; }
+function directObject(root, objectId, includeParameters, parameterLimit, budget, parameterOffset) {
     var result = {object_id: objectId, unique_name: root.getObjectUniqueName(runtime.mapping, objectId), unique_id: root.getObjectUniqueIDString(runtime.mapping, objectId), title: root.getObjectTitle(runtime.mapping, objectId), parameters: []};
-    var count, total, i, tag, parameter;
+    var start, count, total, i, tag, parameter;
     if (root.getObjectTypeName) { result.type = root.getObjectTypeName(runtime.mapping, objectId); }
     total = root.getNumberOfParameters(runtime.mapping, objectId);
     result.parameter_total = total;
     if (!includeParameters) { result.parameters_omitted = true; return result; }
-    count = Math.min(total, parameterLimit);
-    result.parameters_truncated = total > count;
-    for (i = 0; i < count; i += 1) {
+    start = Math.min(parameterOffset || 0, total);
+    count = Math.min(total - start, parameterLimit);
+    if (count > budget.remaining) { count = budget.remaining; budget.exhausted = 'parameters'; }
+    result.parameter_offset = start;
+    for (i = start; i < start + count && !outOfTime(budget); i += 1) {
             tag = root.getParameterTagByIndex(runtime.mapping, objectId, i);
             parameter = {tag: tag, title: root.getParameterTitle(runtime.mapping, objectId, tag, 256), process_value: root.getParameterProcessValue(runtime.mapping, objectId, tag), display_value: root.getParameterDisplayValue(runtime.mapping, objectId, tag), units: root.getParameterDisplayUnits(runtime.mapping, objectId, tag)};
             if (root.convertParameterProcessValueToPlain) { parameter.plain_value = root.convertParameterProcessValueToPlain(runtime.mapping, objectId, tag, parameter.process_value); }
@@ -411,24 +441,67 @@ function directObject(root, objectId, includeParameters, parameterLimit) {
             if (root.getParameterEditLockState) { parameter.edit_locked = root.getParameterEditLockState(runtime.mapping, objectId, tag); }
         result.parameters.push(parameter);
     }
+    budget.remaining -= result.parameters.length; budget.read += result.parameters.length;
+    result.parameters_truncated = start + result.parameters.length < total;
+    if (result.parameters_truncated) { result.next_parameter_offset = start + result.parameters.length; }
     return result;
 }
-function directSnapshot(args) {
-    var root = directRoot(args.root), base = root.getBaseObjectID(runtime.mapping), maxNodes = intArg(args.max_nodes, 256, 1, 1024);
+// The object a read starts from: a resolved channel (target), the pinned selection, or a named DirectAccess root.
+function readScope(args) {
+    var identity, root, name;
+    if (args.target) { identity = resolveTarget(args.target); return {name: 'mixer', root: mixerRoot(), start: identity.object_id, identity: identity}; }
+    if (args.expected_selected) { identity = assertSelected(args.expected_selected); root = directRoot('selected_track'); return {name: 'selected_track', root: root, start: root.getBaseObjectID(runtime.mapping), identity: identity}; }
+    name = args.root || 'selected_track'; root = directRoot(name);
+    return {name: name, root: root, start: root.getBaseObjectID(runtime.mapping), identity: null};
+}
+// Breadth-first snapshot below the scope's start object. node_offset skips the nodes an earlier page returned (they are
+// walked, not read); the traversal order is the host's child order, so pages line up while the tree is unchanged.
+function directSnapshot(args, scope) {
+    var root = scope.root, base = scope.start, maxNodes = intArg(args.max_nodes, 256, 1, 1024);
     var maxDepth = intArg(args.max_depth, 8, 0, 16), parameterLimit = intArg(args.max_parameters, 128, 0, 1024);
-    var includeParameters = args.include_parameters !== false, queue = [{id: base, depth: 0, parent: -1}], nodes = [], item, count, i, child;
-    var depthLimited = 0, nodeLimited = 0, parametersTruncated = 0;
-    while (queue.length && nodes.length < maxNodes) {
-        item = queue.shift(); child = directObject(root, item.id, includeParameters, parameterLimit); child.parent_id = item.parent; child.depth = item.depth; nodes.push(child);
-        if (child.parameters_truncated) { parametersTruncated += 1; }
+    var parameterBudget = intArg(args.max_total_parameters, 256, 0, 2048), nodeOffset = intArg(args.node_offset, 0, 0, 1000000), budget = readBudget(args, parameterBudget);
+    var includeParameters = args.include_parameters !== false, queue = [{id: base, depth: 0, parent: -1}], nodes = [], index = 0, item, count, i, child, needed;
+    var depthLimited = 0, nodeLimited = 0, parametersTruncated = 0, discoverLimit = nodeOffset + maxNodes;
+    while (queue.length && nodes.length < maxNodes && budget.exhausted === null && !outOfTime(budget)) {
+        item = queue[0];
+        if (index >= nodeOffset) {
+            if (includeParameters && nodes.length > 0) {
+                needed = Math.min(root.getNumberOfParameters(runtime.mapping, item.id), parameterLimit);
+                if (needed > budget.remaining) { budget.exhausted = 'parameters'; break; }
+            }
+            child = directObject(root, item.id, includeParameters, parameterLimit, budget, 0); child.parent_id = item.parent; child.depth = item.depth; nodes.push(child);
+            if (child.parameters_truncated) { parametersTruncated += 1; }
+        }
+        queue.shift(); index += 1;
         count = root.getNumberOfChildObjects(runtime.mapping, item.id);
-        if (item.depth >= maxDepth) { depthLimited += count; }
-        else { for (i = 0; i < count; i += 1) { if (queue.length + nodes.length >= maxNodes) { nodeLimited += 1; } else { queue.push({id: root.getChildObjectID(runtime.mapping, item.id, i), depth: item.depth + 1, parent: item.id}); } } }
+        if (item.depth >= maxDepth) { if (index > nodeOffset) { depthLimited += count; } }
+        else { for (i = 0; i < count; i += 1) { if (index + queue.length >= discoverLimit) { nodeLimited += 1; } else { queue.push({id: root.getChildObjectID(runtime.mapping, item.id, i), depth: item.depth + 1, parent: item.id}); } } }
     }
-    return {root: args.root || 'selected_track', base_object_id: base, nodes: nodes,
-        truncated: queue.length > 0 || nodeLimited > 0 || depthLimited > 0 || parametersTruncated > 0,
-        limits: {max_nodes: maxNodes, max_depth: maxDepth, max_parameters: parameterLimit, include_parameters: includeParameters},
-        truncation: {queued_nodes_unvisited: queue.length, node_limit_children: nodeLimited, depth_limit_children: depthLimited, nodes_with_truncated_parameters: parametersTruncated}};
+    var more = queue.length > 0 || nodeLimited > 0;
+    return {root: scope.name, base_object_id: base, target: scope.identity, node_offset: nodeOffset, nodes: nodes, parameters_read: budget.read,
+        truncated: more || depthLimited > 0 || parametersTruncated > 0 || budget.exhausted !== null,
+        continuation: more ? {node_offset: index} : null,
+        limits: {max_nodes: maxNodes, max_depth: maxDepth, max_parameters: parameterLimit, max_total_parameters: parameterBudget,
+            time_budget_ms: intArg(args.time_budget_ms, 1000, 20, 3000), include_parameters: includeParameters},
+        truncation: {queued_nodes_unvisited: queue.length, node_limit_children: nodeLimited, depth_limit_children: depthLimited, nodes_with_truncated_parameters: parametersTruncated,
+            budget_exhausted: budget.exhausted}};
+}
+// The parameters of one object (for example a plug-in on the Stereo Out channel), paged by parameter_offset, with its
+// direct children listed for navigation. Reads only; the object must lie inside the scope.
+function objectRead(args, scope) {
+    var objectId = Number(args.object_id), parameterLimit = intArg(args.max_parameters, 128, 1, 1024), offset = intArg(args.parameter_offset, 0, 0, 1000000);
+    var budget = readBudget(args, parameterLimit), result, count, i, childId, children = [];
+    if (!isFinite(objectId)) { throw codedError('INVALID_ARGUMENT', 'object_id must be a number'); }
+    if (!objectInTree(scope.root, objectId, 4096, scope.start)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id ' + args.object_id + ' is not part of the ' + (scope.identity ? 'resolved target' : scope.name + ' root')); }
+    result = directObject(scope.root, objectId, true, parameterLimit, budget, offset);
+    count = scope.root.getNumberOfChildObjects(runtime.mapping, objectId);
+    for (i = 0; i < count && i < 64; i += 1) {
+        childId = scope.root.getChildObjectID(runtime.mapping, objectId, i);
+        children.push({object_id: childId, title: scope.root.getObjectTitle(runtime.mapping, childId), unique_name: scope.root.getObjectUniqueName(runtime.mapping, childId)});
+    }
+    return {root: scope.name, target: scope.identity, object: result, children: children, children_total: count, fresh: true,
+        truncated: result.parameters_truncated, continuation: result.parameters_truncated ? {parameter_offset: result.next_parameter_offset} : null,
+        budget_exhausted: budget.exhausted};
 }
 function objectInTree(root, objectId, limit, startId) {
     var queue = [startId === undefined ? root.getBaseObjectID(runtime.mapping) : startId], visited = 0, id, count, i;
@@ -608,6 +681,8 @@ function toggleTo(action, key, surfaceValue, desired) {
     if (key === 'cycle' || key === 'metronome' || key === 'recording') { pressLatched(surfaceValue); } else { pulse(surfaceValue); }
     return receipt(action, true, {state_key: key, before: before, desired: desired, dispatch_revision: dispatchRevision});
 }
+// The MIDI Remote API has no getter for the time display; its format arrives only with a time change.
+var TIME_FORMAT_RECOVERY = 'To make Cubase report it, press Play and then Stop once in Cubase, or click once in the ruler to move the project cursor, then retry.';
 function setTime(action, key, locator, args) {
     // Position and both locators belong to the same primary time display, so a format reported for one of them is the
     // format of the others; a locator that has not moved since the driver activated reports no value of its own.
@@ -616,7 +691,7 @@ function setTime(action, key, locator, args) {
     if (args.value !== undefined) { throw codedError('INVALID_ARGUMENT', action + ' requires position_text with an explicit time_format; the numeric value field is ambiguous and not accepted'); }
     if (typeof args.position_text !== 'string' || !args.position_text) { throw codedError('INVALID_ARGUMENT', action + ' requires position_text'); }
     if (typeof args.time_format !== 'string' || !args.time_format) { throw codedError('INVALID_ARGUMENT', action + ' requires time_format'); }
-    if (format === null || format === undefined) { throw codedError('STATE_UNKNOWN', 'Cubase has not reported the primary time format in this driver session; nothing was sent'); }
+    if (format === null || format === undefined) { throw codedError('STATE_UNKNOWN', 'Cubase has not reported the primary time format in this driver session (for example right after the MIDI Remote script was reloaded); nothing was sent. ' + TIME_FORMAT_RECOVERY, {state_key: key, recovery: TIME_FORMAT_RECOVERY}); }
     if (format !== args.time_format) { throw codedError('UNSUPPORTED_TIME_FORMAT', 'the primary time display uses "' + format + '", not "' + args.time_format + '"; nothing was sent', {host_time_format: format}); }
     if (current === args.position_text) { return receipt(action, false, {state_key: key, before: current, desired: args.position_text, time_format: format}); }
     runtime.revision += 1; dispatchRevision = runtime.revision;
@@ -733,10 +808,10 @@ function directSet(args) {
     result.target = identity || guard; result.object_id = objectId; result.parameter_tag = tag;
     return result;
 }
-// A parameter read addressed by target (or pinned selection) is a fresh host read; without an address the call is
-// a bounded snapshot of a DirectAccess root.
+// A parameter read addressed by target (or pinned selection) is a fresh host read; object_id alone reads that object's
+// parameters; otherwise the call is a bounded snapshot of the target channel's subtree or of a DirectAccess root.
 function directGet(args) {
-    var root, identity, objectId, tag;
+    var root, identity, objectId, tag, scope;
     if (args.object_id !== undefined && args.parameter_tag !== undefined && (args.target || args.expected_selected)) {
         if (args.target) { identity = resolveTarget(args.target); root = mixerRoot(); }
         else { identity = assertSelected(args.expected_selected); root = directRoot('selected_track'); }
@@ -745,8 +820,9 @@ function directGet(args) {
         if (!objectInTree(root, objectId, 1024, args.target ? identity.object_id : undefined)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id is not part of the resolved target'); }
         return {target: identity, object_id: objectId, read: readParameter(root, objectId, tag), fresh: true};
     }
-    if (args.target) { resolveTarget(args.target); args.root = 'mixer'; }
-    return directSnapshot(args);
+    scope = readScope(args);
+    if (args.object_id !== undefined && args.object_id !== null) { return objectRead(args, scope); }
+    return directSnapshot(args, scope);
 }
 
 // ---- plug-ins ---------------------------------------------------------------------------------------------
@@ -822,12 +898,41 @@ function pluginGet(args) {
         located = pluginRoot(args);
         if (!isFinite(Number(args.object_id))) { throw codedError('INVALID_ARGUMENT', 'object_id of the plug-in slot is required'); }
         return {slot: pluginSlotState(located.root, Number(args.object_id)), target: located.guard,
+            assignment: assignmentState(Number(args.object_id)),
             api_1_3_plugin_manager: !!(located.root.mPluginManager && located.root.mPluginManager.trySetSlotPlugin)};
     }
-    return directSnapshot(args);
+    return directGet(args);
+}
+// trySetSlotPlugin loads the plug-in before it returns. Live on Cubase 15.0.30 loading Addictive Drums 2 inside the
+// request callback exceeded the script's execution timeout before the reply was sent, so the broker reported
+// OUTCOME_UNKNOWN for a slot that then held the right plug-in. The request now only queues the assignment and replies;
+// the next idle callback performs it (one load per idle callback) and records the host's answer for inspect_slot.
+var pendingAssignments = [];
+var ASSIGNMENT_STALE_MS = 120000;
+function assignmentState(slotId) {
+    var entry = runtime.assignments[slotId], copy = {}, key;
+    if (!entry) { return null; }
+    for (key in entry) { if (Object.prototype.hasOwnProperty.call(entry, key)) { copy[key] = entry[key]; } }
+    return copy;
+}
+function assignmentBusy(entry) {
+    if (!entry) { return false; }
+    if (entry.state === 'queued') { return true; }
+    // An idle callback that the host aborted mid-load never records an answer; it stops blocking the slot eventually.
+    return entry.state === 'running' && new Date().getTime() - entry.started_at < ASSIGNMENT_STALE_MS;
+}
+function runAssignment(job, activeMapping) {
+    job.entry.state = 'running'; job.entry.started_at = new Date().getTime();
+    try {
+        job.entry.accepted = !!job.manager.trySetSlotPlugin(activeMapping, job.objectId, job.uid, job.dontAskDiscard);
+        job.entry.state = 'completed';
+    } catch (error) {
+        job.entry.state = 'failed'; job.entry.error = String(error && error.message ? error.message : error);
+    }
+    job.entry.finished_at = new Date().getTime();
 }
 function pluginSet(args) {
-    var located, manager, objectId, before, after, assigned, dispatchRevision;
+    var located, manager, objectId, before, entry, dispatchRevision;
     if (args.action === 'set_parameter') { return directSet(args); }
     if (args.action !== 'assign') { throw codedError('INVALID_ACTION', 'plugin action is unavailable; supported actions are set_parameter and assign'); }
     located = pluginRoot(args); manager = located.root.mPluginManager; objectId = Number(args.object_id);
@@ -835,14 +940,16 @@ function pluginSet(args) {
     if (!isFinite(objectId) || objectId < 0) { throw codedError('INVALID_ARGUMENT', 'object_id of the target plug-in slot is required'); }
     if (typeof args.plugin_uid !== 'string' || args.plugin_uid.length === 0) { throw codedError('INVALID_ARGUMENT', 'plugin_uid is required for plug-in slot assignment'); }
     if (!objectInTree(located.root, objectId, 1024, located.scope)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id is not a slot of the resolved target'); }
+    if (assignmentBusy(runtime.assignments[objectId])) { throw codedError('ASSIGNMENT_PENDING', 'an earlier plug-in assignment to this slot has not finished; nothing was changed', {assignment: assignmentState(objectId)}); }
     before = pluginSlotState(located.root, objectId);
     if (args.expected_slot_unique_id !== undefined && args.expected_slot_unique_id !== before.unique_id) { throw codedError('TARGET_CHANGED', 'the slot content changed after the assignment was planned; nothing was changed', {observed: before}); }
     runtime.revision += 1; dispatchRevision = runtime.revision;
-    assigned = !!manager.trySetSlotPlugin(runtime.mapping, objectId, args.plugin_uid, args.confirm_replace === true);
-    after = pluginSlotState(located.root, objectId);
-    return receipt('assign', true, {accepted: assigned, dont_ask_discard: args.confirm_replace === true, prior_slot: before, slot: after,
-        requested_plugin_uid: args.plugin_uid, target: located.guard, dispatch_revision: dispatchRevision,
-        note: 'The slot child object names the loaded plug-in class UID; the broker decides verification.'});
+    entry = {slot_object_id: objectId, plugin_uid: args.plugin_uid, state: 'queued', accepted: null, dispatch_revision: dispatchRevision, queued_at: new Date().getTime()};
+    runtime.assignments[objectId] = entry;
+    pendingAssignments.push({manager: manager, objectId: objectId, uid: args.plugin_uid, dontAskDiscard: args.confirm_replace === true, entry: entry});
+    return receipt('assign', true, {accepted: null, deferred: true, assignment: assignmentState(objectId), dont_ask_discard: args.confirm_replace === true,
+        prior_slot: before, requested_plugin_uid: args.plugin_uid, target: located.guard, dispatch_revision: dispatchRevision,
+        note: 'The assignment runs on the next idle callback. inspect_slot reports its state; the slot child object names the loaded plug-in class UID, and the broker decides verification.'});
 }
 function capabilities() {
     return {host_version: hostVersion(), driver_contract_version: DRIVER_CONTRACT_VERSION, driver_build_id: DRIVER_BUILD_ID,
@@ -903,13 +1010,17 @@ page.mOnActivate = function (activeDevice, activeMapping) {
     var name;
     runtime.active = true; runtime.device = activeDevice; runtime.mapping = activeMapping; runtime.sessionId = makeSessionId(); runtime.completed = {}; runtime.pendingChunks = {}; runtime.revision += 1;
     resetMirror();
+    pendingAssignments = []; runtime.assignments = {};
     for (name in runtime.directRoots) { if (runtime.directRoots.hasOwnProperty(name)) { runtime.directRoots[name].activate(activeMapping); } }
+    applyEarlyReports();
 };
 page.mOnDeactivate = function (activeDevice, activeMapping) {
     var name;
     for (name in runtime.directRoots) { if (runtime.directRoots.hasOwnProperty(name)) { runtime.directRoots[name].deactivate(activeMapping); } }
     runtime.active = false; runtime.device = null; runtime.mapping = null; runtime.sessionId = makeSessionId(); runtime.completed = {}; runtime.revision += 1;
     resetMirror();
+    // Queued assignments belong to the ended session and are dropped, never run against another project.
+    pendingAssignments = []; runtime.assignments = {}; earlyReports = {};
 };
 
 """;

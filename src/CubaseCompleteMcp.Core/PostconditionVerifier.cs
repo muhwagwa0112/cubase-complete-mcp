@@ -38,6 +38,8 @@ public sealed record ObservationTimings(TimeSpan Deadline, TimeSpan Interval)
     public static readonly ObservationTimings TrackAndPlugin = new(TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(100));
     public static readonly ObservationTimings Project = new(TimeSpan.FromSeconds(30), TimeSpan.FromMilliseconds(200));
     public static readonly ObservationTimings Export = new(TimeSpan.FromSeconds(120), TimeSpan.FromMilliseconds(500));
+    /// <summary>Heavy instruments (Addictive Drums 2, Kontakt libraries) take many seconds to load and stall the driver meanwhile.</summary>
+    public static readonly ObservationTimings PluginLoad = new(TimeSpan.FromSeconds(45), TimeSpan.FromMilliseconds(250));
 }
 
 /// <summary>

@@ -216,7 +216,7 @@ public sealed partial class CubaseUiAutomation
     /// Mixdown Folder"). Evidence carries only_name_differs when everything but the file name matches.
     /// </summary>
     public async Task<UiStageResult> ReadExportSettingsAsync(UiDialogRef dialog, string directory, string fileName,
-        CancellationToken cancellationToken)
+        bool allowSeparatorNoise, CancellationToken cancellationToken)
     {
         var owned = Revalidate(dialog);
         if (owned is null) return UiStageResult.Failure("export_read", "WORKFLOW_DIALOG_LOST", "The export dialog is no longer open.");
@@ -229,7 +229,7 @@ public sealed partial class CubaseUiAutomation
         foreach (var scale in new[] { 2.0, 2.5, 3.0, 4.0 })
         {
             passes.Add(await RecognizeTextAsync(capture, scale).ConfigureAwait(false));
-            reading = ExportDialogReading.Verify(passes, directory, fileName);
+            reading = ExportDialogReading.Verify(passes, directory, fileName, allowSeparatorNoise);
             if (reading.Ok) break;
         }
         reading.Evidence["capture"] = capture;

@@ -180,21 +180,32 @@ public sealed partial class CubaseController
             read["object_id"] = args["object_id"]?.DeepClone();
             return await DriverReadAsync(request, "plugin.get", read, cancellationToken).ConfigureAwait(false);
         }
-        var snapshot = new JsonObject { ["root"] = args["root"]?.DeepClone() ?? "selected_track" };
-        foreach (var key in new[] { "max_nodes", "max_depth", "max_parameters", "include_parameters" })
-            if (args[key] is { } value) snapshot[key] = value.DeepClone();
-        return await DriverReadAsync(request, "plugin.get", snapshot, cancellationToken).ConfigureAwait(false);
+        // A target (handle, bank slot or pinned selection) narrows the snapshot to that channel's subtree; object_id alone
+        // reads one object's parameters. Each driver reply is bounded and names a continuation (node_offset or
+        // parameter_offset) when it stopped early.
+        return await DriverReadAsync(request, "plugin.get", await SnapshotArgumentsAsync(args, session, cancellationToken).ConfigureAwait(false),
+            cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task<BrokerResponse> DirectReadAsync(BrokerRequest request, JsonObject args, string session, CancellationToken cancellationToken)
+    private static readonly string[] SnapshotKeys =
+        ["root", "max_nodes", "max_depth", "max_parameters", "include_parameters", "object_id", "parameter_tag",
+         "node_offset", "parameter_offset", "max_total_parameters", "time_budget_ms"];
+
+    private async Task<JsonObject> SnapshotArgumentsAsync(JsonObject args, string session, CancellationToken cancellationToken)
     {
         var resolved = await ResolveSelectorAsync(args, session, false, cancellationToken).ConfigureAwait(false);
-        var read = new JsonObject();
-        foreach (var key in new[] { "root", "max_nodes", "max_depth", "max_parameters", "include_parameters", "object_id", "parameter_tag" })
+        var read = new JsonObject { ["root"] = "selected_track" };
+        foreach (var key in SnapshotKeys)
             if (args[key] is { } value) read[key] = value.DeepClone();
-        if (resolved is not null) foreach (var pair in TargetArguments(resolved.Value.Identity)) read[pair.Key] = pair.Value?.DeepClone();
-        return await DriverReadAsync(request, "direct.get", read, cancellationToken).ConfigureAwait(false);
+        if (resolved is null) return read;
+        foreach (var pair in TargetArguments(resolved.Value.Identity)) read[pair.Key] = pair.Value?.DeepClone();
+        if (resolved.Value.Identity.Kind == TargetKinds.MixerChannel) read["root"] = "mixer";
+        return read;
     }
+
+    private async Task<BrokerResponse> DirectReadAsync(BrokerRequest request, JsonObject args, string session, CancellationToken cancellationToken) =>
+        await DriverReadAsync(request, "direct.get", await SnapshotArgumentsAsync(args, session, cancellationToken).ConfigureAwait(false),
+            cancellationToken).ConfigureAwait(false);
 
     private async Task<BrokerResponse> ProjectGetAsync(BrokerRequest request, CancellationToken cancellationToken)
     {

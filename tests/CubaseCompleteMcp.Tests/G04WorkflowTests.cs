@@ -198,6 +198,79 @@ public sealed class G04WorkflowTests
         if (expected == ResultStatus.Error) Assert.Equal("PLUGIN_MISMATCH", result.Error!.Code);
     }
 
+    private static readonly JsonObject AddictiveDrums = new() { ["uid"] = "4144324D58585858414444524D533200", ["name"] = "Addictive Drums 2", ["vendor"] = "XLN Audio", ["sub_categories"] = "Instrument|Drum" };
+
+    [Fact]
+    public async Task WFL05_HeavyPluginLoadStallsTheDriver_TheSlotIsStillVerifiedByItsUid()
+    {
+        // Live on Cubase 15.0.30: loading Addictive Drums 2 blocked the script ("execution timeout exceeded"), reads
+        // timed out meanwhile, and the assignment came back OUTCOME_UNKNOWN although the slot then held the right UID.
+        using var harness = new ControllerHarness();
+        harness.Driver.DriverPluginCatalog = [(JsonObject)AddictiveDrums.DeepClone()];
+        harness.Driver.DeferAssign = true;
+        harness.Driver.Select(harness.Driver.AddChannel("Drums"));
+        var busyReads = 0;
+        harness.Driver.Override = (operation, args) =>
+            operation == "plugin.get" && args["action"]?.GetValue<string>() == "inspect_slot" && harness.Driver.WriteCount("plugin.set") == 1 && busyReads++ < 3
+                ? new DriverReply(false, null, new BrokerError("DRIVER_TIMEOUT", "the script is busy loading the plug-in"), false, harness.Driver.Revision, true, harness.Driver.Epoch)
+                : null;
+
+        var result = await harness.ConfirmAndCommitAsync("plugin", new JsonObject { ["action"] = "assign", ["target_scope"] = "selected", ["object_id"] = 7, ["plugin_uid"] = AddictiveDrums["uid"]!.GetValue<string>() });
+
+        Assert.Equal(ResultStatus.Ok, result.Status);
+        Assert.Equal(ExecutionState.Applied, result.ExecutionState);
+        Assert.Equal(1, harness.Driver.WriteCount("plugin.set"));
+        Assert.True(busyReads >= 4, $"the busy reads were not waited out ({busyReads})");
+    }
+
+    [Fact]
+    public async Task WFL05_DeferredAssignmentTheHostRejected_IsReportedRejected()
+    {
+        using var harness = new ControllerHarness();
+        harness.Driver.DriverPluginCatalog = [(JsonObject)AddictiveDrums.DeepClone()];
+        harness.Driver.DeferAssign = true;
+        harness.Driver.AssignAccepted = false;
+        harness.Driver.Select(harness.Driver.AddChannel("Drums"));
+
+        var result = await harness.ConfirmAndCommitAsync("plugin", new JsonObject { ["action"] = "assign", ["target_scope"] = "selected", ["object_id"] = 7, ["plugin_uid"] = AddictiveDrums["uid"]!.GetValue<string>() });
+
+        Assert.Equal(ResultStatus.Error, result.Status);
+        Assert.Equal("PLUGIN_ASSIGN_REJECTED", result.Error!.Code);
+        Assert.Equal(ExecutionState.Rejected, result.ExecutionState);
+    }
+
+    [Fact]
+    public async Task PLG01_MixerListWithATargetHandle_IsScopedToThatChannel()
+    {
+        // Live on Cubase 15.0.30: target_handle was ignored for root=mixer, so the whole 12-channel mixer was read.
+        using var harness = new ControllerHarness();
+        harness.Driver.AddChannel("Drums");
+        var master = harness.Driver.AddChannel("Stereo Out");
+        var handle = await harness.HandleForAsync(master);
+
+        var scoped = await harness.SendAsync("plugin", new JsonObject
+        {
+            ["action"] = "list", ["root"] = "mixer", ["target_handle"] = handle, ["object_id"] = 42,
+            ["parameter_offset"] = 128, ["max_total_parameters"] = 64, ["node_offset"] = 3, ["include_parameters"] = true
+        });
+        Assert.Equal(ResultStatus.Ok, scoped.Status);
+        var sent = harness.Driver.ReadArguments.Last(item => item.Operation == "plugin.get").Arguments;
+        Assert.Equal(master.UniqueId, sent["target"]!["unique_id"]!.GetValue<string>());
+        Assert.Equal("mixer", sent["root"]!.GetValue<string>());
+        Assert.Equal(42, sent["object_id"]!.GetValue<int>());
+        Assert.Equal(128, sent["parameter_offset"]!.GetValue<int>());
+        Assert.Equal(64, sent["max_total_parameters"]!.GetValue<int>());
+        Assert.Equal(3, sent["node_offset"]!.GetValue<int>());
+
+        await harness.SendAsync("plugin", new JsonObject { ["action"] = "list", ["root"] = "mixer" });
+        Assert.Null(harness.Driver.ReadArguments.Last(item => item.Operation == "plugin.get").Arguments["target"]);
+
+        await harness.SendAsync("direct", new JsonObject { ["action"] = "list", ["root"] = "mixer", ["node_offset"] = 9, ["max_total_parameters"] = 32 });
+        var direct = harness.Driver.ReadArguments.Last(item => item.Operation == "direct.get").Arguments;
+        Assert.Equal(9, direct["node_offset"]!.GetValue<int>());
+        Assert.Equal(32, direct["max_total_parameters"]!.GetValue<int>());
+    }
+
     [Fact]
     public async Task WFL05_Api13Host_UidOutsideTheDriverCatalog_IsRefusedBeforeDispatch()
     {
@@ -304,6 +377,79 @@ public sealed class G04WorkflowTests
         Assert.True(WavFileValidator.Validate(Wav(2.015), 2.0).Valid);
         Assert.Equal("empty_data", WavFileValidator.Validate(Wav(0), 0).Error);
         Assert.False(WavFileValidator.Read(new byte[] { 1, 2, 3 }).Valid);
+    }
+
+    private static void ExportWritesTheShownName(ControllerHarness harness)
+    {
+        var perform = harness.Catalog.Find("Audio Export", "Perform Audio Export")!.Id;
+        harness.Driver.Commands[perform] = (_, _) =>
+        {
+            File.WriteAllBytes(Path.Combine(harness.Ui.ExportDirectory!, harness.Ui.ExportDialogName + ".wav"), Wav(2.0));
+            return true;
+        };
+    }
+
+    [Fact]
+    public async Task WFL07_AnotherNameThatOcrReadsWithASeparatorDifference_IsReplacedByTheRequestedName()
+    {
+        // Live 2026-10-16 (Cubase 15.0.30): the dialog held "YuugureDrive_final" and OCR read the '_' as a space.
+        // Normalizing spaces away made it match the request "YuugureDriveFinal", so the name was not typed, Cubase
+        // exported YuugureDrive_final.wav and the broker waited for YuugureDriveFinal.wav until POSTCONDITION_TIMEOUT.
+        using var harness = new ControllerHarness();
+        var directory = FixtureDirectory(harness);
+        var requested = Path.Combine(directory, "YuugureDriveFinal.wav");
+        ExportWritesTheShownName(harness);
+        harness.Ui.ExportDialogName = "YuugureDrive_final";
+        harness.Ui.ExportPreviewOcr = name => name.Replace('_', ' ');
+        harness.Ui.AvailableDialogs.Add(DialogKinds.ExportAudio);
+
+        var result = await harness.SendAsync("project", new JsonObject { ["action"] = "export_audio", ["path"] = requested, ["expected_duration_seconds"] = 2.0 });
+
+        Assert.Equal(ResultStatus.Ok, result.Status);
+        Assert.Equal(["export_read:YuugureDrive_final", "export_name:YuugureDriveFinal", "export_read:YuugureDriveFinal"],
+            harness.Ui.Actions.Where(action => action.StartsWith("export_", StringComparison.Ordinal)).ToArray());
+        Assert.True(File.Exists(requested));
+        Assert.False(File.Exists(Path.Combine(directory, "YuugureDrive_final.wav")));
+    }
+
+    [Fact]
+    public async Task WFL07_TypedNameThatDidNotTake_IsNotAcceptedThroughSeparatorNoise()
+    {
+        // The pre-commit read differed from the request only by a separator, so after typing only an exact read
+        // (OCR confusions position by position) can tell the new name from the old one.
+        using var harness = new ControllerHarness();
+        var directory = FixtureDirectory(harness);
+        ExportWritesTheShownName(harness);
+        harness.Ui.ExportDialogName = "YuugureDrive_final";
+        harness.Ui.ExportPreviewOcr = name => name.Replace('_', ' ');
+        harness.Ui.ExportNameTakes = false;
+        harness.Ui.AvailableDialogs.Add(DialogKinds.ExportAudio);
+        var commands = harness.Driver.WriteCount("command.execute");
+
+        var result = await harness.SendAsync("project", new JsonObject { ["action"] = "export_audio", ["path"] = Path.Combine(directory, "YuugureDriveFinal.wav"), ["expected_duration_seconds"] = 2.0 });
+
+        Assert.Equal("EXPORT_SETTINGS_MISMATCH", result.Error!.Code);
+        Assert.Equal(ExecutionState.NotApplied, result.ExecutionState);
+        Assert.Equal(commands + 2, harness.Driver.WriteCount("command.execute")); // open and reopen; never perform
+        Assert.Empty(Directory.GetFiles(directory));
+    }
+
+    [Fact]
+    public async Task WFL07_AfterTheNameWasTyped_OcrSpacingNoiseOnTheNewName_IsTolerated()
+    {
+        // Live OCR inserts spaces mid-word ("accepta nce.wav"). Once a clearly different name was replaced by typing,
+        // a read that differs from the typed name only by separators is the typed name.
+        using var harness = new ControllerHarness();
+        var directory = FixtureDirectory(harness);
+        ExportWritesTheShownName(harness);
+        harness.Ui.ExportDialogName = "other";
+        harness.Ui.ExportPreviewOcr = name => name == "acceptance" ? "accepta nce" : name;
+        harness.Ui.AvailableDialogs.Add(DialogKinds.ExportAudio);
+
+        var result = await harness.SendAsync("project", new JsonObject { ["action"] = "export_audio", ["path"] = Path.Combine(directory, "acceptance.wav"), ["expected_duration_seconds"] = 2.0 });
+
+        Assert.Equal(ResultStatus.Ok, result.Status);
+        Assert.True(File.Exists(Path.Combine(directory, "acceptance.wav")));
     }
 
     [Fact]

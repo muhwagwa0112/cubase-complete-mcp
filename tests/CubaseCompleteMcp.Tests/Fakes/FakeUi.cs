@@ -156,20 +156,35 @@ public sealed class FakeUi : IWorkflowUi
     public bool ExportFormatMatches { get; set; } = true;
     public string? ExportDirectory { get; private set; }
 
-    public Task<UiStageResult> ReadExportSettingsAsync(UiDialogRef dialog, string directory, string fileName, CancellationToken cancellationToken)
+    /// <summary>What OCR reads for the shown name (live: '_' was read as a space, spaces were inserted mid-word).</summary>
+    public Func<string, string> ExportPreviewOcr { get; set; } = name => name;
+    /// <summary>False models a typed name that Cubase did not keep.</summary>
+    public bool ExportNameTakes { get; set; } = true;
+
+    private static JsonObject OcrLine(string text, double x, double y) =>
+        new() { ["text"] = text, ["words"] = new JsonArray(new JsonObject { ["text"] = text.Split(' ')[0], ["x"] = x, ["y"] = y }) };
+
+    /// <summary>Renders the dialog as OCR lines and judges them with the production read-back.</summary>
+    public Task<UiStageResult> ReadExportSettingsAsync(UiDialogRef dialog, string directory, string fileName, bool allowSeparatorNoise,
+        CancellationToken cancellationToken)
     {
         Actions.Add("export_read:" + ExportDialogName);
         ExportDirectory = directory;
-        var nameMatches = ExportDialogName == fileName;
-        if (ExportFormatMatches && nameMatches) return Task.FromResult(UiStageResult.Success("export_read"));
-        return Task.FromResult(UiStageResult.Failure("export_read", "EXPORT_SETTINGS_MISMATCH", "settings differ",
-            new JsonObject { ["only_name_differs"] = ExportFormatMatches && !nameMatches }));
+        var ocr = new JsonArray(
+            OcrLine("Path", 377, 130), OcrLine(directory, 501, 130),
+            OcrLine("Preview", 377, 161), OcrLine(ExportPreviewOcr(ExportDialogName) + ".wav", 501, 161),
+            OcrLine("File Type", 377, 262), OcrLine("Wave", 501, 263),
+            OcrLine("Sample Rate", 376, 292), OcrLine(ExportFormatMatches ? "48.0 kHz" : "44.1 kHz", 501, 293),
+            OcrLine("Bit Depth", 377, 322), OcrLine("24 bit", 501, 323));
+        var reading = ExportDialogReading.Verify([ocr], directory, fileName, allowSeparatorNoise);
+        return Task.FromResult(reading.Ok ? UiStageResult.Success("export_read", reading.Evidence)
+            : UiStageResult.Failure("export_read", "EXPORT_SETTINGS_MISMATCH", reading.Message!, reading.Evidence));
     }
 
     public Task<UiStageResult> CommitExportNameAsync(UiDialogRef dialog, string fileName, CancellationToken cancellationToken)
     {
         Actions.Add("export_name:" + fileName);
-        ExportDialogName = fileName;
+        if (ExportNameTakes) ExportDialogName = fileName;
         _open.Remove(dialog.Id);
         AvailableDialogs.Add(DialogKinds.ExportAudio); // the export command opens it again
         return Task.FromResult(UiStageResult.Success("export_name"));

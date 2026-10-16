@@ -37,7 +37,7 @@ public sealed class CubaseTools(BrokerClient broker)
             confirmation_id, operation_id, cancellationToken);
 
     [McpServerTool(Name = "cubase_transport", ReadOnly = false, Destructive = true, OpenWorld = false)]
-    [Description("Read (action=get) or change transport: play, stop, record/record_start/record_stop (confirmation required), cycle/metronome (enabled), tempo (bpm), position/left_locator/right_locator (position_text in the host's primary time_format, e.g. the format reported by action=get). Each change is sent once and verified by a fresh host callback; toggles are refused while the host state is unknown.")]
+    [Description("Read (action=get) or change transport: play, stop, record/record_start/record_stop (confirmation required), cycle/metronome (enabled), tempo (bpm), position/left_locator/right_locator (position_text in the host's primary time_format, e.g. the format reported by action=get; Cubase reports the format only with a time change, so right after a MIDI Remote script reload these are refused with STATE_UNKNOWN until Play/Stop or a click in the ruler). Each change is sent once and verified by a fresh host callback; toggles are refused while the host state is unknown.")]
     public Task<JsonNode> Transport(string action = "get", bool? enabled = null, double? bpm = null,
         string? position_text = null, string? time_format = null, string? operation_id = null,
         string? confirmation_id = null, CancellationToken cancellationToken = default) =>
@@ -65,29 +65,34 @@ public sealed class CubaseTools(BrokerClient broker)
             ("track_id", track_id)), null, operation_id, cancellationToken);
 
     [McpServerTool(Name = "cubase_plugin", ReadOnly = false, Destructive = true, OpenWorld = false)]
-    [Description("list (DirectAccess snapshot), inspect_slot, catalog (installed plug-in UIDs; returns PLUGIN_CATALOG_UNAVAILABLE when the host offers no verifiable list), set_parameter (parameter_tag + value), assign (plugin_uid from the catalog into slot object_id; confirmation required; verified only by the loaded plug-in UID). Removing, bypassing and opening editors are not supported." + TargetHelp)]
+    [Description("list (bounded DirectAccess snapshot: a target narrows it to that channel's subtree; object_id without parameter_tag reads one object's parameters, e.g. a plug-in on Stereo Out; a reply that stopped early names a continuation node_offset or parameter_offset to pass back), inspect_slot (also reports the state of a queued assignment), catalog (installed plug-in UIDs; returns PLUGIN_CATALOG_UNAVAILABLE when the host offers no verifiable list), set_parameter (parameter_tag + value), assign (plugin_uid from the catalog into slot object_id; confirmation required; the driver loads it on its next idle callback and the result is verified only by the loaded plug-in UID). Removing, bypassing and opening editors are not supported." + TargetHelp)]
     public Task<JsonNode> Plugin(string action = "list", string? target_handle = null, string? target_scope = null,
         int? bank_index = null, string root = "selected_track", long? object_id = null, int? parameter_tag = null,
         double? process_value = null, double? plain_value = null, string? display_value = null, string? plugin_uid = null,
-        bool? confirm_replace = null, string? operation_id = null, string? confirmation_id = null,
-        CancellationToken cancellationToken = default) =>
+        bool? confirm_replace = null, int? max_nodes = null, int? max_depth = null, int? max_parameters = null,
+        bool? include_parameters = null, int? max_total_parameters = null, int? node_offset = null, int? parameter_offset = null,
+        string? operation_id = null, string? confirmation_id = null, CancellationToken cancellationToken = default) =>
         SendAsync("plugin", Args(("action", action), ("target_handle", target_handle), ("target_scope", target_scope),
             ("bank_index", bank_index), ("root", root), ("object_id", object_id), ("parameter_tag", parameter_tag),
             ("process_value", process_value), ("plain_value", plain_value), ("display_value", display_value),
-            ("plugin_uid", plugin_uid), ("confirm_replace", confirm_replace)), confirmation_id, operation_id, cancellationToken);
+            ("plugin_uid", plugin_uid), ("confirm_replace", confirm_replace), ("max_nodes", max_nodes), ("max_depth", max_depth),
+            ("max_parameters", max_parameters), ("include_parameters", include_parameters), ("max_total_parameters", max_total_parameters),
+            ("node_offset", node_offset), ("parameter_offset", parameter_offset)), confirmation_id, operation_id, cancellationToken);
 
     [McpServerTool(Name = "cubase_direct", ReadOnly = false, Destructive = false, OpenWorld = false)]
-    [Description("list/get: bounded snapshot of a DirectAccess root (selected_track, mixer, control_room, focused_quick_controls) with per-axis truncation, or a fresh parameter read when a target, object_id and parameter_tag are given. set: write one parameter of an object inside the resolved target (object IDs are ephemeral and must belong to that target)." + TargetHelp)]
+    [Description("list/get: bounded snapshot of a DirectAccess root (selected_track, mixer, control_room, focused_quick_controls) or of a target channel's subtree, with per-axis truncation and a per-call parameter/time budget (max_total_parameters, default 256); a reply that stopped early names continuation.node_offset to pass back. object_id alone reads that object's parameters (paged by parameter_offset); target + object_id + parameter_tag is a fresh single-parameter read. set: write one parameter of an object inside the resolved target (object IDs are ephemeral and must belong to that target)." + TargetHelp)]
     public Task<JsonNode> Direct(string action = "list", string root = "selected_track", string? target_handle = null,
         string? target_scope = null, int? bank_index = null, long? object_id = null, int? parameter_tag = null,
         double? process_value = null, double? plain_value = null, string? display_value = null, int? max_nodes = null,
-        int? max_depth = null, int? max_parameters = null, bool? include_parameters = null, string? operation_id = null,
+        int? max_depth = null, int? max_parameters = null, bool? include_parameters = null, int? max_total_parameters = null,
+        int? node_offset = null, int? parameter_offset = null, string? operation_id = null,
         CancellationToken cancellationToken = default) =>
         SendAsync("direct", Args(("action", action), ("root", root), ("target_handle", target_handle),
             ("target_scope", target_scope), ("bank_index", bank_index), ("object_id", object_id), ("parameter_tag", parameter_tag),
             ("process_value", process_value), ("plain_value", plain_value), ("display_value", display_value),
             ("max_nodes", max_nodes), ("max_depth", max_depth), ("max_parameters", max_parameters),
-            ("include_parameters", include_parameters)), null, operation_id, cancellationToken);
+            ("include_parameters", include_parameters), ("max_total_parameters", max_total_parameters),
+            ("node_offset", node_offset), ("parameter_offset", parameter_offset)), null, operation_id, cancellationToken);
 
     [McpServerTool(Name = "cubase_midi", ReadOnly = false, Destructive = true, OpenWorld = false)]
     [Description("Session-scoped MIDI compositions (tracks, parts, notes, chords, drums, CC, pitch bend, pressure, program/tempo/signature/text events, transforms, SMF import/export). compare_file compares a document with a MIDI file exported from Cubase (content_roundtrip_verified). import_to_cubase imports new tracks named '<name> [CBMCP-xxxxxxxx]' so pre-existing tracks can never be mistaken for the result; the best level observable through MIDI Remote is targets_observed, reported Unverified with IMPORT_CAUSALITY_UNPROVEN until content is compared. stop_transport=true is required (with confirmation) when Cubase is playing or recording.")]
