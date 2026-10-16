@@ -70,7 +70,7 @@ public interface IWorkflowUi
 public sealed record PluginCatalogEntry(string Uid, string Name, string? Vendor, string? Category, bool Available);
 
 public sealed record PluginCatalogSnapshot(bool Available, string Source, IReadOnlyList<PluginCatalogEntry> Entries,
-    string? UnavailableReason);
+    string? UnavailableReason, long? SlotObjectId = null);
 
 /// <summary>
 /// Installed plug-in UIDs and slot identity read-back. The production provider reports the catalog as unavailable:

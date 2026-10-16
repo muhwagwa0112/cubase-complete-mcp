@@ -177,6 +177,7 @@ public sealed class G04WorkflowTests
         Assert.Equal(ResultStatus.Ok, catalog.Status);
         Assert.Equal("midi_remote_api_1_3_plugin_manager", catalog.Data!["source"]!.GetValue<string>());
         Assert.Equal(2, catalog.Data["entries"]!.AsArray().Count);
+        Assert.Equal(7, catalog.Data["slot_object_id"]!.GetValue<long>());
 
         var result = await harness.ConfirmAndCommitAsync("plugin", new JsonObject { ["action"] = "assign", ["target_scope"] = "selected", ["object_id"] = 7, ["plugin_uid"] = requested });
         Assert.Equal(expected, result.Status);

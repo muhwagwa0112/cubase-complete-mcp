@@ -23,17 +23,19 @@ public sealed partial class CubaseController
         if (!DriverListsPlugins) return await _plugins.GetCatalogAsync(cancellationToken).ConfigureAwait(false);
         const string source = "midi_remote_api_1_3_plugin_manager";
         var entries = new List<PluginCatalogEntry>();
+        long? slot = null;
         var offset = 0;
         while (offset < PluginCatalogLimit)
         {
             var args = target is null ? new JsonObject() : TargetArguments(target);
             args["action"] = "catalog";
-            if (slotObjectId is { } slot) args["object_id"] = slot;
+            if (slotObjectId is { } requested) args["object_id"] = requested;
             args["offset"] = offset;
             args["limit"] = PluginCatalogPage;
             var page = await ReadDriverAsync("plugin.get", args, cancellationToken).ConfigureAwait(false);
             if (ReadBool(page["available"]) != true)
                 return new PluginCatalogSnapshot(false, source, [], page["reason"]?.GetValue<string>() ?? ErrorCodes.PluginCatalogUnavailable);
+            slot ??= ReadLong(page["slot_object_id"]);
             var items = page["entries"] as JsonArray ?? [];
             foreach (var item in items.OfType<JsonObject>())
             {
@@ -45,7 +47,7 @@ public sealed partial class CubaseController
             offset += items.Count;
             if (items.Count == 0 || offset >= (ReadLong(page["total"]) ?? 0)) break;
         }
-        return new PluginCatalogSnapshot(true, source, entries, null);
+        return new PluginCatalogSnapshot(true, source, entries, null, slot);
     }
 
     private async Task<string?> ObserveSlotPluginUidAsync(TargetIdentity target, long slotObjectId, CancellationToken cancellationToken)
