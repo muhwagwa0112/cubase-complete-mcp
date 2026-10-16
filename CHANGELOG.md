@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.0 (unreleased)
+## 1.0.0 (2026-10-16)
 
 First public release. Pipe protocol 2, driver contract 2. Validated live on Cubase 15.0.30 (MIDI Remote API 1.3): all
 15 live acceptance cases pass and the gate evaluator reports `CODE_RC_READY` 67/67 and `WORKFLOW_RELEASE_READY` 82/82
