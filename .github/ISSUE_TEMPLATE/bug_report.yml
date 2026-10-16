@@ -1,0 +1,49 @@
+name: Bug report
+description: Report a reproducible Cubase Complete MCP problem without private project data.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not include songs, audio, personal paths, Key Command files with private names, or security
+        vulnerabilities. Use the Security tab for vulnerabilities. Reproduce with a new empty Cubase project
+        whenever possible.
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Windows, Cubase (Help > About, e.g. 15.0.30), MCP release ID, loopMIDI, and MCP client (Codex, Claude Code, Claude Desktop).
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: cubase_status output
+      description: >-
+        Paste the result of the `cubase_status` tool (connection_state, driver_build_id, api13_available,
+        broker_release_id, warnings). Redact personal paths.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: The tool calls (name and arguments) and what Cubase showed. Use a synthetic project.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+      description: Include the result's status, execution_state, error code and, for workflows, the last workflow stage.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed songs, audio, personal paths, project names and credentials.
+          required: true

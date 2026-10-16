@@ -1,0 +1,86 @@
+# Builds the Windows release from a version tag and attaches it to a DRAFT GitHub release.
+# Nothing is published automatically: a maintainer reviews the draft and publishes it.
+# Live Cubase gates are not run on hosted runners; the release notes link the live acceptance record.
+# Action revisions are pinned to the same commit SHAs as ci.yml.
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      DOTNET_NOLOGO: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.11.1'
+      - name: Check the tag against the project version
+        shell: pwsh
+        run: |
+          $version = ([xml](Get-Content Directory.Build.props -Raw)).Project.PropertyGroup.Version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) { Write-Error "Tag $env:GITHUB_REF_NAME does not match <Version>$version</Version>"; exit 1 }
+          "VERSION=$version" >> $env:GITHUB_ENV
+      - name: Restore (locked)
+        run: dotnet restore CubaseCompleteMcp.sln --locked-mode
+      - name: Build
+        run: dotnet build CubaseCompleteMcp.sln -c Release --no-restore
+      - name: Test
+        shell: pwsh
+        env:
+          DOTNET_CLI_UI_LANGUAGE: en
+        run: |
+          dotnet test CubaseCompleteMcp.sln -c Release --no-build --logger "trx" --results-directory test-results
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Publish and validate release payload
+        shell: pwsh
+        run: ./scripts/publish.ps1 -Output "$env:RUNNER_TEMP/release" -LogDirectory "$env:RUNNER_TEMP/release-logs" -AllowDirty:$false
+      - name: Package
+        shell: pwsh
+        run: |
+          $release = Get-ChildItem "$env:RUNNER_TEMP/release" -Directory | Where-Object Name -notlike '.staging-*' | Select-Object -First 1
+          $manifestHash = (Get-FileHash (Join-Path $release.FullName 'release-manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+          $zip = "$env:RUNNER_TEMP/cubase-complete-mcp-$env:VERSION-windows.zip"
+          Compress-Archive -Path (Join-Path $release.FullName '*') -DestinationPath $zip
+          $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$zipHash  $(Split-Path $zip -Leaf)" | Set-Content -Encoding ascii "$zip.sha256"
+          # Release notes: the CHANGELOG section of this version plus the integrity values.
+          $changelog = Get-Content CHANGELOG.md -Raw
+          $section = [regex]::Match($changelog, "(?ms)^## $([regex]::Escape($env:VERSION))\b.*?(?=^## |\z)").Value.Trim()
+          if (-not $section) { Write-Error "CHANGELOG.md has no section for $env:VERSION"; exit 1 }
+          $notes = @(
+            ($section -replace '^## .*\r?\n', ''),
+            '',
+            '### Integrity',
+            '',
+            "- Release ID: ``$($release.Name)``",
+            "- ``release-manifest.json`` SHA-256: ``$manifestHash``",
+            "- ``$(Split-Path $zip -Leaf)`` SHA-256: ``$zipHash``",
+            '',
+            'Verify after extracting: `CubaseCompleteMcp.Cli.exe validate-release . --manifest-sha256 <release-manifest SHA-256 above>`.',
+            '',
+            'Installation and setup: [docs/USAGE.md](https://github.com/muhwagwa0112/cubase-complete-mcp/blob/main/docs/USAGE.md).'
+          ) -join "`n"
+          Set-Content -Path "$env:RUNNER_TEMP/notes.md" -Value $notes -Encoding utf8
+          "ZIP=$zip" >> $env:GITHUB_ENV
+      - name: Create draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME $env:ZIP "$env:ZIP.sha256" --draft --verify-tag `
+            --title "Cubase Complete MCP $env:VERSION" --notes-file "$env:RUNNER_TEMP/notes.md"

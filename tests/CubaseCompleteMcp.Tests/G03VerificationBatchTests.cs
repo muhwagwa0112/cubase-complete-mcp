@@ -14,7 +14,13 @@ public sealed class G03VerificationBatchTests
     [InlineData(1000)]
     public async Task VER01_DelayedTransportCallback_DispatchOnceOkOnlyAfterFreshObservation(int delayMs)
     {
-        using var harness = new ControllerHarness();
+        // The deadline leaves 4 s beyond the callback delay: on a loaded CI runner a 1 s callback plus scheduling
+        // overran the shared fast deadline. The no-callback deadline is VER02's subject, not this test's.
+        var timings = ControllerHarness.FastTimings with
+        {
+            TransportAndMixer = new ObservationTimings(TimeSpan.FromMilliseconds(delayMs + 4000), TimeSpan.FromMilliseconds(20))
+        };
+        using var harness = new ControllerHarness(timings: timings);
         harness.Driver.CallbackDelay = TimeSpan.FromMilliseconds(delayMs);
         var response = await harness.SendAsync("transport", new JsonObject { ["action"] = "play" });
         Assert.Equal(ResultStatus.Ok, response.Status);
