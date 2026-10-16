@@ -79,6 +79,7 @@ try {
   group('merging offline and live runs');
   const offline = join(root, 'offline');
   const offlineResults = offlineRun(offline, 'offline-1');
+  write(join(offline, 'gates-code_rc.json'), '{"decision":"CODE_RC_READY"}');
   const offlineHash = sha256File(join(offline, 'results.json'));
   const live = join(root, 'live');
   liveRun(live, 'offline-1');
@@ -95,6 +96,7 @@ try {
     .every(item => existsSync(join(out, item.path)) && sha256File(join(out, item.path)) === item.sha256)));
   check('the inputs are untouched', sha256File(join(offline, 'results.json')) === offlineHash && sha256File(join(live, 'live-results.json')) === liveHash);
   check('the live results are kept beside the merge', existsSync(join(out, 'live-results.json')));
+  check('earlier gate reports are not carried into the merge', !existsSync(join(out, 'gates-code_rc.json')) && existsSync(join(offline, 'gates-code_rc.json')));
 
   group('merge refusals');
   throws('an existing output directory is refused', () => mergeAcceptance({ base: offline, live, out }), /already exists/);

@@ -72,7 +72,9 @@ export function mergeAcceptance({ base, live, out }) {
     if (existsSync(clash) && sha256File(clash) !== ref.sha256) throw new Error(`refusing to merge: ${ref.path} exists in both runs with different content`);
   }
 
-  cpSync(base, out, { recursive: true, errorOnExist: true, force: false });
+  // Earlier gate reports are verdicts about the base run, not evidence; they would sit beside the merged result.
+  const staleReport = path => resolve(dirname(path)) === resolve(base) && /^gates-.*\.json$/i.test(path.split(/[\\/]/).pop());
+  cpSync(base, out, { recursive: true, errorOnExist: true, force: false, filter: path => !staleReport(path) });
   for (const ref of liveRefs) {
     const target = inside(out, ref.path);
     mkdirSync(dirname(target), { recursive: true });
