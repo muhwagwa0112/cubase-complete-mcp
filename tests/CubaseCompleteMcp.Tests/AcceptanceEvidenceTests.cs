@@ -1,4 +1,3 @@
-using System.Runtime.CompilerServices;
 using System.Text.Json;
 
 namespace CubaseCompleteMcp.Tests;
@@ -14,8 +13,8 @@ public sealed class AcceptanceEvidenceTests
     public async Task LiveRunJoinsOfflineRun_AndMergeNeverRewritesEvidence()
     {
         var node = NodeHarnessRunner.RequireNode(Environment.GetEnvironmentVariable("PATH"));
-        var script = Path.Combine(Path.GetDirectoryName(SourceFile())!, "Acceptance", "acceptance-evidence.mjs");
-        Assert.True(File.Exists(script), $"{script} was not found next to this test file.");
+        var script = RepositoryPaths.Combine("tests", "CubaseCompleteMcp.Tests", "Acceptance", "acceptance-evidence.mjs");
+        Assert.True(File.Exists(script), $"{script} was not found.");
 
         var result = await NodeHarnessRunner.RunAsync(node, [script], Path.GetDirectoryName(script)!, TimeSpan.FromSeconds(60));
         Assert.False(result.TimedOut, "acceptance-evidence.mjs did not finish within 60 seconds.");
@@ -33,6 +32,4 @@ public sealed class AcceptanceEvidenceTests
         Assert.True(summary.RootElement.GetProperty("checks").GetInt32() >= 25);
         Assert.Equal(0, result.ExitCode);
     }
-
-    private static string SourceFile([CallerFilePath] string path = "") => path;
 }

@@ -12,8 +12,7 @@ public sealed class G05ReleaseGateTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "cbmcp-g05-" + Guid.NewGuid().ToString("N"));
 
-    private static string RepositoryRoot([CallerFilePath] string path = "") =>
-        Path.GetFullPath(Path.Combine(Path.GetDirectoryName(path)!, "..", ".."));
+    private static string RepositoryRoot() => RepositoryPaths.Root;
 
     private static string CliAssembly()
     {
