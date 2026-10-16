@@ -8,7 +8,7 @@ namespace CubaseCompleteMcp.Broker;
 public sealed record CubaseProcessState(bool Running, int? ProcessId, string? Version, string? WindowTitle,
     IntPtr WindowHandle, DateTimeOffset? StartTime);
 
-public sealed class CubaseProcessInspector
+public sealed class CubaseProcessInspector : IHostProcessProbe
 {
     public CubaseProcessState Inspect()
     {
@@ -80,7 +80,11 @@ public sealed class CubaseProcessInspector
             return true;
         }, IntPtr.Zero);
 
-        var preferred = candidates.FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate.Title));
+        // Project identity is derived from this title, so a dialog (for example an "Error" box) must never be
+        // mistaken for the project window: prefer the project window, then the Hub, then any titled window.
+        var preferred = candidates.FirstOrDefault(candidate => candidate.Title.Contains(" Project - ", StringComparison.Ordinal));
+        if (preferred == default) preferred = candidates.FirstOrDefault(candidate => candidate.Title.EndsWith(" Hub", StringComparison.Ordinal));
+        if (preferred == default) preferred = candidates.FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate.Title));
         return preferred == default ? (IntPtr.Zero, null) : preferred;
     }
 

@@ -1,31 +1,32 @@
 # Capability matrix
 
-| Area | Primary path | Support | Verification contract |
+Support levels: **implemented** (code exists), **mock_validated** (offline tests with fake host adapters and the generated driver in a mock MIDI Remote host), **live_validated** (verified on an owned Cubase 15.0.10 fixture on 2026-09-28, re-run on candidate 8079732 on 2026-10-16), **unsupported**, **blocked_environment** (needs an API or environment that is not available), **best_effort**.
+
+| Area | Path | Level | Postcondition / contract |
 |---|---|---|---|
-| Status, ports, version | Broker / WinMM | Full | Cubase process, guarded loopMIDI autostart, configured/observed ports, connection state, driver handshake and client/Broker Release identity |
-| 69 categories / 2,777 commands | Generated command bindings | Catalog complete; risk classification covers the rule-matched subset only (`classified_commands` / `unclassified_commands`); execution context-dependent | Exact ID/name plus v1.3 `canPerform` where the host exposes it; execution remains `UNVERIFIED` without a state postcondition |
-| Play, stop, record, cycle, click, tempo, locators | High-level MIDI Remote bindings | Full after live validation | State callbacks and session revision |
-| Track enumeration | Mixer DirectAccess | Dynamic | Fresh object traversal |
-| Track create/delete/duplicate/freeze/enable | Key Commands | Command-backed | `canPerform`; destructive delete requires confirmation |
-| Volume, pan, mute, solo, monitor, record enable | High-level bindings | Full after live validation | Callback state |
-| EQ, filters, sends, channel strip, automation | DirectAccess parameters | Dynamic | Read-back process/display values |
-| Plugin parameter enumeration/write | DirectAccess | Generic for exposed parameters | Read-back value, unit and metadata |
-| Arbitrary DirectAccess tree/parameter | `cubase_direct` | Dynamic across selected track, mixer, Control Room and focused Quick Controls | Fresh traversal plus process/display/plain-value read-back |
-| MIDI composition document | `cubase_midi` | Full, session-isolated | Persisted JSON validation and event/count summary |
-| Notes, chords, drum patterns | `cubase_midi` generators | Full | Structured event read-back plus SMF round-trip |
-| CC, pitch bend, pressure, program changes | `cubase_midi` events | Full | Range validation plus SMF round-trip |
-| Tempo/time/key maps, markers, lyrics, SysEx | `cubase_midi` meta events | Full | Standards-compliant SMF encoding/decoding |
-| Quantize, transpose, humanize, range replacement | `cubase_midi` transforms | Full | Deterministic mutation summary; replacement requires confirmation |
-| MIDI file import/export | SMF format 0/1 | Full for PPQ files | Header/track/event validation, SHA-256 and decode round-trip |
-| Generated MIDI import into Cubase | Command Binding plus owned file dialog | Command/UI hybrid | Rendered file hash/round-trip, dialog closure and every expected track name observed through DirectAccess/OCR |
-| Plugin slot assignment | API v1.3 plugin manager | Feature-detected | API return plus refreshed slot traversal |
-| Control Room / Quick Controls | DirectAccess roots | Dynamic | Fresh traversal/read-back |
-| Save, new, open, close, import/export | Key Command then UI | Mixed | File/window/project postcondition required |
-| Cubase native dialogs | UI Automation plus guarded snapshot input | Best effort | Reinspect after every action |
-| Custom-rendered plugin GUI | OCR coordinates plus guarded click/drag/scroll/key/text | Best effort | Never reported verified without a visible postcondition |
-| OCR | Windows.Media.Ocr | Snapshot-scoped | Words and rectangles returned with the screenshot |
-| Windows Graphics Capture | None | Not implemented | PrintWindow is used instead |
+| Status, ports, driver identity | Broker / WinMM / hello | live_validated | contract version, build ID, epoch, feature flags |
+| Key Command catalog (69 categories; count per installation) | Generated command bindings | implemented | A binding exists; execution is `Unverified` (no declared postcondition). Unclassified commands require confirmation. Selection-dependent commands need a target guard. |
+| Play / stop / record / cycle / metronome | Transport bindings + callbacks | live_validated | Fresh callback newer than the dispatch; toggles refused while state unknown; record needs confirmation. Record, cycle and metronome are latched presses released on the next idle tick. `record_stop` ends recording; Cubase keeps playing until `stop` |
+| Tempo | Time display | live_validated | Fresh BPM within 0.01 |
+| Position / locators | Time display | mock_validated | `position_text` in the host's reported `time_format`; other formats `UNSUPPORTED_TIME_FORMAT`. A time already at the target in the host's spelling (`1. 1. 1.  0` for `1.1.1.0`) is confirmed by the read, since Cubase reports no change for it |
+| Track list | DirectAccess `VST Mixer` children | live_validated | Handles bind the unique ID string and object ID; `bank_truncated` beyond 256 channels |
+| Volume / pan / mute / solo / monitor / record enable | DirectAccess on the target channel | live_validated (volume, pan) | Fresh read of the same target (1e-4; MIDI-track volume/pan are 7-bit, half a step); audio/instrument pan lives on the `Panner` child; ambiguous/hidden/locked refused |
+| EQ, sends, strip, other channel parameters | DirectAccess `parameter_tag` within the target | mock_validated | Fresh read of the same object/tag |
+| Track delete / duplicate | Guarded Key Command | mock_validated (live: the selection-change refusal) | Identity guard in the driver callback; delete confirmed; observed disappearance / one new identity |
+| Track freeze / enable | Guarded Key Command | implemented | No host read-back: `Unverified` |
+| Track create (MIDI, instrument, audio) | Key Command + Add Track dialog (verified-foreground keyboard) | live_validated (MIDI, instrument) | One new identity with the requested name |
+| Track rename | Guarded Key Command + typed text | live_validated | Title of the planned identity |
+| Project open / save / save_as | Key Command + owned file dialog (Win32 controls) | live_validated | Title change / file change; overwrite bound to file identity; `FILE_EXISTS` / `FILE_CHANGED` |
+| WAV mixdown (PCM, stereo, 48 kHz, 24-bit, locator range) | Key Command + owned export dialog | unsupported on Cubase 15.0.10 | The export dialog exposes no controls; `WORKFLOW_CONTROL_MISSING` before anything is typed or started. The WAV validator (RIFF/fmt/data, length within max(20 ms, host latency)) stays for a host that exposes them |
+| Plug-in catalog (installed UIDs) | — | blocked_environment | The installed MIDI Remote API declares no plug-in enumeration; `PLUGIN_CATALOG_UNAVAILABLE` |
+| Plug-in slot assignment | API 1.3 `trySetSlotPlugin` | blocked_environment | Requires a catalog UID and UID read-back; title changes are never proof |
+| Plug-in parameters | DirectAccess | mock_validated | Fresh read |
+| MIDI composition documents, SMF import/export | `cubase_midi` | implemented (existing tests) | Validation and SMF round trip |
+| MIDI import into Cubase | SMF + Key Command + owned file dialog | live_validated (`targets_observed`) | `targets_observed` at best automatically (reported `Unverified`); `content_roundtrip_verified` via `compare_file` |
+| Batch | Broker | live_validated | Planned children, one approval, dependency-aware stop, journaled prefix, read-only resume plan |
+| Cubase dialogs via `cubase_ui_*` | UI Automation / guarded input | best_effort | Always `Unverified`; re-inspect |
+| Custom-rendered plug-in GUIs | OCR + guarded input | best_effort | Never reported verified |
+| Windows Graphics Capture | — | unsupported | PrintWindow is used |
+| Existing .cpr note editing, Note Expression, Expression Maps | — | unsupported | Out of scope |
 
-“Dynamic” means the server supports whatever the current Cubase object tree exposes rather than maintaining a hard-coded plugin-specific schema. `cubase://capabilities` is the machine-readable coverage ledger: `classified_commands` counts the Key Commands that matched an explicit risk rule, and `unclassified_commands` counts the ones that fall through to the default `Low` risk and still need review. A third-party plugin can still expose zero automatable parameters, fail to load, or render a control whose state cannot be observed; those cases remain `best_effort` rather than being mislabeled as fully verified.
-
-MIDI composition uses PPQ Standard MIDI Files rather than editing `.cpr` binaries. Format 0 and 1 files are supported. SMPTE-division files, VST Note Expression, Expression Maps, Chord Track voicings and other Cubase-proprietary event types remain accessible through Cubase commands/UI but are not serialized as native structured `cubase_midi` events.
+MIDI Remote API 1.3 features (`canPerform`, extended parameter metadata, plug-in manager) are feature-detected; Cubase 15.0.10 (API 1.2) reports them unavailable without failing driver load. API 1.2 compatibility and API 1.3 full-workflow validation are separate profiles.

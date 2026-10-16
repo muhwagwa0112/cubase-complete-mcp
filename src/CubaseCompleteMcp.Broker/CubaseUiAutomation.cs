@@ -14,7 +14,7 @@ using Windows.Storage;
 
 namespace CubaseCompleteMcp.Broker;
 
-public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, CubasePaths paths)
+public sealed partial class CubaseUiAutomation(CubaseProcessInspector processInspector, CubasePaths paths) : IWorkflowUi
 {
     private readonly ConcurrentDictionary<string, UiToken> _tokens = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, UiSnapshot> _snapshots = new(StringComparer.Ordinal);
@@ -23,6 +23,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     {
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) return false;
+        if (NativeFileDialog(process.ProcessId.Value, midiImportOnly: false).Handle != IntPtr.Zero) return true;
         try { return FindFileDialog(CreateTarget(process)) is not null; }
         catch (Exception ex) when (IsUnavailableElement(ex)) { return false; }
     }
@@ -31,6 +32,7 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
     {
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) return false;
+        if (NativeFileDialog(process.ProcessId.Value, midiImportOnly: true).Handle != IntPtr.Zero) return true;
         try { return FindMidiImportFileDialog(CreateTarget(process)) is not null; }
         catch (Exception ex) when (IsUnavailableElement(ex)) { return false; }
     }
@@ -119,7 +121,8 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         {
             cancellationToken.ThrowIfCancellationRequested();
             var currentTarget = RefreshTarget(target);
-            if (FindMidiImportFileDialog(currentTarget) is not null
+            if (NativeFileDialog(currentTarget.ProcessId, midiImportOnly: true).Handle != IntPtr.Zero
+                || FindMidiImportFileDialog(currentTarget) is not null
                 || FindMidiImportProjectChoice(currentTarget) is not null)
             {
                 return new JsonObject
@@ -187,6 +190,10 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
         var process = processInspector.Inspect();
         if (!process.Running || process.ProcessId is null) throw new InvalidOperationException("Cubase is not running.");
         var target = CreateTarget(process);
+        // Native path first: live on Cubase 15.0.10 the common dialog's controls are not usable through UI Automation,
+        // while the Win32 file-name field and IDOK button are (see CubaseUiAutomation.Workflows.cs).
+        var native = await SubmitMidiFileDialogNativeAsync(target, absolutePath, cancellationToken).ConfigureAwait(false);
+        if (native is not null) return native;
         Exception? unavailable = null;
         for (var attempt = 0; attempt < 40; attempt++)
         {
@@ -291,7 +298,8 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
             var currentTarget = RefreshTarget(target);
             if (FindMidiImportProjectChoice(currentTarget) is not null)
                 return new JsonObject { ["stage"] = "project_choice", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
-            if (FindMidiImportFileDialog(currentTarget) is not null)
+            if (NativeFileDialog(currentTarget.ProcessId, midiImportOnly: true).Handle != IntPtr.Zero
+                || FindMidiImportFileDialog(currentTarget) is not null)
                 return new JsonObject { ["stage"] = "midi_file_dialog", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
             if (FindImportOptionsDialog(currentTarget) is not null)
                 return new JsonObject { ["stage"] = "import_options", ["elapsed_ms"] = stopwatch.ElapsedMilliseconds };
@@ -1011,6 +1019,27 @@ public sealed class CubaseUiAutomation(CubaseProcessInspector processInspector, 
             output.Add(new JsonObject { ["error"] = error.Message });
         }
         return output;
+    }
+
+    public bool IsInputTargetValid(JsonObject arguments, string clientSessionId, out string reason)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (arguments["element_token"]?.GetValue<string>() is { Length: > 0 } tokenValue)
+        {
+            var ok = _tokens.TryGetValue(tokenValue, out var token) && token.ExpiresAt >= now
+                && token.ClientSessionId.Equals(clientSessionId, StringComparison.Ordinal);
+            reason = ok ? string.Empty : "The UI element token is unknown, expired, used, or belongs to another client session.";
+            return ok;
+        }
+        if (arguments["snapshot_id"]?.GetValue<string>() is { Length: > 0 } snapshotValue)
+        {
+            var ok = _snapshots.TryGetValue(snapshotValue, out var snapshot) && snapshot.ExpiresAt >= now
+                && snapshot.ClientSessionId.Equals(clientSessionId, StringComparison.Ordinal);
+            reason = ok ? string.Empty : "The UI snapshot is unknown, expired, already used, or belongs to another client session.";
+            return ok;
+        }
+        reason = "element_token or snapshot_id is required.";
+        return false;
     }
 
     public JsonObject Invoke(JsonObject arguments, string clientSessionId)

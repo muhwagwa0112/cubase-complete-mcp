@@ -3,11 +3,36 @@ using System.IO.Pipes;
 
 namespace CubaseCompleteMcp.Core;
 
+/// <summary>
+/// Single-connection pipe client. A request moves through <c>NotSent → Sending → WaitingForResponse → Completed</c>.
+/// Once the first byte may have left, a lost connection, timeout or cancellation makes the outcome of a write
+/// unknowable, so writes are never re-sent: they return <see cref="ErrorCodes.OutcomeUnknown"/>. Only stateless
+/// diagnostic reads get one retry on a fresh connection, because every other request depends on the broker-side
+/// client session (confirmations, target handles, compositions) that belonged to the lost connection.
+/// </summary>
 public sealed class BrokerClient : IAsyncDisposable
 {
+    public enum RequestPhase { NotSent, Sending, WaitingForResponse, Completed }
+
     private readonly SemaphoreSlim _gate = new(1, 1);
-    private readonly BuildIdentity _identity = BuildIdentityService.Current();
-    private NamedPipeClientStream? _pipe;
+    private readonly BuildIdentity _identity;
+    private readonly Func<CancellationToken, Task<Stream>> _connect;
+    private Stream? _stream;
+
+    public BrokerClient() : this(ConnectToBrokerAsync, BuildIdentityService.Current())
+    {
+    }
+
+    public BrokerClient(Func<CancellationToken, Task<Stream>> connect, BuildIdentity identity)
+    {
+        _connect = connect;
+        _identity = identity;
+    }
+
+    /// <summary>Incremented whenever a new pipe connection (and therefore a new broker client session) is opened.</summary>
+    public long ConnectionGeneration { get; private set; }
+
+    public RequestPhase LastRequestPhase { get; private set; }
 
     public async Task<BrokerResponse> SendAsync(BrokerRequest request, CancellationToken cancellationToken = default)
     {
@@ -19,21 +44,26 @@ public sealed class BrokerClient : IAsyncDisposable
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
-            try
+            var first = await TrySendOnceAsync(request, cancellationToken).ConfigureAwait(false);
+            if (first.Response is not null) return first.Response;
+            var error = first.Error!;
+            if (first.Phase == RequestPhase.NotSent)
+                return NotDispatched(request, error);
+            if (OperationReplayPolicy.IsStatelessDiagnosticRead(request) && !cancellationToken.IsCancellationRequested)
             {
-                await PipeProtocol.WriteAsync(_pipe!, request, cancellationToken).ConfigureAwait(false);
-                return await PipeProtocol.ReadAsync<BrokerResponse>(_pipe!, cancellationToken).ConfigureAwait(false)
-                    ?? throw new EndOfStreamException("Cubase broker closed the connection without a response.");
+                var retry = await TrySendOnceAsync(request, cancellationToken).ConfigureAwait(false);
+                if (retry.Response is not null) return retry.Response;
+                return BrokerResponse.Failure(request.Id, ResultStatus.Error, "BROKER_UNAVAILABLE",
+                    $"The broker connection was lost twice while reading '{request.Operation}': {retry.Error!.Message}",
+                    executionState: ExecutionState.NotApplicable, retryable: true);
             }
-            catch (IOException)
-            {
-                await ResetAsync().ConfigureAwait(false);
-                await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
-                await PipeProtocol.WriteAsync(_pipe!, request, cancellationToken).ConfigureAwait(false);
-                return await PipeProtocol.ReadAsync<BrokerResponse>(_pipe!, cancellationToken).ConfigureAwait(false)
-                    ?? throw new EndOfStreamException("Cubase broker closed the retried connection without a response.");
-            }
+            if (OperationReplayPolicy.IsProvablyReadOnly(request))
+                return BrokerResponse.Failure(request.Id, ResultStatus.Error, ErrorCodes.ClientSessionLost,
+                    $"The broker connection was lost while reading '{request.Operation}'. Session-scoped reads are not re-sent on a new connection because targets, confirmations and documents belonged to the lost session.",
+                    executionState: ExecutionState.NotStarted);
+            return BrokerResponse.OutcomeUnknown(request.Id,
+                $"The broker connection was lost after '{request.Operation}' was sent ({error.GetType().Name}: {error.Message}). The change was not re-sent.",
+                path: "broker_pipe") with { OperationId = request.OperationId };
         }
         finally
         {
@@ -41,37 +71,74 @@ public sealed class BrokerClient : IAsyncDisposable
         }
     }
 
-    private async Task EnsureConnectedAsync(CancellationToken cancellationToken)
+    private async Task<(BrokerResponse? Response, Exception? Error, RequestPhase Phase)> TrySendOnceAsync(
+        BrokerRequest request, CancellationToken cancellationToken)
     {
-        if (_pipe?.IsConnected == true)
-        {
-            return;
-        }
-
-        _pipe = CreatePipe();
+        LastRequestPhase = RequestPhase.NotSent;
         try
         {
-            await _pipe.ConnectAsync(300, cancellationToken).ConfigureAwait(false);
+            await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
+            LastRequestPhase = RequestPhase.Sending; // before any byte can leave
+            await PipeProtocol.WriteAsync(_stream!, request, cancellationToken).ConfigureAwait(false);
+            LastRequestPhase = RequestPhase.WaitingForResponse;
+            var response = await PipeProtocol.ReadAsync<BrokerResponse>(_stream!, cancellationToken).ConfigureAwait(false)
+                ?? throw new EndOfStreamException("Cubase broker closed the connection without a response.");
+            if (!string.Equals(response.Id, request.Id, StringComparison.Ordinal))
+                throw new InvalidDataException($"Broker response id '{response.Id}' does not match request '{request.Id}'.");
+            LastRequestPhase = RequestPhase.Completed;
+            return (response, null, RequestPhase.Completed);
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            // Any failure leaves the pipe at an undefined position (a late response could be read as the answer
+            // to the next request), so the connection is always discarded.
+            var phase = LastRequestPhase;
+            await ResetAsync().ConfigureAwait(false);
+            return (null, error, phase);
+        }
+    }
+
+    private static BrokerResponse NotDispatched(BrokerRequest request, Exception error) =>
+        error is OperationCanceledException
+            ? BrokerResponse.Failure(request.Id, ResultStatus.Error, ErrorCodes.Cancelled,
+                "The request was cancelled before it was sent to the broker.") with { OperationId = request.OperationId }
+            : BrokerResponse.Failure(request.Id, ResultStatus.Offline, "BROKER_UNAVAILABLE",
+                $"The Cubase broker could not be reached; nothing was sent. {error.Message}", retryable: true)
+                with { OperationId = request.OperationId };
+
+    private async Task EnsureConnectedAsync(CancellationToken cancellationToken)
+    {
+        if (_stream is NamedPipeClientStream { IsConnected: true } || _stream is not null and not NamedPipeClientStream)
             return;
+        await ResetAsync().ConfigureAwait(false);
+        _stream = await _connect(cancellationToken).ConfigureAwait(false);
+        ConnectionGeneration++;
+    }
+
+    private static async Task<Stream> ConnectToBrokerAsync(CancellationToken cancellationToken)
+    {
+        var pipe = CreatePipe();
+        try
+        {
+            await pipe.ConnectAsync(300, cancellationToken).ConfigureAwait(false);
+            return pipe;
         }
         catch (TimeoutException)
         {
-            await _pipe.DisposeAsync().ConfigureAwait(false);
-            _pipe = null;
+            await pipe.DisposeAsync().ConfigureAwait(false);
         }
 
         StartBroker();
-        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(8);
+        var deadline = Stopwatch.StartNew();
         Exception? lastError = null;
-        while (DateTimeOffset.UtcNow < deadline)
+        while (deadline.Elapsed < TimeSpan.FromSeconds(8))
         {
             cancellationToken.ThrowIfCancellationRequested();
             var candidate = CreatePipe();
             try
             {
                 await candidate.ConnectAsync(500, cancellationToken).ConfigureAwait(false);
-                _pipe = candidate;
-                return;
+                return candidate;
             }
             catch (Exception error) when (error is TimeoutException or IOException)
             {
@@ -118,10 +185,11 @@ public sealed class BrokerClient : IAsyncDisposable
 
     private async Task ResetAsync()
     {
-        if (_pipe is not null)
+        if (_stream is not null)
         {
-            await _pipe.DisposeAsync().ConfigureAwait(false);
-            _pipe = null;
+            try { await _stream.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception error) when (error is IOException or ObjectDisposedException) { }
+            _stream = null;
         }
     }
 

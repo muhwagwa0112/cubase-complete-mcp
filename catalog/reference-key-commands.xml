@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Reference Key Commands catalog for the source release driver. It lists only the commands the broker
+     binds by name, so the release driver build ID is reproducible. Installations generate their driver from
+     the local Cubase Key Commands.xml instead (see the installation receipt). -->
+<preferences><list name="Categories">
+<item><string name="Name" value="Transport"/><list name="Commands">
+<item><string name="Name" value="Start"/></item>
+<item><string name="Name" value="Stop"/></item>
+<item><string name="Name" value="Record"/></item>
+<item><string name="Name" value="Cycle"/></item>
+<item><string name="Name" value="Metronome On"/></item>
+<item><string name="Name" value="Return to Zero"/></item>
+</list></item>
+<item><string name="Name" value="AddTrack"/><list name="Commands">
+<item><string name="Name" value="Audio"/></item>
+<item><string name="Name" value="Instrument"/></item>
+<item><string name="Name" value="MIDI"/></item>
+<item><string name="Name" value="Marker"/></item>
+<item><string name="Name" value="Folder"/></item>
+</list></item>
+<item><string name="Name" value="Edit"/><list name="Commands">
+<item><string name="Name" value="Rename First Selected Track"/></item>
+<item><string name="Name" value="Freeze/Unfreeze Selected Tracks"/></item>
+<item><string name="Name" value="Undo"/></item>
+<item><string name="Name" value="Redo"/></item>
+</list></item>
+<item><string name="Name" value="Project"/><list name="Commands">
+<item><string name="Name" value="Remove Selected Tracks"/></item>
+<item><string name="Name" value="Duplicate Tracks"/></item>
+</list></item>
+<item><string name="Name" value="Audio"/><list name="Commands">
+<item><string name="Name" value="Disable/Enable Track"/></item>
+</list></item>
+<item><string name="Name" value="File"/><list name="Commands">
+<item><string name="Name" value="New"/></item>
+<item><string name="Name" value="Open"/></item>
+<item><string name="Name" value="Close"/></item>
+<item><string name="Name" value="Save"/></item>
+<item><string name="Name" value="Save As"/></item>
+<item><string name="Name" value="Export Audio Mixdown"/></item>
+<item><string name="Name" value="Import MIDI File"/></item>
+<item><string name="Name" value="Export MIDI File"/></item>
+<item><string name="Name" value="Import Audio File"/></item>
+</list></item>
+</list></preferences>

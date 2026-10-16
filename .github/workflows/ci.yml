@@ -1,0 +1,69 @@
+# Windows build, offline contract tests and release-manifest validation.
+# Real Cubase is not available on hosted runners: live gates (G06-G08) are never run or reported here.
+# Action revisions are pinned to the commit SHAs of the named upstream release tags (resolved 2026-09-28).
+name: ci
+
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      DOTNET_NOLOGO: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.11.1'
+      - name: Record toolchain
+        shell: pwsh
+        run: |
+          dotnet --version
+          node --version
+          git rev-parse HEAD
+      - name: Restore (locked)
+        run: dotnet restore CubaseCompleteMcp.sln --locked-mode
+      - name: Build
+        run: dotnet build CubaseCompleteMcp.sln -c Release --no-restore
+      - name: Test
+        shell: pwsh
+        env:
+          DOTNET_CLI_UI_LANGUAGE: en
+        run: |
+          dotnet test CubaseCompleteMcp.sln -c Release --no-build --logger "trx" --results-directory test-results
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Required tests must run: every test project needs a TRX with executed == passed == total > 0.
+          $projects = @(Get-ChildItem -Path tests -Filter '*.csproj' -Recurse).Count
+          $trx = @(Get-ChildItem -Path test-results -Filter '*.trx')
+          if ($trx.Count -ne $projects) { Write-Error "Expected $projects TRX files, found $($trx.Count)"; exit 1 }
+          foreach ($file in $trx) {
+            $counters = ([xml](Get-Content -LiteralPath $file.FullName -Raw)).TestRun.ResultSummary.Counters
+            if ([int]$counters.total -eq 0) { Write-Error "Zero tests: $($file.Name)"; exit 1 }
+            if ([int]$counters.notExecuted -gt 0 -or [int]$counters.executed -ne [int]$counters.total) { Write-Error "Skipped tests: $($file.Name)"; exit 1 }
+          }
+      - name: Publish and validate release payload
+        shell: pwsh
+        run: ./scripts/publish.ps1 -Output "$env:RUNNER_TEMP/release" -LogDirectory "$env:RUNNER_TEMP/release-logs" -AllowDirty:$false
+      - name: Upload test results and manifest
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-evidence
+          path: |
+            test-results/**/*.trx
+            ${{ runner.temp }}/release/*/release-manifest.json
+          if-no-files-found: error

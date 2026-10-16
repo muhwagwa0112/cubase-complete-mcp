@@ -2,23 +2,44 @@
 
 `Cubase Complete MCP` is a local, Windows-only MCP server for Cubase 15. It exposes a compact set of MCP tools instead of one tool per Key Command and routes all Cubase ownership through a single per-user broker.
 
-## Current implementation
+## Status of this version (pipe protocol 2, driver contract 2)
 
-- Official `ModelContextProtocol` C# SDK 1.4.0 over stdio.
-- .NET SDK 8.0.301 pinned by `global.json`; NuGet lock files are committed.
-- Current-user-only `\\.\pipe\CubaseCompleteMcp.v1`, singleton broker mutex, concurrent client sessions and five-minute idle shutdown.
-- WinMM SysEx v2 transport with 7-bit packing, CRC32, chunks, request/session IDs, nonce handshake, bounded retries, duplicate suppression, stale-session rejection and backpressure limits.
-- Generated ES5 MIDI Remote driver with the locally extracted 69 categories / 2,777 Key Commands.
-- DirectAccess traversal and parameter writes, v1.3 feature detection for parameter metadata, command `canPerform`, and plugin slot assignment.
-- Complete capability registry that classifies every extracted command plus all DirectAccess roots and UI input actions.
-- Session-isolated structured MIDI composition documents with deterministic Standard MIDI File generation and Cubase import.
-- Cubase-PID-scoped UI Automation, OCR-backed snapshot coordinates, guarded click/drag/scroll/key/text `SendInput`, single-use session tokens, and an explicit caller-owned post-action reinspection contract.
-- Manifest-backed backup/restore, setup, diagnostics, driver generation and Codex registration CLI.
-- Manifest-and-SHA-256-validated timestamped Releases plus a two-step confirmation CLI for stale composition-session cleanup.
-- Broker-managed loopMIDI recovery: when the required ports are absent and loopMIDI is not running, the standard installation is product-checked, started once, and polled for up to eight seconds. Set `CUBASE_COMPLETE_MCP_AUTO_START_LOOPMIDI=0` to opt out.
-- Pipe protocol and Release identity diagnostics. Compatible mixed Releases continue with an explicit warning; incompatible pipe protocol versions are rejected.
+What is implemented and how far it has been validated is stated per area in the [capability matrix](docs/capability-matrix.md). In short:
 
-Cubase 15.0.10 is supported through the v1.2 DirectAccess and command-execution baseline. Cubase 15.0.20 or later is required for v1.3 command `canPerform`, extended parameter metadata, and plugin-slot assignment. On older builds those specific paths are feature-detected and reported as unavailable rather than failing driver load. Custom-rendered third-party plugin GUIs remain `best_effort`; the server does not claim that UI as fully supported when neither DirectAccess nor UI Automation exposes it.
+- **Offline-validated** (unit, fake-host and generated-driver tests, Windows build): session isolation, no automatic resend of changes, execution journal, target handles, approvals bound to targets/files, mutation serialization, observed postconditions, batch contract, release integrity.
+- **Validated on a live Cubase 15.0.10 fixture** (owned acceptance project, 2026-09-28; re-run on candidate 8079732 on 2026-10-16 with every live pass accepted by the gate evaluator): driver load and build identity, transport (play/stop/tempo/cycle/metronome, a 2 s recording with no physical input), track list and identities, track create (MIDI, instrument) and rename, target-bound mixer writes (another channel unchanged; pan on instrument channels through their Panner child), two concurrent clients, project save/save-as/open, MIDI import up to `targets_observed`, the selection-change refusal and batch failure/resubmission. Driver reconnect was exercised only through project switches (the driver page re-activates; reads retry once after the new handshake).
+- **Not supported on Cubase 15.0.10**: WAV mixdown export. The Export Audio Mixdown dialog exposes no addressable controls, so the workflow stops with `WORKFLOW_CONTROL_MISSING` before typing or starting anything.
+- **Blocked by the environment**: plug-in catalog/UID verification (the installed MIDI Remote API declares no plug-in enumeration or UID read-back) and all MIDI Remote API 1.3 features on Cubase 15.0.10.
+
+Nothing in this repository claims a live Cubase run that has not happened. The finalization evidence and final report describe exactly which gates passed.
+
+## Result semantics
+
+Every tool result has `status` and `execution_state`:
+
+| status | execution_state | meaning |
+|---|---|---|
+| `Ok` | `applied` / `not_applied` / `not_applicable` | The declared postcondition was observed by a fresh host read (`not_applied`: already satisfied, nothing sent). |
+| `Unverified` | `applied` | The change was observed, but the full postcondition could not be proven. |
+| `Unverified` | `unknown` + `OUTCOME_UNKNOWN` | The change may have reached Cubase and its effect is unknown. **It is never re-sent automatically; read state before deciding.** |
+| `RequiresConfirmation` | `not_started` | Nothing changed. Commit the identical request with `confirmation_id`. |
+| `Error` / `Offline` / `Unsupported` | usually `not_started` | Refused or failed; partial batch results keep `partially_applied`. |
+
+## Migration from protocol 1
+
+- Pipe name `\\.\pipe\CubaseCompleteMcp.v2`, broker mutex `Local\CubaseCompleteMcp.Broker.v2`. A protocol-1 broker is neither reused nor terminated; old clients are refused with `BROKER_PROTOCOL_MISMATCH`.
+- The MIDI wire framing stays version 2; the driver now declares `driver_contract_version = 2` and a `driver_build_id` in its hello. Writes are refused (`DRIVER_CONTRACT_MISMATCH`) until the new driver is installed (`setup`) and Cubase reloads it.
+- `track_id` on `cubase_track` / `cubase_mixer` (a 0–63 bank slot in protocol 1) is rejected with `LEGACY_TARGET_AMBIGUOUS`. Use `target_handle` from `cubase_track action=list`, `bank_index`, or `target_scope=selected`. `cubase_midi`'s `track_id` is a composition document ID and is unchanged.
+- `cubase_transport` positions use `position_text` + `time_format` (the host's primary time display format); the numeric `value` field is gone.
+- All changing tools accept `operation_id` (UUID). The server issues one when omitted and returns it; a confirmation commit reuses the ID stored with the approved plan. Re-sending the same ID and plan returns the recorded result without re-executing; a different plan under the same ID is `IDEMPOTENCY_CONFLICT`.
+- `cubase_batch` exposes `continue_on_unverified` (default false), `timeout_ms` (≤ 180000), `depends_on` per item and `resume_operation_id` (read-only resume plan). Counts are `requested/evaluated/dispatched/applied/verified/unverified/failed/not_started`; `executed` is a legacy alias of `dispatched_count`.
+- Raw Key Commands that no explicit rule classifies now require confirmation (`effective_risk = Confirm`).
+- `cubase_diagnostics action=operation_status operation_id=...` reads the journal entry of an operation owned by the same client session.
+- Release manifests are schema 2 and list the complete payload; registration and smoke tests take an explicit `--release <dir>`.
+
+## Architecture in one paragraph
+
+stdio MCP server → current-user named pipe (protocol 2) → singleton broker → (a) WinMM SysEx to the generated ES5 MIDI Remote driver, (b) Cubase-owned dialogs through their Win32 controls (file dialogs), verified-foreground keyboard input (Add Track) and OCR of question boxes (project activation), with UI Automation as a fallback. The broker normalizes every request, plans it (targets, file identities, preconditions), gets approval when needed without holding the mutation lease, then re-plans under the lease, journals `dispatching`, dispatches once and observes. See [architecture](docs/architecture.md).
 
 ## Build and test
 
@@ -26,45 +47,37 @@ Cubase 15.0.10 is supported through the v1.2 DirectAccess and command-execution 
 dotnet restore CubaseCompleteMcp.sln --locked-mode
 dotnet build CubaseCompleteMcp.sln -c Release --no-restore
 dotnet test CubaseCompleteMcp.sln -c Release --no-build
-powershell -ExecutionPolicy Bypass -File .\scripts\publish.ps1
-node .\scripts\smoke-mcp.mjs
-# With Cubase open on a disposable project:
-node .\scripts\smoke-live.mjs
-# Include composition rendering and a real File > Import > MIDI File round trip:
-$env:CBMCP_TEST_MIDI_IMPORT = '1'; node .\scripts\smoke-live.mjs
 ```
 
-`publish.ps1` writes `release-manifest.json` with the Git SHA, dirty-worktree flag, SDK version and hashes of the Server, Broker, Core and CLI. `register-codex` ignores flat or manifest-less artifacts; use `--allow-debug` only for an explicit development registration.
+Node.js is a required test dependency (the generated driver runs in a Node `vm` mock host). Missing Node fails the test run with an explicit reason.
+
+```powershell
+# Clean tree only; stages, validates and atomically publishes <output>/<release-id>/
+powershell -ExecutionPolicy Bypass -File .\scripts\publish.ps1 -Output C:\cbmcp-releases
+node .\scripts\smoke-mcp.mjs --release C:\cbmcp-releases\<release-id>
+CubaseCompleteMcp.Cli.exe register-codex --release C:\cbmcp-releases\<release-id> --validate-only
+```
+
+`scripts/live-acceptance.mjs` is the live fixture harness. It refuses to run without an authorization file granting live fixture mutation and a fixture directory it created itself; see [live acceptance](docs/live-acceptance.md).
 
 ## Safe installation order
 
-1. Run `CubaseCompleteMcp.Cli.exe backup pre-setup`.
+1. `CubaseCompleteMcp.Cli.exe backup pre-setup`
 2. Close Cubase.
-3. Run `CubaseCompleteMcp.Cli.exe setup` to install the driver alongside the legacy driver.
-4. Start Cubase and open a disposable project. The Broker starts loopMIDI when needed; if Cubase was already running before the ports appeared, `doctor` may report `cubase_restart_required` rather than restarting Cubase automatically.
-5. Run `CubaseCompleteMcp.Cli.exe doctor` and `node .\scripts\smoke-live.mjs`.
-6. Run `CubaseCompleteMcp.Cli.exe register-codex`.
-7. Optionally update Cubase to 15.0.20 or later when v1.3-only features are needed. Back up first and rerun the live smoke afterward.
-8. Run `setup --deactivate-legacy` only after separately deciding to retire the legacy driver; it is not required for side-by-side use.
+3. `CubaseCompleteMcp.Cli.exe setup` installs the driver generated from the local Key Commands and writes an installation receipt (catalog input hash, installed driver/catalog hashes, expected build ID).
+4. Start Cubase with a disposable project, then `CubaseCompleteMcp.Cli.exe doctor --release <dir>` compares the loaded driver build ID with the receipt.
+5. `CubaseCompleteMcp.Cli.exe register-codex --release <dir>` (backs up the previous registration first).
 
-`setup` refuses to touch MIDI Remote files while Cubase is running. It creates a new backup and automatically restores it if installation fails. It never changes VST junctions and never edits `.cpr` files.
+`setup` refuses to run while Cubase is running, backs up first and restores on failure. Nothing edits `.cpr` files, injects DLLs, changes VST junctions or exposes HTTP.
 
 ## MCP tools and resources
 
-Tools: `cubase_status`, `cubase_capability_search`, `cubase_command`, `cubase_transport`, `cubase_track`, `cubase_mixer`, `cubase_plugin`, `cubase_direct`, `cubase_midi`, `cubase_project`, `cubase_ui_inspect`, `cubase_ui_invoke`, `cubase_batch`, and `cubase_diagnostics`.
+Tools: `cubase_status`, `cubase_capability_search`, `cubase_command`, `cubase_transport`, `cubase_track`, `cubase_mixer`, `cubase_plugin`, `cubase_direct`, `cubase_midi`, `cubase_project`, `cubase_ui_inspect`, `cubase_ui_invoke`, `cubase_batch`, `cubase_diagnostics`.
 
-Resources: `cubase://state`, `cubase://capabilities`, `cubase://commands`, and `cubase://events`.
+Resources: `cubase://state`, `cubase://capabilities`, `cubase://commands`, `cubase://events`.
 
-`cubase_midi` creates tracks/parts, notes, chords, drum patterns, CC, pitch bend, channel/poly pressure, program changes, tempo/time/key signatures, markers, lyrics, raw meta/SysEx, quantize, transpose, deterministic humanize, range replacement, SMF import/export, and `import_to_cubase`. See [MIDI composition](docs/midi-composition.md) for schemas and examples.
+The Key Command catalog is generated from the local `Key Commands.xml` (69 categories; the count depends on the installation). A catalog entry means a binding exists, not that its effect was verified.
 
-Destructive commands and all arbitrary UI inputs return `RequiresConfirmation` and a short-lived `confirmation_id`. Re-submit the exact same operation and arguments with that ID to commit it. IDs and UI snapshots are session-bound and single-use; a mismatched retry is rejected without burning the approval. MIDI document/track/part deletion, range replacement, and explicit file overwrite use the same confirmation flow. `cubase://capabilities` contains the full command catalog, the four DirectAccess roots, the complete UI action vocabulary, and all MIDI composition actions; `classified_commands` counts the Key Commands that matched an explicit risk rule, and `unclassified_commands` counts the ones that still fall through to the default `Low` risk and need review.
+MIDI composition: see [MIDI composition](docs/midi-composition.md), including import verification levels (`submitted`, `targets_observed`, `parts_observed`, `content_roundtrip_verified`).
 
-`cubase_ui_invoke` always returns `Unverified` after delivering an input. Its snapshot is consumed, so call `cubase_ui_inspect` again and verify the resulting Cubase state from a fresh snapshot.
-
-`cubase_status` reports loopMIDI installation/process/autostart state, configured and observed ports, client/Broker Release IDs, and a normalized connection state. Track listing remains strictly `Offline` while CompleteBridge is offline; it does not substitute a partial OCR list.
-
-MIDI import executes the command once, waits for each Cubase dialog stage, and permits at most one menu fallback. A file picker is closed only after all matching MIDI dialogs remain absent for three checks. Track names are then polled through DirectAccess and project OCR for up to ten seconds; graph changes alone never verify an import.
-
-To permanently remove only stale session-scoped composition documents and renders, first preview with `cleanup-sessions --older-than-days <N>`, then repeat the same age with the returned `--confirmation-id`. The proposal expires after five minutes and cleanup refuses to run while the broker is active.
-
-See [architecture](docs/architecture.md) and the [capability matrix](docs/capability-matrix.md).
+To remove stale session-scoped composition documents, preview with `cleanup-sessions --older-than-days <N>` and repeat with the returned `--confirmation-id`.

@@ -10,7 +10,10 @@ public sealed record DriverGenerationResult(
     int CommandCount,
     int CategoryCount,
     string DriverSha256,
-    string CatalogSha256);
+    string CatalogSha256,
+    string DriverBuildId = "",
+    string CatalogInputSha256 = "",
+    string GeneratorSourceSha = "");
 
 public sealed class MidiRemoteDriverGenerator
 {
@@ -23,7 +26,31 @@ public sealed class MidiRemoteDriverGenerator
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
 
-    public DriverGenerationResult Generate(KeyCommandCatalog catalog, string outputDirectory)
+    /// <summary>
+    /// SHA-256 over the ordered command list (id, category, name, index). This is the catalog input that, with
+    /// the generator source revision and the driver contract version, determines the driver build ID.
+    /// </summary>
+    public static string CatalogInputSha256(KeyCommandCatalog catalog)
+    {
+        var builder = new StringBuilder();
+        foreach (var command in catalog.Commands)
+            builder.Append(command.Id).Append('\t').Append(command.Category).Append('\t').Append(command.Name)
+                .Append('\t').Append(command.Index).Append('\n');
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(builder.ToString())))
+            .ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// Deterministic build ID: SHA-256(generator source SHA, catalog input SHA, driver contract version). It is not a
+    /// hash of the script itself, so the script can embed it without a self-reference.
+    /// </summary>
+    public static string ComputeDriverBuildId(string generatorSourceSha, string catalogInputSha256) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(
+            generatorSourceSha + "\n" + catalogInputSha256 + "\n" + CubaseConstants.DriverContractVersion)))
+            .ToLowerInvariant();
+
+    public DriverGenerationResult Generate(KeyCommandCatalog catalog, string outputDirectory,
+        string generatorSourceSha = "unversioned")
     {
         ArgumentNullException.ThrowIfNull(catalog);
         ArgumentException.ThrowIfNullOrWhiteSpace(outputDirectory);
@@ -31,13 +58,19 @@ public sealed class MidiRemoteDriverGenerator
 
         var driverPath = Path.Combine(outputDirectory, DriverFileName);
         var catalogPath = Path.Combine(outputDirectory, CatalogFileName);
-        var script = BuildScript(catalog);
+        var catalogInput = CatalogInputSha256(catalog);
+        var buildId = ComputeDriverBuildId(generatorSourceSha, catalogInput);
+        var script = BuildScript(catalog, buildId);
         File.WriteAllText(driverPath, script, new UTF8Encoding(false));
 
         var manifest = new
         {
-            schema_version = 1,
-            protocol_version = 2,
+            schema_version = 2,
+            protocol_version = CubaseConstants.MidiWireProtocolVersion,
+            driver_contract_version = CubaseConstants.DriverContractVersion,
+            driver_build_id = buildId,
+            catalog_input_sha256 = catalogInput,
+            generator_source_sha = generatorSourceSha,
             vendor = CubaseConstants.DeviceVendor,
             device = CubaseConstants.DeviceName,
             input_port = CubaseConstants.InputPortName,
@@ -60,10 +93,13 @@ public sealed class MidiRemoteDriverGenerator
             catalog.Commands.Count,
             catalog.CategoryCount,
             HashFile(driverPath),
-            HashFile(catalogPath));
+            HashFile(catalogPath),
+            buildId,
+            catalogInput,
+            generatorSourceSha);
     }
 
-    public string BuildScript(KeyCommandCatalog catalog)
+    public string BuildScript(KeyCommandCatalog catalog, string driverBuildId = "unversioned")
     {
         ArgumentNullException.ThrowIfNull(catalog);
         var builder = new StringBuilder(512 * 1024);
@@ -72,8 +108,10 @@ public sealed class MidiRemoteDriverGenerator
         builder.AppendLine("'use strict';");
         builder.AppendLine("var midiremote_api = require('midiremote_api_v1');");
         builder.AppendLine();
-        builder.AppendLine("var DRIVER_VERSION = '0.1.0';");
+        builder.AppendLine("var DRIVER_VERSION = '0.2.0';");
         builder.AppendLine("var PROTOCOL_VERSION = 2;");
+        builder.AppendLine($"var DRIVER_CONTRACT_VERSION = {CubaseConstants.DriverContractVersion};");
+        builder.AppendLine($"var DRIVER_BUILD_ID = {Js(driverBuildId)};");
         builder.AppendLine($"var INPUT_PORT_NAME = {Js(CubaseConstants.InputPortName)};");
         builder.AppendLine($"var OUTPUT_PORT_NAME = {Js(CubaseConstants.OutputPortName)};");
         builder.AppendLine("var deviceDriver = midiremote_api.makeDeviceDriver('CBMCP', 'CompleteBridge', 'CBMCP');");
@@ -112,7 +150,7 @@ var KIND = {request: 1, response: 2, event: 3, ack: 4, nack: 5, heartbeat: 6};
 var OPCODE = {
     'system.hello': 1, 'system.heartbeat': 2, 'status.get': 10, 'capabilities.get': 11,
     'command.execute': 20, 'command.can_perform': 21, 'transport.get': 30, 'transport.set': 31,
-    'track.get': 40, 'track.set': 41, 'mixer.get': 50, 'mixer.set': 51,
+    'track.get': 40, 'track.set': 41, 'track.list': 42, 'mixer.get': 50, 'mixer.set': 51,
     'plugin.get': 60, 'plugin.set': 61, 'project.get': 70, 'project.set': 71,
     'direct.get': 80, 'direct.set': 81, 'state.event': 254, 'error': 255
 };
@@ -126,12 +164,18 @@ var PENDING_TIMEOUT_MS = 10000;
 var runtime = {
     active: false, device: null, mapping: null, sessionId: 0, sequence: 0, revision: 0,
     pendingChunks: {}, completed: {}, commandIds: [], commandValues: [], commandBindings: [], commandIndex: {},
-    directRoots: {}, mixRoots: {}, state: {
-        playing: null, recording: null, cycle: null, metronome: null, tempo: null,
-        position: '', leftLocator: '', rightLocator: '', selectedTrack: '',
-        volume: null, pan: null, mute: null, solo: null, monitor: null, recordEnable: null
-    }
+    directRoots: {}, mixRoots: {}, state: {}, stateRevision: {}, timeFormats: {}
 };
+function resetMirror() {
+    // Unknown until the host reports a value in the current activation; online does not mean 'false'.
+    runtime.state = {playing: null, recording: null, cycle: null, metronome: null, tempo: null,
+        position: null, leftLocator: null, rightLocator: null, selectedTrack: null,
+        volume: null, pan: null, mute: null, solo: null, monitor: null, recordEnable: null};
+    runtime.stateRevision = {};
+    runtime.timeFormats = {position: null, leftLocator: null, rightLocator: null};
+}
+resetMirror();
+function codedError(code, message, details) { var error = new Error(message); error.code = code; error.details = details || {}; return error; }
 
 function makeSessionId() {
     var value = ((new Date().getTime()) + Math.floor(Math.random() * 4294967295)) % 4294967295;
@@ -240,11 +284,12 @@ function acceptChunk(frame) {
     for (i = 0; i < pending.count; i += 1) { if (!pending.parts[i]) { return null; } Array.prototype.push.apply(joined, pending.parts[i]); if (joined.length > MAX_LOGICAL_BYTES) { delete runtime.pendingChunks[key]; throw new Error('payload too large'); } }
     delete runtime.pendingChunks[key]; frame.payload = joined; frame.chunkIndex = 0; frame.chunkCount = 1; return frame;
 }
-function cacheKey(frame) { return frame ? frame.sessionId + ':' + frame.requestId + ':' + frame.opcode : ''; }
-function remember(frame, kind, envelope) { var key = cacheKey(frame), keys, i; if (!key) { return; } runtime.completed[key] = {kind: kind, envelope: envelope, at: new Date().getTime()}; keys = Object.keys(runtime.completed); if (keys.length > REQUEST_CACHE_LIMIT) { keys.sort(function (a, b) { return runtime.completed[a].at - runtime.completed[b].at; }); for (i = 0; i < keys.length - REQUEST_CACHE_LIMIT; i += 1) { delete runtime.completed[keys[i]]; } } }
+function cacheKey(frame) { return frame ? frame.sessionId + ':' + frame.requestId : ''; }
+function payloadDigest(frame) { return frame && frame.payload ? frame.opcode + ':' + frame.payload.length + ':' + crc32(frame.payload, frame.payload.length) : ''; }
+function remember(frame, kind, envelope) { var key = cacheKey(frame), keys, i; if (!key || !frame.payload) { return; } runtime.completed[key] = {kind: kind, envelope: envelope, digest: payloadDigest(frame), at: new Date().getTime()}; keys = Object.keys(runtime.completed); if (keys.length > REQUEST_CACHE_LIMIT) { keys.sort(function (a, b) { return runtime.completed[a].at - runtime.completed[b].at; }); for (i = 0; i < keys.length - REQUEST_CACHE_LIMIT; i += 1) { delete runtime.completed[keys[i]]; } } }
 function respond(frame, data, verified) { var envelope = {ok: true, data: data || {}, verified: verified !== false, revision: runtime.revision}; remember(frame, KIND.response, envelope); sendEnvelope(KIND.response, frame.requestId, frame.opcode, envelope); }
-function fail(frame, code, message, details) { var envelope = {ok: false, error: {code: code, message: message, details: details || {}}, revision: runtime.revision}; remember(frame, KIND.nack, envelope); sendEnvelope(KIND.nack, frame ? frame.requestId : 0, frame ? frame.opcode : OPCODE.error, envelope); }
-function emitState(key, value) { runtime.revision += 1; if (runtime.active && runtime.device) { sendEnvelope(KIND.event, 0, OPCODE['state.event'], {ok: true, data: {key: key, value: value}, verified: true, revision: runtime.revision}); } }
+function fail(frame, code, message, details) { var envelope = {ok: false, error: {code: code, message: message, details: details || {}}, revision: runtime.revision}; if (code !== 'REQUEST_ID_CONFLICT' && code !== 'STALE_SESSION' && code !== 'PROTOCOL_ERROR') { remember(frame, KIND.nack, envelope); } sendEnvelope(KIND.nack, frame ? frame.requestId : 0, frame ? frame.opcode : OPCODE.error, envelope); }
+function emitState(key, value) { runtime.revision += 1; runtime.stateRevision[key] = runtime.revision; if (runtime.active && runtime.device) { sendEnvelope(KIND.event, 0, OPCODE['state.event'], {ok: true, data: {key: key, value: value}, verified: true, revision: runtime.revision}); } }
 function hostVersion() { var value = midiremote_api.mDefaults && midiremote_api.mDefaults.mAppVersion; return value && value.getVersionString ? value.getVersionString() : ''; }
 
 """;
@@ -257,8 +302,9 @@ var timeDisplay = transport.mTimeDisplay;
 var selectedTrack = page.mHostAccess.mTrackSelection.mMixerChannel;
 var selectedValues = selectedTrack.mValue;
 var mixBank = page.mHostAccess.mMixConsole.makeMixerBankZone('Cubase Complete MCP Bank');
-var mixChannels = [], mixIndex;
-for (mixIndex = 0; mixIndex < 64; mixIndex += 1) { mixChannels.push(mixBank.makeMixerBankChannel()); }
+// Every host object is created here while the script loads. Track identity is read through DirectAccess only:
+// in a live run on Cubase 15.0.10, HostObject.getUniqueIDString/getRuntimeID called from a MIDI callback made Cubase
+// report itself unstable, while DirectAccess reads with the same mapping were stable.
 
 var surface = {
     play: deviceDriver.mSurface.makeCustomValueVariable('Play'), stop: deviceDriver.mSurface.makeCustomValueVariable('Stop'),
@@ -294,11 +340,23 @@ function registerCommand(id, category, name) {
     private const string HostMappingCallbacksAndDispatch = """
 function setSurface(value, number) { value.setProcessValue(runtime.device, number); }
 function pulse(value) { setSurface(value, 1); setSurface(value, 0); }
+// Live on Cubase 15.0.10 an immediate 1->0 pulse did not toggle the metronome: the host only saw the final value.
+// Latched presses keep the value at 1 and release it on the next idle callback.
+var pendingReleases = [];
+function pressLatched(value) { setSurface(value, 1); pendingReleases.push(value); }
+page.mOnIdle = function (activeDevice, activeMapping) {
+    var releases = pendingReleases, i;
+    pendingReleases = [];
+    for (i = 0; i < releases.length; i += 1) { releases[i].setProcessValue(activeDevice, 0); }
+};
 function stateSnapshot() {
     return {host_version: hostVersion(), driver_version: DRIVER_VERSION, protocol_version: PROTOCOL_VERSION,
-        command_count: runtime.commandIds.length, active: runtime.active, state: runtime.state};
+        driver_contract_version: DRIVER_CONTRACT_VERSION, driver_build_id: DRIVER_BUILD_ID, session_id: runtime.sessionId,
+        command_count: runtime.commandIds.length, active: runtime.active, state: runtime.state,
+        state_revision: runtime.stateRevision, time_formats: runtime.timeFormats, revision: runtime.revision};
 }
-function updateState(key, value) { if (runtime.state[key] !== value) { runtime.state[key] = value; emitState(key, value); } }
+function updateState(key, value) { if (runtime.state[key] !== value || runtime.stateRevision[key] === undefined) { runtime.state[key] = value; emitState(key, value); } }
+function updateTime(key, value, format) { runtime.timeFormats[key] = (format === undefined || format === null) ? null : String(format); updateState(key, value); }
 
 bindings.play.mOnValueChange = function (d, m, value) { updateState('playing', value >= 0.5); };
 bindings.record.mOnValueChange = function (d, m, value) { updateState('recording', value >= 0.5); };
@@ -312,9 +370,9 @@ selectedValues.mSolo.mOnProcessValueChange = function (d, m, value) { updateStat
 selectedValues.mMonitorEnable.mOnProcessValueChange = function (d, m, value) { updateState('monitor', value >= 0.5); };
 selectedValues.mRecordEnable.mOnProcessValueChange = function (d, m, value) { updateState('recordEnable', value >= 0.5); };
 timeDisplay.mOnChangeTempoBPM = function (d, m, value) { updateState('tempo', value); };
-timeDisplay.mPrimary.mTransportLocator.mOnChange = function (d, m, value) { updateState('position', value); };
-timeDisplay.mPrimary.mCycleLocatorLeft.mOnChange = function (d, m, value) { updateState('leftLocator', value); };
-timeDisplay.mPrimary.mCycleLocatorRight.mOnChange = function (d, m, value) { updateState('rightLocator', value); };
+timeDisplay.mPrimary.mTransportLocator.mOnChange = function (d, m, value, format) { updateTime('position', value, format); };
+timeDisplay.mPrimary.mCycleLocatorLeft.mOnChange = function (d, m, value, format) { updateTime('leftLocator', value, format); };
+timeDisplay.mPrimary.mCycleLocatorRight.mOnChange = function (d, m, value, format) { updateTime('rightLocator', value, format); };
 
 function makeDirectRoot(name, object) {
     if (page.mHostAccess.makeDirectAccess) { runtime.directRoots[name] = page.mHostAccess.makeDirectAccess(object); }
@@ -324,7 +382,10 @@ makeDirectRoot('mixer', mixBank);
 makeDirectRoot('control_room', page.mHostAccess.mControlRoom);
 makeDirectRoot('focused_quick_controls', page.mHostAccess.mFocusedQuickControls);
 
-function directRoot(name) { var root = runtime.directRoots[name || 'selected_track']; if (!root) { throw new Error('DirectAccess root is unavailable: ' + name); } return root; }
+// DirectAccess trees are cached by the host; update() refreshes them so reads after a change (new track, reorder)
+// do not see a stale or partially updated child list.
+function refreshRoot(root) { if (root && root.update && runtime.mapping) { root.update(runtime.mapping); } return root; }
+function directRoot(name) { var root = runtime.directRoots[name || 'selected_track']; if (!root) { throw codedError('UNSUPPORTED_CAPABILITY', 'DirectAccess root is unavailable: ' + name); } return refreshRoot(root); }
 function intArg(value, fallback, minimum, maximum) {
     var parsed;
     if (value === undefined || value === null || value === '') { return fallback; }
@@ -369,221 +430,323 @@ function directSnapshot(args) {
         limits: {max_nodes: maxNodes, max_depth: maxDepth, max_parameters: parameterLimit, include_parameters: includeParameters},
         truncation: {queued_nodes_unvisited: queue.length, node_limit_children: nodeLimited, depth_limit_children: depthLimited, nodes_with_truncated_parameters: parametersTruncated}};
 }
+function objectInTree(root, objectId, limit, startId) {
+    var queue = [startId === undefined ? root.getBaseObjectID(runtime.mapping) : startId], visited = 0, id, count, i;
+    while (queue.length && visited < limit) {
+        id = queue.shift(); visited += 1;
+        if (id === objectId) { return true; }
+        count = root.getNumberOfChildObjects(runtime.mapping, id);
+        for (i = 0; i < count; i += 1) { queue.push(root.getChildObjectID(runtime.mapping, id, i)); }
+    }
+    return false;
+}
+function readParameter(root, objectId, tag) {
+    var result = {parameter_tag: tag, process_value: root.getParameterProcessValue(runtime.mapping, objectId, tag), display_value: root.getParameterDisplayValue(runtime.mapping, objectId, tag)};
+    if (root.getParameterEditLockState) { result.edit_locked = root.getParameterEditLockState(runtime.mapping, objectId, tag); }
+    return result;
+}
+// Writes one parameter and reads it back in the same host callback. The read-back is a fresh host read; it is
+// reported as an observation and the broker decides verification. A parameter locked by someone else is refused.
 function applyParameter(root, objectId, tag, args) {
-    var before, beforeDisplay, after, afterDisplay, wasLocked = false, requestedProcess = null, verified = false;
-    before = root.getParameterProcessValue(runtime.mapping, objectId, tag);
-    beforeDisplay = root.getParameterDisplayValue(runtime.mapping, objectId, tag);
-    if (root.getParameterEditLockState) { wasLocked = root.getParameterEditLockState(runtime.mapping, objectId, tag); }
-    if (root.setParameterEditLockState && !wasLocked) { root.setParameterEditLockState(runtime.mapping, objectId, tag, true); }
+    var before = readParameter(root, objectId, tag), requestedProcess = null, after, sent = false, dispatchRevision;
+    if (before.edit_locked === true) { throw codedError('PARAMETER_LOCKED', 'the parameter is edit-locked by another controller; it was not changed', {parameter_tag: tag}); }
+    if (typeof args.process_value === 'number') {
+        if (!isFinite(args.process_value) || args.process_value < 0 || args.process_value > 1) { throw codedError('INVALID_ARGUMENT', 'process_value must be a finite number between 0 and 1'); }
+        requestedProcess = args.process_value;
+    } else if (typeof args.plain_value === 'number') {
+        if (!root.convertParameterPlainToProcessValue) { throw codedError('UNSUPPORTED_CAPABILITY', 'plain_value needs convertParameterPlainToProcessValue, which this host API does not expose; use process_value or display_value'); }
+        if (!isFinite(args.plain_value)) { throw codedError('INVALID_ARGUMENT', 'plain_value must be finite'); }
+        requestedProcess = root.convertParameterPlainToProcessValue(runtime.mapping, objectId, tag, args.plain_value);
+        if (typeof requestedProcess !== 'number' || !isFinite(requestedProcess) || requestedProcess < 0 || requestedProcess > 1) { throw codedError('INVALID_ARGUMENT', 'plain_value is outside the host range for this parameter'); }
+    } else if (typeof args.display_value !== 'string') { throw codedError('INVALID_ARGUMENT', 'process_value, plain_value, or display_value is required'); }
+    if (requestedProcess !== null && Math.abs(before.process_value - requestedProcess) <= 0.000001) {
+        return {before: before.process_value, before_display: before.display_value, after: before.process_value, after_display: before.display_value, requested_process_value: requestedProcess, mutation_sent: false, no_op: true, dispatch_revision: runtime.revision};
+    }
+    runtime.revision += 1; dispatchRevision = runtime.revision;
+    if (root.setParameterEditLockState) { root.setParameterEditLockState(runtime.mapping, objectId, tag, true); }
     try {
-        if (typeof args.process_value === 'number') {
-            if (!isFinite(args.process_value) || args.process_value < 0 || args.process_value > 1) { throw new Error('process_value must be between 0 and 1'); }
-            requestedProcess = args.process_value; root.setParameterProcessValue(runtime.mapping, objectId, tag, requestedProcess);
-        }
-        else if (typeof args.plain_value === 'number' && root.convertParameterPlainToProcessValue) {
-            requestedProcess = root.convertParameterPlainToProcessValue(runtime.mapping, objectId, tag, args.plain_value);
-            root.setParameterProcessValue(runtime.mapping, objectId, tag, requestedProcess);
-        }
-        else if (typeof args.display_value === 'string') { root.setParameterDisplayValue(runtime.mapping, objectId, tag, args.display_value); }
-        else { throw new Error('process_value, plain_value, or display_value is required'); }
+        sent = true;
+        if (requestedProcess !== null) { root.setParameterProcessValue(runtime.mapping, objectId, tag, requestedProcess); }
+        else { root.setParameterDisplayValue(runtime.mapping, objectId, tag, args.display_value); }
     } finally {
-        if (root.setParameterEditLockState && !wasLocked) { root.setParameterEditLockState(runtime.mapping, objectId, tag, false); }
+        if (root.setParameterEditLockState) { root.setParameterEditLockState(runtime.mapping, objectId, tag, false); }
     }
-    after = root.getParameterProcessValue(runtime.mapping, objectId, tag);
-    afterDisplay = root.getParameterDisplayValue(runtime.mapping, objectId, tag);
-    verified = requestedProcess !== null ? Math.abs(after - requestedProcess) <= 0.0001 : afterDisplay === args.display_value;
-    runtime.revision += 1;
-    return {before: before, before_display: beforeDisplay, after: after, after_display: afterDisplay, verified: verified};
+    after = readParameter(root, objectId, tag);
+    return {before: before.process_value, before_display: before.display_value, after: after.process_value, after_display: after.display_value,
+        requested_process_value: requestedProcess, requested_display_value: requestedProcess === null ? args.display_value : null,
+        mutation_sent: sent, no_op: false, dispatch_revision: dispatchRevision};
 }
-function directSet(args) {
-    var root = directRoot(args.root), objectId = Number(args.object_id), tag = Number(args.parameter_tag);
-    if (!isFinite(objectId) || !isFinite(tag)) { throw new Error('object_id and parameter_tag are required numbers'); }
-    return applyParameter(root, objectId, tag, args);
+
+// ---- target identity ------------------------------------------------------------------------------------
+// Identity comes from DirectAccess only. Channels are the child objects of the VST Mixer ('mixer' root); a channel's
+// identity is its unique ID plus its object ID in that root (the object ID changes when the object is replaced).
+// bank_index is the channel's position among those children, an address rather than an identity.
+var MAX_CHANNELS = 256;
+function mixerRoot() {
+    var root = runtime.directRoots.mixer;
+    if (!root) { throw codedError('UNSUPPORTED_CAPABILITY', 'target-addressed access requires MIDI Remote API 1.2 DirectAccess, which this host does not expose'); }
+    if (!runtime.mapping) { throw codedError('DRIVER_OFFLINE', 'the driver page is not active'); }
+    return refreshRoot(root);
 }
-function selectedTrackIdentity() {
-    return {unique_id: selectedTrack.getUniqueIDString ? selectedTrack.getUniqueIDString(runtime.mapping) : null,
-        runtime_id: selectedTrack.getRuntimeID ? Number(selectedTrack.getRuntimeID(runtime.mapping)) : null,
-        title: runtime.state.selectedTrack};
-}
-function mixerBankIndex(value) {
-    var parsed = Number(value);
-    if (!isFinite(parsed) || Math.floor(parsed) !== parsed || parsed < 0 || parsed >= mixChannels.length) {
-        throw new Error('track_id must be a mixer bank channel index between 0 and ' + (mixChannels.length - 1) + '; received ' + JSON.stringify(value));
+function mixerChannels() {
+    var root = mixerRoot(), base = root.getBaseObjectID(runtime.mapping), count = root.getNumberOfChildObjects(runtime.mapping, base), channels = [], seen = {}, i, objectId, uid;
+    for (i = 0; i < count && i < MAX_CHANNELS; i += 1) {
+        objectId = Number(root.getChildObjectID(runtime.mapping, base, i));
+        uid = root.getObjectUniqueIDString(runtime.mapping, objectId);
+        if (!uid || seen[objectId]) { continue; }
+        seen[objectId] = true;
+        channels.push({kind: 'mixer_channel', bank_index: i, unique_id: String(uid), runtime_id: objectId, object_id: objectId,
+            title: root.getObjectTitle(runtime.mapping, objectId), channel_type: root.getObjectUniqueName(runtime.mapping, objectId)});
     }
-    return parsed;
+    return {channels: channels, total: count};
 }
-function mixerChannelRoot(index) {
-    var channel = mixChannels[index], cache = runtime.mixRoots[index];
-    if (!channel) { throw new Error('mixer bank channel is unavailable at index ' + index); }
-    if (!page.mHostAccess.makeDirectAccess) { throw new Error('track_id targeting requires MIDI Remote API 1.2 DirectAccess, which this host does not expose'); }
-    if (!cache) {
-        cache = {root: page.mHostAccess.makeDirectAccess(channel), mapping: runtime.mapping};
-        runtime.mixRoots[index] = cache;
-        if (cache.root.activate) { cache.root.activate(runtime.mapping); }
-    } else if (cache.mapping !== runtime.mapping) {
-        if (cache.root.activate) { cache.root.activate(runtime.mapping); }
-        cache.mapping = runtime.mapping;
+function selectedIdentity() {
+    var root = refreshRoot(runtime.directRoots.selected_track), base, uid = null, i, channels;
+    var identity = {kind: 'selected_track', unique_id: null, runtime_id: null, title: runtime.state.selectedTrack};
+    if (!root || !runtime.mapping) { return identity; }
+    base = Number(root.getBaseObjectID(runtime.mapping));
+    if (base >= 0) { uid = root.getObjectUniqueIDString(runtime.mapping, base) || null; }
+    if (!uid) { return identity; }
+    identity.unique_id = String(uid); identity.title = root.getObjectTitle(runtime.mapping, base);
+    // Report the object ID the same channel has in the mixer root, so identities are comparable across roots.
+    channels = mixerChannels().channels;
+    for (i = 0; i < channels.length; i += 1) { if (channels[i].unique_id === identity.unique_id) { identity.runtime_id = channels[i].runtime_id; identity.bank_index = channels[i].bank_index; break; } }
+    return identity;
+}
+function trackList(args) {
+    var listed = mixerChannels();
+    return {scope: 'vst_mixer', bank_size: MAX_CHANNELS, channels: listed.channels, available_channel_count: listed.channels.length,
+        bank_truncated: listed.total > MAX_CHANNELS, selected: selectedIdentity(), session_id: runtime.sessionId};
+}
+// Resolves the planned channel by identity inside the current host callback. A reordered mixer is followed when
+// exactly one channel carries the unique ID and its object ID still matches; anything else is stale.
+function resolveTarget(expected) {
+    var channels, i, matches = [], identity;
+    if (!expected || typeof expected.unique_id !== 'string' || !expected.unique_id) { throw codedError('TARGET_REQUIRED', 'a resolved target identity (unique_id, runtime_id, bank_index) is required'); }
+    channels = mixerChannels().channels;
+    for (i = 0; i < channels.length; i += 1) { if (channels[i].unique_id === expected.unique_id) { matches.push(channels[i]); } }
+    if (matches.length !== 1) { throw codedError('STALE_TARGET', matches.length === 0 ? 'the planned channel is no longer in the mixer' : 'the planned channel identity is ambiguous in the mixer', {expected: expected}); }
+    identity = matches[0];
+    if (expected.runtime_id !== null && expected.runtime_id !== undefined && identity.runtime_id !== expected.runtime_id) {
+        throw codedError('STALE_TARGET', 'the planned channel object was replaced (object ID changed)', {expected: expected, observed: identity});
     }
-    if (cache.root.update) { cache.root.update(runtime.mapping); }
-    return cache.root;
+    identity.relocated = identity.bank_index !== expected.bank_index;
+    return identity;
 }
-function mixerChannelIdentity(index) {
-    var channel = mixChannels[index], root = mixerChannelRoot(index);
-    return {track_id: index, object_id: Number(root.getBaseObjectID(runtime.mapping)),
-        unique_id: channel.getUniqueIDString ? channel.getUniqueIDString(runtime.mapping) : null,
-        runtime_id: channel.getRuntimeID ? Number(channel.getRuntimeID(runtime.mapping)) : null};
+function assertSelected(expected) {
+    var current = selectedIdentity();
+    if (!expected || !expected.unique_id) { throw codedError('TARGET_REQUIRED', 'expected_selected identity is required'); }
+    if (current.unique_id !== expected.unique_id || (expected.runtime_id !== null && expected.runtime_id !== undefined && current.runtime_id !== expected.runtime_id)) {
+        throw codedError('TARGET_CHANGED', 'the selected track changed after the operation was planned; nothing was changed', {expected: expected, observed: current});
+    }
+    return current;
 }
-function findParameterTag(root, objectId, requested) {
-    var normalized = String(requested).toLowerCase().replace(/[^a-z0-9]/g, ''), total = root.getNumberOfParameters(runtime.mapping, objectId);
-    var i, tag, title, candidate, prefix = null, samples = [];
+var PARAMETER_ALIASES = {
+    volume: ['volume', 'vol', 'level', '볼륨'], pan: ['pan', 'panorama', 'panleftright', '팬'],
+    mute: ['mute', '뮤트', '음소거'], solo: ['solo', '솔로'],
+    monitor: ['monitor', 'monitorenable', 'monitoring', '모니터'], record_enable: ['recordenable', 'recenable', 'record', '녹음활성화']
+};
+function normalizeTitle(text) { return String(text || '').toLowerCase().replace(/[\s\-_.:\/()]/g, ''); }
+function findNamedParameter(root, objectId, requested) {
+    var aliases = PARAMETER_ALIASES[requested], total = root.getNumberOfParameters(runtime.mapping, objectId), i, tag, title, matches = [], samples = [];
+    if (!aliases) { throw codedError('INVALID_ARGUMENT', 'unsupported named parameter "' + requested + '"; use volume, pan, mute, solo, monitor, record_enable, or parameter_tag'); }
     for (i = 0; i < total; i += 1) {
         tag = root.getParameterTagByIndex(runtime.mapping, objectId, i);
         title = String(root.getParameterTitle(runtime.mapping, objectId, tag, 256) || '');
-        candidate = title.toLowerCase().replace(/[^a-z0-9]/g, '');
-        if (candidate && normalized && candidate === normalized) { return {tag: tag, title: title, match: 'exact'}; }
-        if (candidate && normalized && candidate.indexOf(normalized) === 0) {
-            if (prefix === null) { prefix = {tag: tag, title: title, match: 'prefix'}; }
-            else { prefix = {ambiguous: true, first: prefix.title, second: title}; }
-        }
-        if (samples.length < 8) { samples.push(title); }
+        if (aliases.indexOf(normalizeTitle(title)) >= 0) { matches.push({tag: tag, title: title}); }
+        if (samples.length < 12) { samples.push(title); }
     }
-    if (prefix !== null && !prefix.ambiguous) { return prefix; }
-    if (prefix !== null) { throw new Error('parameter "' + requested + '" is ambiguous on the resolved mixer channel ("' + prefix.first + '" and "' + prefix.second + '" both match); use object_id and parameter_tag instead'); }
-    throw new Error('parameter "' + requested + '" is not exposed on the resolved mixer channel; observed titles: ' + samples.join(', '));
+    if (matches.length === 0 && requested === 'pan') { return findPannerParameter(root, objectId, aliases, samples); }
+    if (matches.length === 1) { return matches[0]; }
+    if (matches.length > 1) { throw codedError('PARAMETER_AMBIGUOUS', 'parameter "' + requested + '" matches more than one exposed parameter on the target; use parameter_tag', {candidates: matches}); }
+    throw codedError('PARAMETER_NOT_EXPOSED', 'parameter "' + requested + '" is not exposed on the target channel; observed titles: ' + samples.join(', '), {observed_titles: samples});
 }
-function setMixerNamedOnTrack(args) {
-    var index = mixerBankIndex(args.track_id), before = mixerChannelIdentity(index), root, found, result, after, request = args, key;
-    if (typeof args.process_value !== 'number' && typeof args.plain_value !== 'number' && args.display_value === undefined) {
-        if (typeof args.value !== 'number' || !isFinite(args.value) || args.value < 0 || args.value > 1) {
-            throw new Error('mixer value must be normalized between 0 and 1 when track_id addresses the channel');
+// Audio, instrument and group channels keep their pan in a child object whose unique name is "Panner"
+// ("Standard Panner": "Pan Left-Right"); only that child is searched, never other children such as an
+// instrument track's MIDI Channel, whose "Pan" is a different parameter.
+function findPannerParameter(root, objectId, aliases, samples) {
+    var count = root.getNumberOfChildObjects(runtime.mapping, objectId), i, child, total, j, tag, title, matches = [];
+    for (i = 0; i < count; i += 1) {
+        child = root.getChildObjectID(runtime.mapping, objectId, i);
+        if (String(root.getObjectUniqueName(runtime.mapping, child) || '') !== 'Panner') { continue; }
+        total = root.getNumberOfParameters(runtime.mapping, child);
+        for (j = 0; j < total; j += 1) {
+            tag = root.getParameterTagByIndex(runtime.mapping, child, j);
+            title = String(root.getParameterTitle(runtime.mapping, child, tag, 256) || '');
+            if (aliases.indexOf(normalizeTitle(title)) >= 0) { matches.push({tag: tag, title: title, objectId: child}); }
         }
-        request = {};
-        for (key in args) { if (Object.prototype.hasOwnProperty.call(args, key)) { request[key] = args[key]; } }
-        request.process_value = args.value;
     }
-    root = mixerChannelRoot(index);
-    found = findParameterTag(root, before.object_id, args.parameter);
-    result = applyParameter(root, before.object_id, found.tag, request);
-    after = mixerChannelIdentity(index);
-    return {target: {scope: 'track_index', track_id: index, object_id: before.object_id, unique_id: before.unique_id,
-            runtime_id: before.runtime_id, runtime_id_after: after.runtime_id,
-            identity_stable: before.runtime_id !== null && before.runtime_id === after.runtime_id},
-        parameter: args.parameter, parameter_tag: found.tag, parameter_title: found.title, parameter_match: found.match,
-        before: result.before, before_display: result.before_display, after: result.after, after_display: result.after_display,
-        verified: result.verified && before.runtime_id !== null && before.runtime_id === after.runtime_id};
+    if (matches.length === 1) { return matches[0]; }
+    if (matches.length > 1) { throw codedError('PARAMETER_AMBIGUOUS', 'parameter "pan" matches more than one panner parameter on the target; use object_id and parameter_tag', {candidates: matches}); }
+    throw codedError('PARAMETER_NOT_EXPOSED', 'parameter "pan" is not exposed on the target channel or its panner; observed titles: ' + samples.join(', '), {observed_titles: samples});
+}
+function targetParameter(args) {
+    var identity = resolveTarget(args.target), root = mixerRoot(), objectId = identity.object_id, found, tag;
+    if (args.parameter_tag !== undefined && args.parameter_tag !== null) {
+        tag = Number(args.parameter_tag);
+        if (!isFinite(tag)) { throw codedError('INVALID_ARGUMENT', 'parameter_tag must be a number'); }
+        if (args.object_id !== undefined && args.object_id !== null) {
+            objectId = Number(args.object_id);
+            if (!objectInTree(root, objectId, 1024, identity.object_id)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id ' + args.object_id + ' is not part of the resolved channel'); }
+        }
+        found = {tag: tag, title: root.getParameterTitle(runtime.mapping, objectId, tag, 256)};
+    } else { found = findNamedParameter(root, objectId, args.parameter); if (found.objectId !== undefined) { objectId = found.objectId; } }
+    return {identity: identity, root: root, objectId: objectId, tag: found.tag, title: found.title};
+}
+
+// ---- transport -------------------------------------------------------------------------------------------
+function receipt(action, sent, extra) {
+    var result = {action: action, mutation_sent: sent, no_op: !sent, dispatch_revision: runtime.revision, session_id: runtime.sessionId}, key;
+    for (key in extra) { if (Object.prototype.hasOwnProperty.call(extra, key)) { result[key] = extra[key]; } }
+    return result;
+}
+function toggleTo(action, key, surfaceValue, desired) {
+    var before = runtime.state[key], dispatchRevision;
+    if (before === null || before === undefined) { throw codedError('STATE_UNKNOWN', 'the ' + key + ' state has not been reported by Cubase in this driver session, so a toggle cannot be aimed at the requested state; nothing was sent'); }
+    if (before === desired) { return receipt(action, false, {state_key: key, before: before, desired: desired}); }
+    runtime.revision += 1; dispatchRevision = runtime.revision;
+    if (key === 'cycle' || key === 'metronome' || key === 'recording') { pressLatched(surfaceValue); } else { pulse(surfaceValue); }
+    return receipt(action, true, {state_key: key, before: before, desired: desired, dispatch_revision: dispatchRevision});
+}
+function setTime(action, key, locator, args) {
+    var current = runtime.state[key], format = runtime.timeFormats[key], dispatchRevision;
+    if (args.value !== undefined) { throw codedError('INVALID_ARGUMENT', action + ' requires position_text with an explicit time_format; the numeric value field is ambiguous and not accepted'); }
+    if (typeof args.position_text !== 'string' || !args.position_text) { throw codedError('INVALID_ARGUMENT', action + ' requires position_text'); }
+    if (typeof args.time_format !== 'string' || !args.time_format) { throw codedError('INVALID_ARGUMENT', action + ' requires time_format'); }
+    if (format === null || format === undefined) { throw codedError('STATE_UNKNOWN', 'Cubase has not reported the primary time format in this driver session; nothing was sent'); }
+    if (format !== args.time_format) { throw codedError('UNSUPPORTED_TIME_FORMAT', 'the primary time display uses "' + format + '", not "' + args.time_format + '"; nothing was sent', {host_time_format: format}); }
+    if (current === args.position_text) { return receipt(action, false, {state_key: key, before: current, desired: args.position_text, time_format: format}); }
+    runtime.revision += 1; dispatchRevision = runtime.revision;
+    locator.setTime(runtime.mapping, args.position_text);
+    return receipt(action, true, {state_key: key, before: current, desired: args.position_text, time_format: format, dispatch_revision: dispatchRevision});
+}
+function requireBoolean(args) { if (typeof args.enabled !== 'boolean') { throw codedError('INVALID_ARGUMENT', 'enabled must be true or false'); } return args.enabled; }
+function setTransport(args) {
+    var action = args.action, dispatchRevision;
+    if (action === 'play') { return toggleTo('play', 'playing', surface.play, true); }
+    if (action === 'stop') {
+        if (runtime.state.playing === null || runtime.state.recording === null) { throw codedError('STATE_UNKNOWN', 'playback/record state has not been reported in this driver session; nothing was sent'); }
+        if (runtime.state.playing === false && runtime.state.recording === false) { return receipt('stop', false, {state_key: 'playing', before: false, desired: false}); }
+        runtime.revision += 1; dispatchRevision = runtime.revision; pulse(surface.stop);
+        return receipt('stop', true, {state_key: 'playing', before: runtime.state.playing, recording_before: runtime.state.recording, desired: false, dispatch_revision: dispatchRevision});
+    }
+    if (action === 'record') { return toggleTo(args.enabled === false ? 'record_stop' : 'record_start', 'recording', surface.record, args.enabled !== false); }
+    if (action === 'record_start') { return toggleTo('record_start', 'recording', surface.record, true); }
+    if (action === 'record_stop') { return toggleTo('record_stop', 'recording', surface.record, false); }
+    if (action === 'cycle') { return toggleTo('cycle', 'cycle', surface.cycle, requireBoolean(args)); }
+    if (action === 'metronome') { return toggleTo('metronome', 'metronome', surface.metronome, requireBoolean(args)); }
+    if (action === 'tempo') {
+        if (typeof args.bpm !== 'number' || !isFinite(args.bpm) || args.bpm < 20 || args.bpm > 300) { throw codedError('INVALID_ARGUMENT', 'bpm must be between 20 and 300'); }
+        if (typeof runtime.state.tempo === 'number' && Math.abs(runtime.state.tempo - args.bpm) <= 0.005) { return receipt('tempo', false, {state_key: 'tempo', before: runtime.state.tempo, desired: args.bpm}); }
+        runtime.revision += 1; dispatchRevision = runtime.revision;
+        timeDisplay.setTempoBPM(runtime.mapping, args.bpm);
+        return receipt('tempo', true, {state_key: 'tempo', before: runtime.state.tempo, desired: args.bpm, dispatch_revision: dispatchRevision});
+    }
+    if (action === 'position') { return setTime('position', 'position', timeDisplay.mPrimary.mTransportLocator, args); }
+    if (action === 'left_locator') { return setTime('left_locator', 'leftLocator', timeDisplay.mPrimary.mCycleLocatorLeft, args); }
+    if (action === 'right_locator') { return setTime('right_locator', 'rightLocator', timeDisplay.mPrimary.mCycleLocatorRight, args); }
+    throw codedError('INVALID_ACTION', 'unsupported transport action ' + action);
+}
+
+// ---- track selection and commands ------------------------------------------------------------------------
+function setTrack(args) {
+    var before = selectedIdentity(), dispatchRevision;
+    runtime.revision += 1; dispatchRevision = runtime.revision;
+    if (args.action === 'previous') { pulse(surface.previousTrack); }
+    else if (args.action === 'next') { pulse(surface.nextTrack); }
+    else { throw codedError('INVALID_ACTION', 'track.set supports next and previous'); }
+    return receipt(args.action, true, {selected_before: before, dispatch_revision: dispatchRevision});
 }
 function commandCapability(args) {
     var index = runtime.commandIndex[args.id], binding;
-    if (typeof index !== 'number') { throw new Error('unknown command id'); }
+    if (typeof index !== 'number') { throw codedError('COMMAND_NOT_FOUND', 'unknown command id'); }
     binding = runtime.commandBindings[index];
     return {id: args.id, can_perform: binding.canPerform ? binding.canPerform(runtime.mapping) : null, api_1_3: !!binding.canPerform};
 }
+// Selection-dependent commands carry expected_selected; the identity is compared in this same host callback
+// immediately before the pulse, so a selection change after planning stops the command instead of retargeting it.
 function executeCommand(args) {
-    var index = runtime.commandIndex[args.id], capability;
-    if (typeof index !== 'number') { throw new Error('unknown command id'); }
+    var index = runtime.commandIndex[args.id], capability, guard = null, dispatchRevision;
+    if (typeof index !== 'number') { throw codedError('COMMAND_NOT_FOUND', 'unknown command id'); }
+    if (args.expected_selected) { guard = assertSelected(args.expected_selected); }
+    else if (args.requires_target === true) { throw codedError('TARGET_CONTEXT_UNSAFE', 'this command acts on the selection but no expected_selected identity was supplied'); }
     capability = commandCapability(args);
-    if (capability.can_perform === false) { throw new Error('command is not performable in the current Cubase context'); }
-    pulse(runtime.commandValues[index]); runtime.revision += 1;
-    return {id: args.id, executed: true, can_perform: capability.can_perform, verified: false};
+    if (capability.can_perform === false) { throw codedError('COMMAND_NOT_PERFORMABLE', 'command is not performable in the current Cubase context'); }
+    runtime.revision += 1; dispatchRevision = runtime.revision;
+    pulse(runtime.commandValues[index]);
+    return receipt('execute', true, {id: args.id, can_perform: capability.can_perform, guarded_target: guard, dispatch_revision: dispatchRevision});
 }
-function setTransport(args) {
-    var action = args.action;
-    if (action === 'play') { pulse(surface.play); }
-    else if (action === 'stop') { pulse(surface.stop); }
-    else if (action === 'record' || action === 'record_start' || action === 'record_stop') { return recordRequest(action, args.enabled); }
-    else if (action === 'cycle') { setSurface(surface.cycle, args.enabled ? 1 : 0); }
-    else if (action === 'metronome') { setSurface(surface.metronome, args.enabled ? 1 : 0); }
-    else if (action === 'tempo') { if (typeof args.bpm !== 'number' || args.bpm < 20 || args.bpm > 300) { throw new Error('bpm must be between 20 and 300'); } timeDisplay.setTempoBPM(runtime.mapping, args.bpm); }
-    else if (action === 'position') { timeDisplay.mPrimary.mTransportLocator.setTime(runtime.mapping, String(args.value)); }
-    else if (action === 'left_locator') { timeDisplay.mPrimary.mCycleLocatorLeft.setTime(runtime.mapping, String(args.value)); }
-    else if (action === 'right_locator') { timeDisplay.mPrimary.mCycleLocatorRight.setTime(runtime.mapping, String(args.value)); }
-    else { throw new Error('unsupported transport action'); }
-    runtime.revision += 1; return {requested: args, state: runtime.state};
-}
-function recordRequest(action, enabled) {
-    var mode = action, before = runtime.state.recording, after, pulsed = false;
-    if (mode === 'record') { mode = enabled === false ? 'record_stop' : 'record_start'; }
-    if (mode === 'record_start') {
-        if (before === true) { return {action: 'record_start', pulsed: false, recording_before: before, recording_after: before, already_recording: true, verified: true}; }
-        pulse(surface.record); pulsed = true;
-    } else if (mode === 'record_stop') {
-        if (before === false) { return {action: 'record_stop', pulsed: false, recording_before: before, recording_after: before, already_stopped: true, verified: true}; }
-        if (before === null || before === undefined) { throw new Error('the mirrored record state is unknown, so a toggle pulse cannot be guaranteed to stop recording; read transport.get first or stop recording in Cubase directly'); }
-        pulse(surface.record); pulsed = true;
-    } else { throw new Error('unsupported record action: ' + action); }
-    after = runtime.state.recording;
-    runtime.revision += 1;
-    return {action: mode, pulsed: pulsed, recording_before: before, recording_after: after,
-        verified: mode === 'record_start' ? after === true : after === false,
-        note: 'Transport record is a host toggle; the operation reports verified only when the driver mirror observed the requested record state.'};
-}
-function setTrack(args) {
-    if (args.action === 'previous') { pulse(surface.previousTrack); }
-    else if (args.action === 'next') { pulse(surface.nextTrack); }
-    else { throw new Error('track action requires command or UI fallback'); }
-    runtime.revision += 1; return {requested: args, state: runtime.state};
-}
+
+// ---- mixer and direct access ----------------------------------------------------------------------------
+var SELECTED_TOGGLES = {mute: 'mute', solo: 'solo', monitor: 'monitor', record_enable: 'recordEnable'};
 function setMixer(args) {
-    var value = args.value, parameter = args.parameter, target, identity, after, direct;
-    var named = parameter === 'volume' || parameter === 'pan' || parameter === 'mute' || parameter === 'solo' || parameter === 'monitor' || parameter === 'record_enable';
-    var hasTrack = args.track_id !== undefined && args.track_id !== null && args.track_id !== '';
-    var hasObject = args.object_id !== undefined && args.object_id !== null && args.object_id !== '';
-    if (hasTrack && named) { return setMixerNamedOnTrack(args); }
-    if (hasTrack && hasObject) {
-        identity = mixerChannelIdentity(mixerBankIndex(args.track_id));
-        if (Number(args.object_id) !== identity.object_id) {
-            throw new Error('track_id ' + identity.track_id + ' resolves to object_id ' + identity.object_id + ', not the requested object_id ' + args.object_id);
+    var resolved, result, key, surfaceValue, value, dispatchRevision, guard;
+    if (args.track_id !== undefined) { throw codedError('LEGACY_TARGET_AMBIGUOUS', 'track_id is not accepted by driver contract 2; resolve a target first'); }
+    if (args.target) {
+        resolved = targetParameter(args);
+        if (args.process_value === undefined && args.plain_value === undefined && args.display_value === undefined) {
+            if (typeof args.value === 'boolean') { args.process_value = args.value ? 1 : 0; }
+            else { args.process_value = args.value; }
         }
-        direct = directSet(args); direct.target = identity; runtime.revision += 1; return direct;
+        result = applyParameter(resolved.root, resolved.objectId, resolved.tag, args);
+        result.target = resolved.identity; result.parameter_tag = resolved.tag; result.parameter_title = resolved.title; result.object_id = resolved.objectId;
+        return result;
     }
-    if (hasTrack && !hasObject) {
-        throw new Error('track_id targeting supports the named parameters volume, pan, mute, solo, monitor and record_enable; "' + parameter + '" requires object_id with parameter_tag');
+    if (!args.expected_selected) { throw codedError('TARGET_REQUIRED', 'mixer.set requires target or expected_selected'); }
+    guard = assertSelected(args.expected_selected);
+    value = args.value;
+    if (args.parameter === 'volume' || args.parameter === 'pan') {
+        surfaceValue = args.parameter === 'volume' ? surface.volume : surface.pan; key = args.parameter;
+        if (typeof value !== 'number' || !isFinite(value) || value < 0 || value > 1) { throw codedError('INVALID_ARGUMENT', 'mixer value must be normalized between 0 and 1'); }
+        if (typeof runtime.state[key] === 'number' && Math.abs(runtime.state[key] - value) <= 0.000001) { return receipt('set', false, {state_key: key, before: runtime.state[key], desired: value, target: guard}); }
+        runtime.revision += 1; dispatchRevision = runtime.revision;
+        setSurface(surfaceValue, value);
+        return receipt('set', true, {state_key: key, before: runtime.state[key], desired: value, target: guard, dispatch_revision: dispatchRevision});
     }
-    if (parameter === 'volume') { target = surface.volume; }
-    else if (parameter === 'pan') { target = surface.pan; }
-    else if (parameter === 'mute') { target = surface.mute; value = value ? 1 : 0; }
-    else if (parameter === 'solo') { target = surface.solo; value = value ? 1 : 0; }
-    else if (parameter === 'monitor') { target = surface.monitor; value = value ? 1 : 0; }
-    else if (parameter === 'record_enable') { target = surface.recordEnable; value = value ? 1 : 0; }
-    else if (hasObject) { direct = directSet(args); direct.target = {scope: 'selected_track_object_id'}; runtime.revision += 1; return direct; }
-    else { throw new Error('unsupported mixer parameter "' + parameter + '"; use volume, pan, mute, solo, monitor, record_enable, or object_id with parameter_tag'); }
-    if (typeof value !== 'number' || !isFinite(value) || value < 0 || value > 1) { throw new Error('mixer value must be normalized between 0 and 1'); }
-    identity = selectedTrackIdentity();
-    setSurface(target, value);
-    runtime.revision += 1;
-    after = selectedTrackIdentity();
-    return {requested: args, target: {scope: 'selected_track', unique_id: identity.unique_id, runtime_id: identity.runtime_id,
-            runtime_id_after: after.runtime_id, identity_stable: identity.runtime_id !== null && identity.runtime_id === after.runtime_id},
-        state: runtime.state};
+    if (SELECTED_TOGGLES[args.parameter]) {
+        if (typeof value !== 'boolean') { throw codedError('INVALID_ARGUMENT', args.parameter + ' requires a boolean value'); }
+        result = toggleTo('set', SELECTED_TOGGLES[args.parameter], surface[SELECTED_TOGGLES[args.parameter]], value);
+        result.target = guard; return result;
+    }
+    throw codedError('INVALID_ARGUMENT', 'unsupported selected-track parameter "' + args.parameter + '"; use a target handle with parameter_tag');
 }
-function pluginSet(args) {
-    var root = directRoot(args.root || 'selected_track'), manager = root.mPluginManager, objectId, before, after, assigned, changed;
-    if (args.action === 'set_parameter') { return directSet(args); }
-    if (args.action === 'inspect_slot') {
-        objectId = Number(args.object_id);
-        if (!isFinite(objectId) || objectId < 0) { throw new Error('object_id of the target plug-in slot is required'); }
-        return {action: 'inspect_slot', slot: pluginSlotState(root, objectId),
-            api_1_3_plugin_manager: !!(manager && manager.trySetSlotPlugin)};
+function getMixer(args) {
+    var resolved, read;
+    if (args.target) {
+        resolved = targetParameter(args); read = readParameter(resolved.root, resolved.objectId, resolved.tag);
+        read.target = resolved.identity; read.parameter_title = resolved.title; read.object_id = resolved.objectId; read.fresh = true;
+        return read;
     }
-    if (args.action === 'assign') {
-        objectId = Number(args.object_id);
-        if (!manager || !manager.trySetSlotPlugin) { throw new Error('plug-in slot assignment requires MIDI Remote API 1.3; this host does not expose mPluginManager.trySetSlotPlugin'); }
-        if (!isFinite(objectId) || objectId < 0) { throw new Error('object_id of the target plug-in slot is required'); }
-        if (typeof args.plugin_uid !== 'string' || args.plugin_uid.length === 0) { throw new Error('plugin_uid is required for plug-in slot assignment'); }
-        before = pluginSlotState(root, objectId);
-        assigned = !!manager.trySetSlotPlugin(runtime.mapping, objectId, args.plugin_uid, args.confirm_replace === true);
-        after = pluginSlotState(root, objectId);
-        runtime.revision += 1;
-        changed = before.unique_id !== after.unique_id || before.title !== after.title || before.unique_name !== after.unique_name
-            || before.parameter_total !== after.parameter_total || before.child_objects !== after.child_objects;
-        return {action: 'assign', assigned: assigned, dont_ask_discard: args.confirm_replace === true,
-            prior_slot: before, slot: after, slot_changed: changed, verified: false,
-            note: args.confirm_replace === true
-                ? 'confirm_replace was true, so existing plug-in contents can be discarded without a host prompt.'
-                : 'The host decides whether to prompt before discarding existing plug-in contents; confirm_replace was not set to true.'};
-    }
-    throw new Error('plugin action is unavailable; supported actions are set_parameter, inspect_slot and assign');
+    return {selected: selectedIdentity(), state: runtime.state, state_revision: runtime.stateRevision, source: 'callback_mirror', fresh: false};
 }
+function directSet(args) {
+    var root, objectId = Number(args.object_id), tag = Number(args.parameter_tag), result, guard = null, identity = null;
+    if (!isFinite(objectId) || !isFinite(tag)) { throw codedError('INVALID_ARGUMENT', 'object_id and parameter_tag are required numbers'); }
+    if (args.target) { identity = resolveTarget(args.target); root = mixerRoot(); }
+    else if (args.expected_selected && (args.root || 'selected_track') === 'selected_track') { guard = assertSelected(args.expected_selected); root = directRoot('selected_track'); }
+    else { throw codedError('TARGET_REQUIRED', 'direct writes require a target channel or expected_selected on the selected_track root'); }
+    if (!objectInTree(root, objectId, 1024, identity ? identity.object_id : undefined)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id ' + objectId + ' is not part of the resolved target'); }
+    result = applyParameter(root, objectId, tag, args);
+    result.target = identity || guard; result.object_id = objectId; result.parameter_tag = tag;
+    return result;
+}
+// A parameter read addressed by target (or pinned selection) is a fresh host read; without an address the call is
+// a bounded snapshot of a DirectAccess root.
+function directGet(args) {
+    var root, identity, objectId, tag;
+    if (args.object_id !== undefined && args.parameter_tag !== undefined && (args.target || args.expected_selected)) {
+        if (args.target) { identity = resolveTarget(args.target); root = mixerRoot(); }
+        else { identity = assertSelected(args.expected_selected); root = directRoot('selected_track'); }
+        objectId = Number(args.object_id); tag = Number(args.parameter_tag);
+        if (!isFinite(objectId) || !isFinite(tag)) { throw codedError('INVALID_ARGUMENT', 'object_id and parameter_tag must be numbers'); }
+        if (!objectInTree(root, objectId, 1024, args.target ? identity.object_id : undefined)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id is not part of the resolved target'); }
+        return {target: identity, object_id: objectId, read: readParameter(root, objectId, tag), fresh: true};
+    }
+    if (args.target) { resolveTarget(args.target); args.root = 'mixer'; }
+    return directSnapshot(args);
+}
+
+// ---- plug-ins ---------------------------------------------------------------------------------------------
 function pluginSlotState(root, objectId) {
     return {object_id: objectId, unique_name: root.getObjectUniqueName(runtime.mapping, objectId),
         unique_id: root.getObjectUniqueIDString(runtime.mapping, objectId),
@@ -592,54 +755,109 @@ function pluginSlotState(root, objectId) {
         parameter_total: root.getNumberOfParameters(runtime.mapping, objectId),
         child_objects: root.getNumberOfChildObjects(runtime.mapping, objectId)};
 }
+function pluginRoot(args) {
+    if (args.target) { return {root: mixerRoot(), guard: null, scope: resolveTarget(args.target).object_id}; }
+    if (args.expected_selected) { return {root: directRoot('selected_track'), guard: assertSelected(args.expected_selected), scope: undefined}; }
+    throw codedError('TARGET_REQUIRED', 'plug-in slot operations require a target channel or expected_selected');
+}
+function pluginGet(args) {
+    var located, manager;
+    if (args.action === 'catalog') {
+        // No enumeration member of a plug-in manager is declared by the installed MIDI Remote API, so no UID list
+        // can be produced. UIDs are never synthesised from names.
+        manager = runtime.directRoots.selected_track ? runtime.directRoots.selected_track.mPluginManager : null;
+        return {available: false, reason: 'PLUGIN_CATALOG_UNAVAILABLE', plugin_manager_present: !!manager, entries: []};
+    }
+    if (args.action === 'inspect_slot') {
+        located = pluginRoot(args);
+        if (!isFinite(Number(args.object_id))) { throw codedError('INVALID_ARGUMENT', 'object_id of the plug-in slot is required'); }
+        return {slot: pluginSlotState(located.root, Number(args.object_id)), target: located.guard,
+            api_1_3_plugin_manager: !!(located.root.mPluginManager && located.root.mPluginManager.trySetSlotPlugin)};
+    }
+    return directSnapshot(args);
+}
+function pluginSet(args) {
+    var located, manager, objectId, before, after, assigned, dispatchRevision;
+    if (args.action === 'set_parameter') { return directSet(args); }
+    if (args.action !== 'assign') { throw codedError('INVALID_ACTION', 'plugin action is unavailable; supported actions are set_parameter and assign'); }
+    located = pluginRoot(args); manager = located.root.mPluginManager; objectId = Number(args.object_id);
+    if (!manager || !manager.trySetSlotPlugin) { throw codedError('UNSUPPORTED_CAPABILITY', 'plug-in slot assignment requires MIDI Remote API 1.3; this host does not expose mPluginManager.trySetSlotPlugin'); }
+    if (!isFinite(objectId) || objectId < 0) { throw codedError('INVALID_ARGUMENT', 'object_id of the target plug-in slot is required'); }
+    if (typeof args.plugin_uid !== 'string' || args.plugin_uid.length === 0) { throw codedError('INVALID_ARGUMENT', 'plugin_uid is required for plug-in slot assignment'); }
+    if (!objectInTree(located.root, objectId, 1024, located.scope)) { throw codedError('TARGET_SCOPE_MISMATCH', 'object_id is not a slot of the resolved target'); }
+    before = pluginSlotState(located.root, objectId);
+    if (args.expected_slot_unique_id !== undefined && args.expected_slot_unique_id !== before.unique_id) { throw codedError('TARGET_CHANGED', 'the slot content changed after the assignment was planned; nothing was changed', {observed: before}); }
+    runtime.revision += 1; dispatchRevision = runtime.revision;
+    assigned = !!manager.trySetSlotPlugin(runtime.mapping, objectId, args.plugin_uid, args.confirm_replace === true);
+    after = pluginSlotState(located.root, objectId);
+    return receipt('assign', true, {accepted: assigned, dont_ask_discard: args.confirm_replace === true, prior_slot: before, slot: after,
+        requested_plugin_uid: args.plugin_uid, target: located.guard, dispatch_revision: dispatchRevision,
+        note: 'The host does not report the loaded plug-in UID back through this API; the broker decides verification.'});
+}
 function capabilities() {
-    return {host_version: hostVersion(), api_1_2_direct_access: !!page.mHostAccess.makeDirectAccess,
+    return {host_version: hostVersion(), driver_contract_version: DRIVER_CONTRACT_VERSION, driver_build_id: DRIVER_BUILD_ID,
+        api_1_2_direct_access: !!page.mHostAccess.makeDirectAccess,
         api_1_3_command_can_perform: runtime.commandBindings.length > 0 && !!runtime.commandBindings[0].canPerform,
         api_1_3_plugin_manager: !!(runtime.directRoots.selected_track && runtime.directRoots.selected_track.mPluginManager),
+        plugin_catalog: false, target_identity: !!runtime.directRoots.mixer,
         command_count: runtime.commandIds.length,
-        operations: ['status.get','capabilities.get','command.execute','command.can_perform','transport.get','transport.set','track.get','track.set','mixer.get','mixer.set','plugin.get','plugin.set','direct.get','direct.set']};
+        operations: ['status.get','capabilities.get','command.execute','command.can_perform','transport.get','transport.set','track.get','track.list','track.set','mixer.get','mixer.set','plugin.get','plugin.set','direct.get','direct.set']};
 }
 function dispatch(frame, envelope) {
-    var operation = envelope.operation, args = envelope.arguments || {}, result, cached = operation === 'system.hello' ? null : runtime.completed[cacheKey(frame)];
-    if (cached) { sendEnvelope(cached.kind, frame.requestId, frame.opcode, cached.envelope); return; }
-    if (operation !== 'system.hello' && frame.sessionId !== runtime.sessionId) { fail(frame, 'STALE_SESSION', 'request targets a stale driver session', {expected: runtime.sessionId, received: frame.sessionId}); return; }
-    if (operation === 'system.hello') { respond(frame, {session_id: runtime.sessionId, client_nonce: args.client_nonce || '', capabilities: capabilities()}, true); }
-    else if (operation === 'system.heartbeat') { sendEnvelope(KIND.heartbeat, frame.requestId, frame.opcode, {ok: true, data: {online: runtime.active}, verified: true, revision: runtime.revision}); }
+    var operation = envelope.operation, args = envelope.arguments || {}, result, cached;
+    if (operation === 'system.hello') {
+        respond(frame, {session_id: runtime.sessionId, client_nonce: args.client_nonce || '', driver_contract_version: DRIVER_CONTRACT_VERSION,
+            driver_build_id: DRIVER_BUILD_ID, capabilities: capabilities()}, true);
+        return;
+    }
+    // Stale sessions are refused before the request cache is consulted, so an old session can never receive a
+    // cached (or new) result for a request it did not own in this activation.
+    if (frame.sessionId !== runtime.sessionId) { fail(frame, 'STALE_SESSION', 'request targets a stale driver session', {expected: runtime.sessionId, received: frame.sessionId}); return; }
+    cached = runtime.completed[cacheKey(frame)];
+    if (cached) {
+        if (cached.digest !== payloadDigest(frame)) { fail(frame, 'REQUEST_ID_CONFLICT', 'request id was reused with a different operation or payload; nothing was executed'); return; }
+        sendEnvelope(cached.kind, frame.requestId, frame.opcode, cached.envelope); return;
+    }
+    if (operation === 'system.heartbeat') { sendEnvelope(KIND.heartbeat, frame.requestId, frame.opcode, {ok: true, data: {online: runtime.active}, verified: true, revision: runtime.revision}); }
     else if (operation === 'status.get') { respond(frame, stateSnapshot(), true); }
     else if (operation === 'capabilities.get') { respond(frame, capabilities(), true); }
     else if (operation === 'command.can_perform') { respond(frame, commandCapability(args), true); }
-    else if (operation === 'command.execute') { result = executeCommand(args); respond(frame, result, false); }
-    else if (operation === 'transport.get') { respond(frame, runtime.state, true); }
-    else if (operation === 'transport.set') { result = setTransport(args); respond(frame, result, !!result.verified); }
-    else if (operation === 'track.get') { respond(frame, {selected_track: runtime.state.selectedTrack}, true); }
+    else if (operation === 'command.execute') { respond(frame, executeCommand(args), false); }
+    else if (operation === 'transport.get') { respond(frame, stateSnapshot(), true); }
+    else if (operation === 'transport.set') { respond(frame, setTransport(args), false); }
+    else if (operation === 'track.get') { respond(frame, {selected: selectedIdentity(), selected_track: runtime.state.selectedTrack}, true); }
+    else if (operation === 'track.list') { respond(frame, trackList(args), true); }
     else if (operation === 'track.set') { respond(frame, setTrack(args), false); }
-    else if (operation === 'mixer.get') { respond(frame, runtime.state, true); }
-    else if (operation === 'mixer.set') { result = setMixer(args); respond(frame, result, !!result.verified); }
-    else if (operation === 'plugin.get' || operation === 'direct.get') { respond(frame, directSnapshot(args), true); }
-    else if (operation === 'plugin.set') { result = pluginSet(args); respond(frame, result, !!result.verified); }
-    else if (operation === 'direct.set') { result = directSet(args); respond(frame, result, !!result.verified); }
+    else if (operation === 'mixer.get') { respond(frame, getMixer(args), true); }
+    else if (operation === 'mixer.set') { result = setMixer(args); respond(frame, result, false); }
+    else if (operation === 'plugin.get') { respond(frame, pluginGet(args), true); }
+    else if (operation === 'direct.get') { respond(frame, directGet(args), true); }
+    else if (operation === 'plugin.set') { respond(frame, pluginSet(args), false); }
+    else if (operation === 'direct.set') { respond(frame, directSet(args), false); }
     else if (operation === 'project.get') { respond(frame, {state: runtime.state, host_version: hostVersion()}, true); }
     else { fail(frame, 'UNSUPPORTED_CAPABILITY', 'operation requires command or UI fallback', {operation: operation}); }
 }
 
 midiInput.mOnSysex = function (activeDevice, message) {
-    var frame, complete, envelope;
+    var frame = null, complete = null, envelope;
     runtime.device = activeDevice;
-    try { frame = decodeChunk(message); complete = acceptChunk(frame); if (!complete) { return; } envelope = JSON.parse(utf8Decode(complete.payload)); if (!envelope || typeof envelope.operation !== 'string') { throw new Error('invalid request envelope'); } dispatch(complete, envelope); }
-    catch (error) { try { fail(frame || null, 'PROTOCOL_ERROR', String(error && error.message ? error.message : error)); } catch (ignored) { console.log('CBMCP protocol error: ' + error); } }
+    try { frame = decodeChunk(message); complete = acceptChunk(frame); if (!complete) { return; } envelope = JSON.parse(utf8Decode(complete.payload)); if (!envelope || typeof envelope.operation !== 'string') { throw new Error('invalid request envelope'); } }
+    catch (error) { try { fail(frame || null, 'PROTOCOL_ERROR', String(error && error.message ? error.message : error)); } catch (ignored) { console.log('CBMCP protocol error: ' + error); } return; }
+    try { dispatch(complete, envelope); }
+    catch (failure) { try { fail(complete, failure && failure.code ? failure.code : 'OPERATION_FAILED', String(failure && failure.message ? failure.message : failure), failure && failure.details ? failure.details : {}); } catch (ignored2) { console.log('CBMCP dispatch error: ' + failure); } }
 };
 
 page.mOnActivate = function (activeDevice, activeMapping) {
     var name;
     runtime.active = true; runtime.device = activeDevice; runtime.mapping = activeMapping; runtime.sessionId = makeSessionId(); runtime.completed = {}; runtime.pendingChunks = {}; runtime.revision += 1;
+    resetMirror();
     for (name in runtime.directRoots) { if (runtime.directRoots.hasOwnProperty(name)) { runtime.directRoots[name].activate(activeMapping); } }
-    for (name in runtime.mixRoots) { if (runtime.mixRoots.hasOwnProperty(name) && runtime.mixRoots[name].root.activate) { runtime.mixRoots[name].root.activate(activeMapping); runtime.mixRoots[name].mapping = activeMapping; } }
 };
 page.mOnDeactivate = function (activeDevice, activeMapping) {
     var name;
     for (name in runtime.directRoots) { if (runtime.directRoots.hasOwnProperty(name)) { runtime.directRoots[name].deactivate(activeMapping); } }
-    for (name in runtime.mixRoots) { if (runtime.mixRoots.hasOwnProperty(name) && runtime.mixRoots[name].root.deactivate) { runtime.mixRoots[name].root.deactivate(activeMapping); } }
-    runtime.active = false; runtime.device = null; runtime.mapping = null; runtime.sessionId = makeSessionId(); runtime.revision += 1;
+    runtime.active = false; runtime.device = null; runtime.mapping = null; runtime.sessionId = makeSessionId(); runtime.completed = {}; runtime.revision += 1;
+    resetMirror();
 };
 
 """;

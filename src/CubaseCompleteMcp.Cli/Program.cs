@@ -11,7 +11,17 @@ try
     switch (command)
     {
         case "generate":
-            Print(Generate(args.Skip(1).FirstOrDefault() ?? Path.Combine(paths.RepositoryRoot, "artifacts", "driver")));
+            Print(Generate(args.Skip(1).FirstOrDefault(value => !value.StartsWith("--", StringComparison.Ordinal))
+                    ?? Path.Combine(paths.RepositoryRoot, "artifacts", "driver"),
+                OptionValue(args, "--catalog"), OptionValue(args, "--source-sha")));
+            break;
+        case "release-manifest":
+            Print(WriteReleaseManifest(args));
+            break;
+        case "validate-release":
+            RequireArgument(args, 1, "validate-release <release-directory> [--manifest-sha256 <hash>] [--allow-dirty]");
+            Print(DescribeRelease(ReleaseManifestService.Validate(args[1], new ReleaseValidationOptions(
+                args.Contains("--allow-dirty", StringComparer.OrdinalIgnoreCase), OptionValue(args, "--manifest-sha256")))));
             break;
         case "backup":
             Print(new BackupService(paths).Create(args.Skip(1).FirstOrDefault() ?? "manual"));
@@ -39,7 +49,7 @@ try
         case "help":
         case "--help":
         case "-h":
-            Console.WriteLine("Cubase Complete MCP CLI\n\n  generate [directory]\n  backup [label]\n  restore <backup-directory> --confirm\n  setup [--deactivate-legacy]\n  doctor\n  cleanup-sessions --older-than-days <N> [--confirmation-id <ID>]\n  register-codex [--allow-debug]\n  unregister-codex");
+            Console.WriteLine("Cubase Complete MCP CLI\n\n  generate [directory] [--catalog <Key Commands.xml>] [--source-sha <sha>]\n  release-manifest <payload-dir> --release-id <id> --candidate-sha <sha> --source-dirty <true|false> --dotnet-sdk <v> --node-version <v> --catalog <xml>\n  validate-release <release-dir> [--manifest-sha256 <hash>] [--allow-dirty]\n  backup [label]\n  restore <backup-directory> --confirm\n  setup [--deactivate-legacy]\n  doctor [--release <release-dir>]\n  cleanup-sessions --older-than-days <N> [--confirmation-id <ID>]\n  register-codex --release <release-dir> [--manifest-sha256 <hash>] [--validate-only] | --debug-server <dll>\n  unregister-codex");
             break;
         default:
             throw new ArgumentException($"Unknown command '{command}'. Run with --help.");
@@ -52,11 +62,40 @@ catch (Exception error) when (error is IOException or InvalidDataException or In
     Environment.ExitCode = 1;
 }
 
-DriverGenerationResult Generate(string output)
+DriverGenerationResult Generate(string output, string? catalogPath = null, string? sourceSha = null)
 {
-    var catalog = KeyCommandCatalog.Load(paths.KeyCommandsFile);
-    return new MidiRemoteDriverGenerator().Generate(catalog, Path.GetFullPath(output));
+    var catalog = KeyCommandCatalog.Load(catalogPath ?? paths.KeyCommandsFile);
+    var identity = BuildIdentityService.Current();
+    return new MidiRemoteDriverGenerator().Generate(catalog, Path.GetFullPath(output),
+        sourceSha ?? identity.GitSha ?? "unversioned");
 }
+
+object WriteReleaseManifest(string[] input)
+{
+    RequireArgument(input, 1, "release-manifest <payload-dir> --release-id <id> --candidate-sha <sha> --source-dirty <true|false> --dotnet-sdk <v> --node-version <v> --catalog <xml>");
+    string Required(string name) => OptionValue(input, name) ?? throw new ArgumentException($"{name} is required.");
+    var payload = Path.GetFullPath(input[1]);
+    var candidate = Required("--candidate-sha");
+    // The source release carries a driver generated from the repository reference catalog, so its build ID is
+    // reproducible; a user's local catalog is only used at installation time (see the installation receipt).
+    var generated = Generate(Path.Combine(payload, "driver"), Required("--catalog"), candidate);
+    var manifest = ReleaseManifestService.Build(payload, Required("--release-id"), candidate,
+        bool.Parse(Required("--source-dirty")), "Release", Required("--dotnet-sdk"), Required("--node-version"),
+        generated.DriverBuildId, generated.CatalogInputSha256, generated.GeneratorSourceSha);
+    var path = ReleaseManifestService.Write(payload, manifest);
+    return new
+    {
+        manifest = path, manifest_sha256 = ReleaseManifestService.HashFile(path), manifest.ReleaseId, manifest.CandidateGitSha,
+        manifest.SourceDirty, file_count = manifest.Files.Count, manifest.DriverBuildId, manifest.CatalogInputSha256
+    };
+}
+
+object DescribeRelease(ValidatedRelease release) => new
+{
+    status = "valid", release.Root, release.ManifestSha256, release.ServerPath, release.Manifest.ReleaseId,
+    release.Manifest.CandidateGitSha, release.Manifest.SourceDirty, file_count = release.Manifest.Files.Count,
+    release.Manifest.DriverBuildId, release.Manifest.PipeProtocolVersion, release.Manifest.DriverContractVersion
+};
 
 object Setup(string[] input)
 {
@@ -67,6 +106,7 @@ object Setup(string[] input)
     try
     {
         new BackupService(paths).InstallActiveDriver(staging);
+        var receipt = WriteInstallationReceipt(generated, backup.Root);
         string? disabledLegacy = null;
         if (input.Contains("--deactivate-legacy", StringComparer.OrdinalIgnoreCase))
         {
@@ -78,13 +118,33 @@ object Setup(string[] input)
                 Directory.Move(legacy, disabledLegacy);
             }
         }
-        return new { installed = paths.ActiveDriverDirectory, backup, generated, disabled_legacy = disabledLegacy };
+        return new { installed = paths.ActiveDriverDirectory, backup, generated, installation_receipt = receipt, disabled_legacy = disabledLegacy,
+            next_step = "Restart Cubase so MIDI Remote loads the new driver, then run doctor to compare the loaded driver build ID with this receipt." };
     }
     catch
     {
         new BackupService(paths).Restore(backup.Root, true);
         throw;
     }
+}
+
+string WriteInstallationReceipt(DriverGenerationResult generated, string backupRoot)
+{
+    var identity = BuildIdentityService.Current();
+    var manifestPath = Path.Combine(AppContext.BaseDirectory, ReleaseManifestService.ManifestFileName);
+    var installedDriver = Path.Combine(paths.ActiveDriverDirectory, MidiRemoteDriverGenerator.DriverFileName);
+    var installedCatalog = Path.Combine(paths.ActiveDriverDirectory, MidiRemoteDriverGenerator.CatalogFileName);
+    var receipt = new InstallationReceipt(1, identity.GitSha ?? "unversioned",
+        File.Exists(manifestPath) ? ReleaseManifestService.HashFile(manifestPath) : "development-build",
+        DateTimeOffset.UtcNow, generated.CatalogInputSha256, HashFile(installedDriver) ?? string.Empty,
+        HashFile(installedCatalog) ?? string.Empty, generated.DriverBuildId, null,
+        "%USERPROFILE%/Documents/Steinberg/Cubase/MIDI Remote/Driver Scripts/Local/CBMCP/CompleteBridge",
+        Path.GetFileName(backupRoot));
+    var directory = Path.Combine(paths.LocalStateRoot, "installation-receipts");
+    Directory.CreateDirectory(directory);
+    var path = Path.Combine(directory, $"{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}-{generated.DriverBuildId[..12]}.json");
+    File.WriteAllText(path, JsonSerializer.Serialize(receipt, JsonOptions()));
+    return path;
 }
 
 async Task<object> DoctorAsync()
@@ -106,8 +166,13 @@ async Task<object> DoctorAsync()
         var catalog = File.Exists(paths.KeyCommandsFile) ? KeyCommandCatalog.Load(paths.KeyCommandsFile) : null;
         ValidatedRelease? release = null;
         string? releaseError = null;
-        try { release = ReleaseManifestService.FindLatestValid(Path.Combine(paths.RepositoryRoot, "artifacts", "publish")); }
-        catch (Exception error) when (error is IOException or InvalidDataException or JsonException) { releaseError = error.Message; }
+        var releaseOption = OptionValue(args, "--release");
+        if (releaseOption is null) releaseError = "No --release <directory> was given; releases are never auto-selected by timestamp.";
+        else
+        {
+            try { release = ReleaseManifestService.Validate(releaseOption); }
+            catch (Exception error) when (error is IOException or InvalidDataException or JsonException) { releaseError = error.Message; }
+        }
         var registeredCommand = GetRegisteredCodexCommand();
         var activeDriverScript = Path.Combine(paths.ActiveDriverDirectory, "CBMCP_CompleteBridge.js");
         var generatedDriverScript = Path.Combine(paths.RepositoryRoot, "artifacts", "driver", "CBMCP_CompleteBridge.js");
@@ -136,18 +201,42 @@ async Task<object> DoctorAsync()
             codex_registered_server = registeredCommand,
             codex_registration_matches_release = release is not null && registeredCommand is not null
                 && Path.GetFullPath(registeredCommand).Equals(Path.GetFullPath(release.ServerPath), StringComparison.OrdinalIgnoreCase),
+            selected_release_manifest_sha256 = release?.ManifestSha256,
             requesting_client_release_id = clientIdentity.ReleaseId,
             active_broker_release_id = brokerStatus?.Data?["broker_release_id"]?.GetValue<string>(),
             active_broker_path = brokerStatus?.Data?["broker_executable_path"]?.GetValue<string>(),
             running_server_processes = serverProcesses,
             running_broker_processes = brokerProcesses,
             stale_server_processes = serverProcesses.Where(item => item.IsStale).ToArray(),
-            catalog_matches_expected = catalog?.Commands.Count == 2777 && catalog.CategoryCount == 69,
+            latest_installation_receipt = LatestInstallationReceipt(),
+            installation_check = InstallationCheckFor(activeDriverHash, brokerStatus),
+            loaded_driver_build_id = brokerStatus?.Data?["status"]?["data"]?["driver_build_id"]?.GetValue<string>(),
+            loaded_driver_contract_version = brokerStatus?.Data?["status"]?["data"]?["driver_contract_version"]?.ToJsonString(),
             paths,
             broker_status = brokerStatus,
             broker_error = brokerError
         };
     }
+}
+
+object? InstallationCheckFor(string? activeDriverHash, BrokerResponse? brokerStatus)
+{
+    var directory = Path.Combine(paths.LocalStateRoot, "installation-receipts");
+    var latest = Directory.Exists(directory)
+        ? Directory.EnumerateFiles(directory, "*.json").OrderByDescending(path => path, StringComparer.Ordinal).FirstOrDefault() : null;
+    if (latest is null) return new { ok = false, problems = new[] { "No installation receipt exists; run setup." } };
+    var receipt = JsonSerializer.Deserialize<InstallationReceipt>(File.ReadAllText(latest), JsonOptions())!;
+    var status = brokerStatus?.Data?["status"]?["data"];
+    var contract = status?["driver_contract_version"] is { } node && int.TryParse(node.ToJsonString(), out var parsed) ? parsed : (int?)null;
+    return InstallationCheck.Evaluate(receipt, activeDriverHash, status?["driver_build_id"]?.GetValue<string>(), contract);
+}
+
+object? LatestInstallationReceipt()
+{
+    var directory = Path.Combine(paths.LocalStateRoot, "installation-receipts");
+    if (!Directory.Exists(directory)) return null;
+    var latest = Directory.EnumerateFiles(directory, "*.json").OrderByDescending(path => path, StringComparer.Ordinal).FirstOrDefault();
+    return latest is null ? null : JsonDocument.Parse(File.ReadAllText(latest)).RootElement.Clone();
 }
 
 object CleanupSessions(string[] input)
@@ -179,27 +268,40 @@ object CleanupSessions(string[] input)
 
 object RegisterCodex(bool remove, string[] input)
 {
+    if (!remove && input.Contains("--validate-only", StringComparer.OrdinalIgnoreCase))
+    {
+        // Validation only: no Codex call and no configuration write.
+        var releaseRoot = OptionValue(input, "--release") ?? throw new ArgumentException("--release <release-directory> is required.");
+        var validated = ReleaseManifestService.Validate(releaseRoot, new ReleaseValidationOptions(false, OptionValue(input, "--manifest-sha256")));
+        return new { action = "validated_only", configuration_written = false, release = DescribeRelease(validated) };
+    }
     var codex = FindExecutable("codex.cmd") ?? FindExecutable("codex.exe")
         ?? throw new FileNotFoundException("codex command was not found on PATH.");
+    var previous = RunCodex(codex, ["mcp", "get", CubaseConstants.ServerName], allowFailure: true);
+    var backupDirectory = Path.Combine(paths.LocalStateRoot, "registration-backups");
+    Directory.CreateDirectory(backupDirectory);
+    var backupPath = Path.Combine(backupDirectory, $"{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}-{CubaseConstants.ServerName}.txt");
+    File.WriteAllText(backupPath, previous.ExitCode == 0 ? previous.Output : "(no previous registration)");
     if (remove)
     {
         var removed = RunCodex(codex, ["mcp", "remove", CubaseConstants.ServerName], allowFailure: true);
-        return new { action = "unregistered", name = CubaseConstants.ServerName, output = removed.Output.Trim() };
+        return new { action = "unregistered", name = CubaseConstants.ServerName, previous_registration_backup = backupPath, output = removed.Output.Trim() };
     }
 
     string server;
     ValidatedRelease? release = null;
-    try
+    if (OptionValue(input, "--debug-server") is { } debugServer)
     {
-        release = ReleaseManifestService.FindLatestValid(Path.Combine(paths.RepositoryRoot, "artifacts", "publish"));
-        server = release.ServerPath;
+        // Development registration: explicit build output only, reported as such.
+        server = Path.GetFullPath(debugServer);
+        if (!File.Exists(server)) throw new FileNotFoundException("The --debug-server file does not exist.", server);
     }
-    catch (Exception error) when (error is IOException or InvalidDataException or JsonException)
+    else
     {
-        if (!input.Contains("--allow-debug", StringComparer.OrdinalIgnoreCase)) throw;
-        server = Path.Combine(paths.RepositoryRoot, "src", "CubaseCompleteMcp.Server", "bin", "Debug",
-            "net8.0-windows10.0.19041.0", "CubaseCompleteMcp.Server.dll");
-        if (!File.Exists(server)) throw new FileNotFoundException("No valid Release or explicit Debug server was found.", server, error);
+        var releaseRoot = OptionValue(input, "--release") ?? throw new ArgumentException(
+            "--release <release-directory> is required; the newest timestamp is never selected automatically.");
+        release = ReleaseManifestService.Validate(releaseRoot, new ReleaseValidationOptions(false, OptionValue(input, "--manifest-sha256")));
+        server = release.ServerPath;
     }
 
     _ = RunCodex(codex, ["mcp", "remove", CubaseConstants.ServerName], allowFailure: true);
@@ -209,9 +311,9 @@ object RegisterCodex(bool remove, string[] input)
     var added = RunCodex(codex, arguments);
     return new
     {
-        action = "registered", name = CubaseConstants.ServerName, server,
-        release_id = release?.Manifest.ReleaseId, git_sha = release?.Manifest.GitSha,
-        activation_pending_new_task = true,
+        action = release is null ? "registered_debug_build" : "registered", name = CubaseConstants.ServerName, server,
+        release_id = release?.Manifest.ReleaseId, git_sha = release?.Manifest.CandidateGitSha, manifest_sha256 = release?.ManifestSha256,
+        previous_registration_backup = backupPath, activation_pending_new_task = true,
         stale_server_processes = RuntimeProcesses("CubaseCompleteMcp.Server", release?.Manifest.ReleaseId)
             .Where(item => item.IsStale).ToArray(),
         output = added.Output.Trim()
@@ -223,9 +325,15 @@ object RegisterCodex(bool remove, string[] input)
     var start = new ProcessStartInfo(executable) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
     foreach (var argument in arguments) start.ArgumentList.Add(argument);
     using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start the Codex CLI.");
-    var stdout = process.StandardOutput.ReadToEnd();
-    var stderr = process.StandardError.ReadToEnd();
-    process.WaitForExit();
+    var stdoutTask = process.StandardOutput.ReadToEndAsync();
+    var stderrTask = process.StandardError.ReadToEndAsync();
+    if (!process.WaitForExit(60_000))
+    {
+        process.Kill(entireProcessTree: true);
+        throw new InvalidOperationException("The Codex CLI did not finish within 60 seconds.");
+    }
+    var stdout = stdoutTask.GetAwaiter().GetResult();
+    var stderr = stderrTask.GetAwaiter().GetResult();
     if (!allowFailure && process.ExitCode != 0) throw new InvalidOperationException($"Codex command failed: {stderr.Trim()}");
     return (process.ExitCode, stdout, stderr);
 }
