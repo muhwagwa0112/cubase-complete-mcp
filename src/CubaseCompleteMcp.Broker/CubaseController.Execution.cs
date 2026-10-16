@@ -102,7 +102,13 @@ public sealed partial class CubaseController
                     ["dispatch_revision"] = dispatchRevision, ["time_format"] = snapshot["time_formats"]?[key]?.DeepClone()
                 };
                 if (!sameSession) return new Observation(false, observed, "driver.transport.get", ContextChanged: true);
-                var satisfied = fresh && context.Operation.Action switch
+                // Live on Cubase 15.0.10: the driver compares time text verbatim, so "1.1.1.0" was sent although the
+                // left locator already read "1. 1. 1.  0", and Cubase reports no change for a time that did not move.
+                // A time target already met before the dispatch is therefore confirmed by the read without a newer callback.
+                var alreadyAtTarget = revision is not null && context.Operation.Action is "position" or "left_locator" or "right_locator"
+                    && receipt["before"]?.GetValue<string>() is { } beforeText && receipt["desired"]?.GetValue<string>() is { } desiredText
+                    && PostconditionVerifier.CanonicalTimeText(beforeText) == PostconditionVerifier.CanonicalTimeText(desiredText);
+                var satisfied = (fresh || alreadyAtTarget) && context.Operation.Action switch
                 {
                     "tempo" => PostconditionVerifier.WithinTempo(ReadDouble(state["tempo"]), ReadDouble(receipt["desired"]) ?? double.NaN),
                     "position" or "left_locator" or "right_locator" =>
@@ -113,7 +119,9 @@ public sealed partial class CubaseController
                     _ => ReadBool(state[key]) is { } value && ReadBool(receipt["desired"]) == value
                 };
                 return new Observation(satisfied, observed, "driver.transport.get",
-                    Note: fresh ? null : "No host callback newer than the dispatch has been observed yet.");
+                    Note: fresh ? null : alreadyAtTarget
+                        ? "The time was already at the target before the dispatch, so Cubase sent no newer callback."
+                        : "No host callback newer than the dispatch has been observed yet.");
             };
         }, _timings.TransportAndMixer, context.Operation.Action == "tempo" ? "abs(bpm) <= 0.01" : "exact", cancellationToken);
     }

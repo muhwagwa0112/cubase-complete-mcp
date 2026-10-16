@@ -109,6 +109,27 @@ public sealed class G03VerificationBatchTests
     }
 
     [Fact]
+    public async Task VER06_LocatorAlreadyAtTargetInHostSpellingIsVerifiedWithoutACallback()
+    {
+        // Live on Cubase 15.0.10 (LIVE-07): the left locator read "1. 1. 1.  0", "1.1.1.0" was sent, Cubase reported
+        // no change, and the broker timed out waiting for a callback newer than the dispatch.
+        using var harness = new ControllerHarness();
+        harness.Driver.HostChange("leftLocator", "1. 1. 1.  0");
+        var left = await harness.SendAsync("transport", new JsonObject { ["action"] = "left_locator", ["position_text"] = "1.1.1.0", ["time_format"] = "Bars+Beats" });
+        Assert.Equal(ResultStatus.Ok, left.Status);
+        Assert.Equal(1, harness.Driver.WriteCount("transport.set"));
+        Assert.Equal("1. 1. 1.  0", harness.Driver.State["leftLocator"]!.GetValue<string>());
+        Assert.Equal(1, left.Data!["verification"]!["reads"]!.GetValue<int>());
+
+        // A time that had to move still needs a newer host callback.
+        harness.Driver.CallbackDelay = null;
+        var right = await harness.SendAsync("transport", new JsonObject { ["action"] = "right_locator", ["position_text"] = "3.1.1.0", ["time_format"] = "Bars+Beats" });
+        Assert.Equal(ResultStatus.Unverified, right.Status);
+        Assert.Equal(ErrorCodes.PostconditionTimeout, right.Error!.Code);
+        Assert.Equal(2, harness.Driver.WriteCount("transport.set"));
+    }
+
+    [Fact]
     public void MidiChannelValuesAreAcceptedWithinHalfASevenBitStep()
     {
         // Live on Cubase 15: pan 0.2 on a MIDI track reads back as 25/127.

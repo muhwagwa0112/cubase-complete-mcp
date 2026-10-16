@@ -252,9 +252,10 @@ try {
   });
 
   await runCase('LIVE-07', async (expect, attach) => {
-    await a.call('cubase_transport', { action: 'left_locator', position_text: '1.1.1.0', time_format: 'Bars+Beats' });
+    const left = await a.call('cubase_transport', { action: 'left_locator', position_text: '1.1.1.0', time_format: 'Bars+Beats' });
+    if (left.status !== 'Ok') return blockedEnv(`left locator could not be set in Bars+Beats: ${left.error?.code ?? left.status}`);
     const right = await a.call('cubase_transport', { action: 'right_locator', position_text: '3.1.1.0', time_format: 'Bars+Beats' });
-    if (right.status !== 'Ok') return blockedEnv(`locators could not be set in Bars+Beats: ${right.error?.code}`);
+    if (right.status !== 'Ok') return blockedEnv(`right locator could not be set in Bars+Beats: ${right.error?.code ?? right.status}`);
     const wav = join(fixture, 'mixdown.wav');
     const exported = await a.call('cubase_project', { action: 'export_audio', path: wav, expected_duration_seconds: 4.0 });
     if (exported.status === 'Ok') attach(wav, 'mixdown.wav');
