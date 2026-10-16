@@ -1,6 +1,6 @@
 # Capability matrix
 
-Support levels: **implemented** (code exists), **mock_validated** (offline tests with fake host adapters and the generated driver in a mock MIDI Remote host), **live_validated** (verified on an owned Cubase 15.0.10 fixture on 2026-09-28), **unsupported**, **blocked_environment** (needs an API or environment that is not available), **best_effort**.
+Support levels: **implemented** (code exists), **mock_validated** (offline tests with fake host adapters and the generated driver in a mock MIDI Remote host), **live_validated** (verified on an owned Cubase 15.0.10 fixture on 2026-09-28, re-run on candidate 8079732 on 2026-10-16), **unsupported**, **blocked_environment** (needs an API or environment that is not available), **best_effort**.
 
 | Area | Path | Level | Postcondition / contract |
 |---|---|---|---|
@@ -10,7 +10,7 @@ Support levels: **implemented** (code exists), **mock_validated** (offline tests
 | Tempo | Time display | live_validated | Fresh BPM within 0.01 |
 | Position / locators | Time display | mock_validated | `position_text` in the host's reported `time_format`; other formats `UNSUPPORTED_TIME_FORMAT` |
 | Track list | DirectAccess `VST Mixer` children | live_validated | Handles bind the unique ID string and object ID; `bank_truncated` beyond 256 channels |
-| Volume / pan / mute / solo / monitor / record enable | DirectAccess on the target channel | live_validated (volume, pan) | Fresh read of the same target (1e-4; MIDI-track volume/pan are 7-bit, half a step); ambiguous/hidden/locked refused |
+| Volume / pan / mute / solo / monitor / record enable | DirectAccess on the target channel | live_validated (volume, pan) | Fresh read of the same target (1e-4; MIDI-track volume/pan are 7-bit, half a step); audio/instrument pan lives on the `Panner` child; ambiguous/hidden/locked refused |
 | EQ, sends, strip, other channel parameters | DirectAccess `parameter_tag` within the target | mock_validated | Fresh read of the same object/tag |
 | Track delete / duplicate | Guarded Key Command | mock_validated (live: the selection-change refusal) | Identity guard in the driver callback; delete confirmed; observed disappearance / one new identity |
 | Track freeze / enable | Guarded Key Command | implemented | No host read-back: `Unverified` |
