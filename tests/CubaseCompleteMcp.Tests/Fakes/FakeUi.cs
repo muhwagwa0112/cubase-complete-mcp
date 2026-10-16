@@ -150,15 +150,30 @@ public sealed class FakeUi : IWorkflowUi
             : UiStageResult.Failure("rename_text", "FOREGROUND_NOT_CUBASE", "not foreground"));
     }
 
-    public Task<UiStageResult> ConfigureExportAsync(UiDialogRef dialog, string directory, string fileName, CancellationToken cancellationToken)
+    /// <summary>File name the fake Export dialog currently shows; Cubase keeps a typed name only when the dialog closes.</summary>
+    public string ExportDialogName { get; set; } = "acceptance";
+    /// <summary>False models format, rate, depth or path that differ from the request.</summary>
+    public bool ExportFormatMatches { get; set; } = true;
+    public string? ExportDirectory { get; private set; }
+
+    public Task<UiStageResult> ReadExportSettingsAsync(UiDialogRef dialog, string directory, string fileName, CancellationToken cancellationToken)
     {
-        Actions.Add("export_configure");
-        return Task.FromResult(OnExportConfigure?.Invoke(directory, fileName) != false ? UiStageResult.Success("export_configured")
-            : UiStageResult.Failure("export_configure", "EXPORT_SETTINGS_MISMATCH", "settings differ"));
+        Actions.Add("export_read:" + ExportDialogName);
+        ExportDirectory = directory;
+        var nameMatches = ExportDialogName == fileName;
+        if (ExportFormatMatches && nameMatches) return Task.FromResult(UiStageResult.Success("export_read"));
+        return Task.FromResult(UiStageResult.Failure("export_read", "EXPORT_SETTINGS_MISMATCH", "settings differ",
+            new JsonObject { ["only_name_differs"] = ExportFormatMatches && !nameMatches }));
     }
 
-    /// <summary>Read-back of the export settings; false models settings that differ from the request.</summary>
-    public Func<string, string, bool>? OnExportConfigure { get; set; }
+    public Task<UiStageResult> CommitExportNameAsync(UiDialogRef dialog, string fileName, CancellationToken cancellationToken)
+    {
+        Actions.Add("export_name:" + fileName);
+        ExportDialogName = fileName;
+        _open.Remove(dialog.Id);
+        AvailableDialogs.Add(DialogKinds.ExportAudio); // the export command opens it again
+        return Task.FromResult(UiStageResult.Success("export_name"));
+    }
 
     public string? PromptText { get; set; }
 

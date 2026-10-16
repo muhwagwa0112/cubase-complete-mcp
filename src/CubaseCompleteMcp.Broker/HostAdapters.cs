@@ -59,9 +59,11 @@ public interface IWorkflowUi
     Task<UiStageResult> TypeRenameTextAsync(string name, CancellationToken cancellationToken);
     /// <summary>Brings the verified Cubase main window to the foreground; sends no keys.</summary>
     Task<UiStageResult> ActivateCubaseAsync(CancellationToken cancellationToken);
-    /// <summary>Sets the export file name and verifies the dialog's settings by read-back; starts nothing.</summary>
-    Task<UiStageResult> ConfigureExportAsync(UiDialogRef dialog, string directory, string fileName,
+    /// <summary>Reads the export dialog's settings back and compares them with the request; starts nothing.</summary>
+    Task<UiStageResult> ReadExportSettingsAsync(UiDialogRef dialog, string directory, string fileName,
         CancellationToken cancellationToken);
+    /// <summary>Types the export file name and closes the dialog, which is when Cubase keeps the name; starts nothing.</summary>
+    Task<UiStageResult> CommitExportNameAsync(UiDialogRef dialog, string fileName, CancellationToken cancellationToken);
     Task<UiStageResult> CancelDialogAsync(UiDialogRef dialog, CancellationToken cancellationToken);
     /// <summary>Recognized text of a bound dialog (PrintWindow + Windows OCR); null when it cannot be read.</summary>
     Task<string?> ReadDialogTextAsync(UiDialogRef dialog, CancellationToken cancellationToken);

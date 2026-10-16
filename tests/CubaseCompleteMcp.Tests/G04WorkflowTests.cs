@@ -256,17 +256,22 @@ public sealed class G04WorkflowTests
         var directory = FixtureDirectory(harness);
         var good = Path.Combine(directory, "mix.wav");
         var perform = harness.Catalog.Find("Audio Export", "Perform Audio Export")!.Id;
-        string? configured = null;
-        harness.Ui.OnExportConfigure = (dir, name) => { configured = Path.Combine(dir, name + ".wav"); return true; };
-        // The exporter writes only when "Perform Audio Export" arrives, with the settings that were read back.
+        // The exporter writes only when "Perform Audio Export" arrives, under the name the dialog shows.
         Func<byte[]>? render = () => Wav(2.0);
-        harness.Driver.Commands[perform] = (_, _) => { if (render is not null) File.WriteAllBytes(configured!, render()); return true; };
+        harness.Driver.Commands[perform] = (_, _) =>
+        {
+            if (render is not null) File.WriteAllBytes(Path.Combine(harness.Ui.ExportDirectory!, harness.Ui.ExportDialogName + ".wav"), render());
+            return true;
+        };
 
         harness.Ui.AvailableDialogs.Add(DialogKinds.ExportAudio);
         var ok = await harness.SendAsync("project", new JsonObject { ["action"] = "export_audio", ["path"] = good, ["expected_duration_seconds"] = 2.0 });
         Assert.Equal(ResultStatus.Ok, ok.Status);
         Assert.Equal(48000, ok.Data!["wav"]!["sample_rate"]!.GetValue<int>());
-        Assert.Equal(good, configured);
+        // The dialog showed another name: it was typed, the dialog closed and reopened, and read back before exporting.
+        Assert.Equal(["export_read:acceptance", "export_name:mix", "export_read:mix"],
+            harness.Ui.Actions.Where(action => action.StartsWith("export_", StringComparison.Ordinal)).ToArray());
+        Assert.True(File.Exists(good));
 
         harness.Ui.AvailableDialogs.Add(DialogKinds.ExportAudio);
         render = () => Wav(2.0, bits: 16);
@@ -279,11 +284,11 @@ public sealed class G04WorkflowTests
         var performsBefore = harness.Driver.WriteCount("command.execute");
         var timeout = await harness.SendAsync("project", new JsonObject { ["action"] = "export_audio", ["path"] = Path.Combine(directory, "never.wav"), ["expected_duration_seconds"] = 1.0 });
         Assert.Equal(ResultStatus.Unverified, timeout.Status);
-        Assert.Equal(performsBefore + 2, harness.Driver.WriteCount("command.execute")); // open the dialog, perform once; never again
+        Assert.Equal(performsBefore + 3, harness.Driver.WriteCount("command.execute")); // open, reopen after naming, perform once; never again
 
         // Settings that do not read back as the requested WAV start nothing and close the dialog.
         harness.Ui.AvailableDialogs.Add(DialogKinds.ExportAudio);
-        harness.Ui.OnExportConfigure = (_, _) => false;
+        harness.Ui.ExportFormatMatches = false;
         render = () => Wav(2.0);
         var beforeMismatch = harness.Driver.WriteCount("command.execute");
         var mismatch = await harness.SendAsync("project", new JsonObject { ["action"] = "export_audio", ["path"] = Path.Combine(directory, "mismatch.wav"), ["expected_duration_seconds"] = 2.0 });

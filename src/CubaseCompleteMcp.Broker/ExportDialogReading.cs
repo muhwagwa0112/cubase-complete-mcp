@@ -11,7 +11,8 @@ namespace CubaseCompleteMcp.Broker;
 /// </summary>
 public static class ExportDialogReading
 {
-    public sealed record Result(bool Ok, string? Message, JsonObject Evidence);
+    /// <param name="OnlyNameDiffers">Every setting matches except the file name shown in Preview.</param>
+    public sealed record Result(bool Ok, string? Message, JsonObject Evidence, bool OnlyNameDiffers = false);
 
     private const double RowTolerance = 8;
     private const double MinimumValueOffset = 60;
@@ -57,12 +58,13 @@ public static class ExportDialogReading
         var lines = Lines(ocr);
         var evidence = new JsonObject();
         var problems = new List<string>();
+        var differing = new List<string>();
         void Expect(string field, string labelKey, Func<string, bool> matches, string expected)
         {
             var value = ValueFor(lines, labelKey);
             evidence[field] = new JsonObject { ["read"] = value, ["expected"] = expected };
             if (value is null) problems.Add($"{field} could not be read");
-            else if (!matches(Normalize(value))) problems.Add($"{field} reads '{value}', expected {expected}");
+            else if (!matches(Normalize(value))) { problems.Add($"{field} reads '{value}', expected {expected}"); differing.Add(field); }
         }
         Expect("file_type", "File Type", value => value.Contains("wave", StringComparison.Ordinal), "Wave");
         Expect("sample_rate", "Sample Rate", value => value.StartsWith(Normalize("48.0 kHz"), StringComparison.Ordinal) || value.StartsWith(Normalize("48 kHz"), StringComparison.Ordinal), "48.0 kHz");
@@ -76,8 +78,11 @@ public static class ExportDialogReading
             return shown.Length >= 8 && (truncated ? expectedDirectory.StartsWith(shown, StringComparison.Ordinal) : shown.TrimEnd('\\') == expectedDirectory);
         }, directory);
         evidence["ocr_line_count"] = lines.Count;
+        var onlyName = problems.Count == 1 && differing.SequenceEqual(["preview"]);
+        evidence["only_name_differs"] = onlyName;
         return problems.Count == 0
             ? new Result(true, null, evidence)
-            : new Result(false, "The Export Audio Mixdown settings do not match a 48 kHz/24-bit WAV at the requested path: " + string.Join("; ", problems) + ".", evidence);
+            : new Result(false, "The Export Audio Mixdown settings do not match a 48 kHz/24-bit WAV at the requested path: " + string.Join("; ", problems) + ".",
+                evidence, onlyName);
     }
 }

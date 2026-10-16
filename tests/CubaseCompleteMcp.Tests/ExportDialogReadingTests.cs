@@ -46,6 +46,14 @@ public sealed class ExportDialogReadingTests
     }
 
     [Fact]
+    public void OnlyAnotherFileName_IsReportedSoTheNameCanBeSet()
+    {
+        Assert.True(ExportDialogReading.Verify(LiveDialog(preview: "other.wav"), Directory, "acceptance").OnlyNameDiffers);
+        Assert.False(ExportDialogReading.Verify(LiveDialog(rate: "44.1 kHz", preview: "other.wav"), Directory, "acceptance").OnlyNameDiffers);
+        Assert.False(ExportDialogReading.Verify(LiveDialog(), Directory, "acceptance").OnlyNameDiffers);
+    }
+
+    [Fact]
     public void APathOutsideTheRequestedDirectory_IsRefused()
     {
         var result = ExportDialogReading.Verify(LiveDialog(path: @"C:\Users\lufth\Desktop\New York"), Directory, "acceptance");

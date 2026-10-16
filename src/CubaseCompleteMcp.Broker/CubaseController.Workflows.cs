@@ -236,8 +236,30 @@ public sealed partial class CubaseController
 
         if (action == "export_audio")
         {
-            var configure = await _ui.ConfigureExportAsync(dialog, Path.GetDirectoryName(file.Path)!,
-                Path.GetFileNameWithoutExtension(file.Path), cancellationToken).ConfigureAwait(false);
+            var directory = Path.GetDirectoryName(file.Path)!;
+            var fileName = Path.GetFileNameWithoutExtension(file.Path);
+            var configure = await _ui.ReadExportSettingsAsync(dialog, directory, fileName, cancellationToken).ConfigureAwait(false);
+            if (!configure.Ok && configure.Evidence?["only_name_differs"]?.GetValue<bool>() == true)
+            {
+                // Cubase keeps a typed name only when the dialog closes, so the dialog is reopened and read again.
+                log.Add("export_name_differs", configure.Evidence);
+                var named = await _ui.CommitExportNameAsync(dialog, fileName, cancellationToken).ConfigureAwait(false);
+                log.Add(named.Ok ? "export_name_committed" : "export_name_failed", named.Evidence);
+                if (!named.Ok)
+                {
+                    if (_ui.IsDialogOpen(dialog)) await _ui.CancelDialogAsync(dialog, cancellationToken).ConfigureAwait(false);
+                    return WorkflowResult(context, ResultStatus.Error, ExecutionState.NotApplied, data, log, "command+ui",
+                        named.ErrorCode, named.Message + " No export was started.");
+                }
+                var reopened = await DispatchCommandOnceAsync(context, new JsonObject { ["id"] = context.Plan.Command!.Id }, log, cancellationToken).ConfigureAwait(false);
+                if (!reopened.Ok) return DriverFailure(context.Request, reopened);
+                dialog = await _ui.WaitForDialogAsync(DialogKinds.ExportAudio, _timings.DialogStage, cancellationToken).ConfigureAwait(false);
+                if (dialog is null)
+                    return WorkflowResult(context, ResultStatus.Error, ExecutionState.NotApplied, data, log, "command+ui", ErrorCodes.StageTimeout,
+                        "The export dialog did not reopen after the file name was set. No export was started.");
+                log.Add("dialog_found", new JsonObject { ["kind"] = dialog.Kind, ["title"] = dialog.Title });
+                configure = await _ui.ReadExportSettingsAsync(dialog, directory, fileName, cancellationToken).ConfigureAwait(false);
+            }
             log.Add(configure.Ok ? "export_configured" : "export_configuration_failed", configure.Evidence);
             if (!configure.Ok)
             {
