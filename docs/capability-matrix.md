@@ -1,6 +1,6 @@
 # Capability matrix
 
-Support levels: **implemented** (code exists), **mock_validated** (offline tests with fake host adapters and the generated driver in a mock MIDI Remote host), **live_validated** (verified on an owned Cubase 15.0.10 fixture on 2026-09-28, re-run on candidate 8079732 on 2026-10-16), **unsupported**, **blocked_environment** (needs an API or environment that is not available), **best_effort**.
+Support levels: **implemented** (code exists), **mock_validated** (offline tests with fake host adapters and the generated driver in a mock MIDI Remote host), **live_validated** (verified on an owned Cubase fixture: 15.0.10 on 2026-09-28; 15.0.30 with MIDI Remote API 1.3 on 2026-10-16, candidate 895b582, all live cases passing), **unsupported**, **blocked_environment** (needs an API or environment that is not available), **best_effort**.
 
 | Area | Path | Level | Postcondition / contract |
 |---|---|---|---|
@@ -8,7 +8,7 @@ Support levels: **implemented** (code exists), **mock_validated** (offline tests
 | Key Command catalog (69 categories; count per installation) | Generated command bindings | implemented | A binding exists; execution is `Unverified` (no declared postcondition). Unclassified commands require confirmation. Selection-dependent commands need a target guard. |
 | Play / stop / record / cycle / metronome | Transport bindings + callbacks | live_validated | Fresh callback newer than the dispatch; toggles refused while state unknown; record needs confirmation. Record, cycle and metronome are latched presses released on the next idle tick. `record_stop` ends recording; Cubase keeps playing until `stop` |
 | Tempo | Time display | live_validated | Fresh BPM within 0.01 |
-| Position / locators | Time display | mock_validated | `position_text` in the host's reported `time_format`; other formats `UNSUPPORTED_TIME_FORMAT`. A time already at the target in the host's spelling (`1. 1. 1.  0` for `1.1.1.0`) is confirmed by the read, since Cubase reports no change for it |
+| Position / locators | Time display | live_validated (locators) | `position_text` in the host's reported `time_format`; other formats `UNSUPPORTED_TIME_FORMAT`. A time already at the target in the host's spelling (`1. 1. 1.  0` for `1.1.1.0`) is confirmed by the read, since Cubase reports no change for it. A locator that has not reported since activation uses the format of the shared primary display |
 | Track list | DirectAccess `VST Mixer` children | live_validated | Handles bind the unique ID string and object ID; `bank_truncated` beyond 256 channels |
 | Volume / pan / mute / solo / monitor / record enable | DirectAccess on the target channel | live_validated (volume, pan) | Fresh read of the same target (1e-4; MIDI-track volume/pan are 7-bit, half a step); audio/instrument pan lives on the `Panner` child; ambiguous/hidden/locked refused |
 | EQ, sends, strip, other channel parameters | DirectAccess `parameter_tag` within the target | mock_validated | Fresh read of the same object/tag |
@@ -17,16 +17,17 @@ Support levels: **implemented** (code exists), **mock_validated** (offline tests
 | Track create (MIDI, instrument, audio) | Key Command + Add Track dialog (verified-foreground keyboard) | live_validated (MIDI, instrument) | One new identity with the requested name |
 | Track rename | Guarded Key Command + typed text | live_validated | Title of the planned identity |
 | Project open / save / save_as | Key Command + owned file dialog (Win32 controls) | live_validated | Title change / file change; overwrite bound to file identity; `FILE_EXISTS` / `FILE_CHANGED` |
-| WAV mixdown (PCM, stereo, 48 kHz, 24-bit, locator range) | Key Command + owned export dialog | unsupported on Cubase 15.0.10 | The export dialog exposes no controls; `WORKFLOW_CONTROL_MISSING` before anything is typed or started. The WAV validator (RIFF/fmt/data, length within max(20 ms, host latency)) stays for a host that exposes them |
-| Plug-in catalog (installed UIDs) | — | blocked_environment | The installed MIDI Remote API declares no plug-in enumeration; `PLUGIN_CATALOG_UNAVAILABLE` |
-| Plug-in slot assignment | API 1.3 `trySetSlotPlugin` | blocked_environment | Requires a catalog UID and UID read-back; title changes are never proof |
+| WAV mixdown (PCM, stereo, 48 kHz, 24-bit, locator range) | File > Export Audio Mixdown + typed name + OCR read-back + "Audio Export / Perform Audio Export" | live_validated (15.0.30) | The dialog has no addressable controls; its format is an operator setting (Wave, 48 kHz, 24 bit, Path "Use Project Mixdown Folder"). The name is typed and kept by closing and reopening the dialog; file type, rate, depth, preview name and path are read back by OCR (several upscales) and any difference starts nothing (`EXPORT_SETTINGS_MISMATCH`). Exported once; verified by RIFF/fmt/data and a length within max(20 ms, host latency) |
+| Plug-in catalog (installed UIDs) | API 1.3 `mPluginManager.getPluginCollectionByIndex` for a slot | live_validated (15.0.30) | Class UID, name, vendor, version, sub-categories of the slot's active collection; `PLUGIN_CATALOG_UNAVAILABLE` on API 1.2 |
+| Plug-in slot assignment | API 1.3 `trySetSlotPlugin` | live_validated (15.0.30) | The UID must be in the catalog; verified only by the slot's child object, whose unique name is `<class UID>-<instance>`; title changes are never proof |
 | Plug-in parameters | DirectAccess | mock_validated | Fresh read |
 | MIDI composition documents, SMF import/export | `cubase_midi` | implemented (existing tests) | Validation and SMF round trip |
-| MIDI import into Cubase | SMF + Key Command + owned file dialog | live_validated (`targets_observed`) | `targets_observed` at best automatically (reported `Unverified`); `content_roundtrip_verified` via `compare_file` |
+| MIDI import into Cubase | SMF + Key Command + owned file dialog | live_validated (`targets_observed`, part and content) | `targets_observed` at best automatically (reported `Unverified`). The part is observed in "File > Write MIDI File to Project Folder" (no dialog): the imported events sit on the tagged new track; `compare_file` against that SMF gives `content_roundtrip_verified` |
+| Driver re-activation | Project switch | live_validated | Cubase re-activates the MIDI Remote driver when the active project changes; the new hello starts a new driver epoch, older handles are refused and nothing is replayed |
 | Batch | Broker | live_validated | Planned children, one approval, dependency-aware stop, journaled prefix, read-only resume plan |
 | Cubase dialogs via `cubase_ui_*` | UI Automation / guarded input | best_effort | Always `Unverified`; re-inspect |
 | Custom-rendered plug-in GUIs | OCR + guarded input | best_effort | Never reported verified |
 | Windows Graphics Capture | — | unsupported | PrintWindow is used |
 | Existing .cpr note editing, Note Expression, Expression Maps | — | unsupported | Out of scope |
 
-MIDI Remote API 1.3 features (`canPerform`, extended parameter metadata, plug-in manager) are feature-detected; Cubase 15.0.10 (API 1.2) reports them unavailable without failing driver load. API 1.2 compatibility and API 1.3 full-workflow validation are separate profiles.
+MIDI Remote API 1.3 features (`canPerform`, extended parameter metadata, plug-in manager) are feature-detected; Cubase 15.0.10 (API 1.2) reports them unavailable without failing driver load, and Cubase 15.0.30 reports them available. API 1.2 compatibility and API 1.3 full-workflow validation are separate profiles.
