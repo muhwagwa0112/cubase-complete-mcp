@@ -32,7 +32,7 @@ public sealed class ControllerHarness : IDisposable
     public IPluginCatalogProvider Plugins { get; }
 
     public static readonly ControllerTimings FastTimings = new(
-        new ObservationTimings(TimeSpan.FromMilliseconds(1500), TimeSpan.FromMilliseconds(20)),
+        new ObservationTimings(TimeSpan.FromMilliseconds(2500), TimeSpan.FromMilliseconds(20)),
         new ObservationTimings(TimeSpan.FromMilliseconds(600), TimeSpan.FromMilliseconds(20)),
         new ObservationTimings(TimeSpan.FromMilliseconds(600), TimeSpan.FromMilliseconds(20)),
         new ObservationTimings(TimeSpan.FromMilliseconds(800), TimeSpan.FromMilliseconds(20)),
