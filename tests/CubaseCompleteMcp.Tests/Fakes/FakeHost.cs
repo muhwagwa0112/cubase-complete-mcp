@@ -236,12 +236,18 @@ public sealed class FakeDriver : ICubaseDriver
                         var key = action == "position" ? "position" : action == "left_locator" ? "leftLocator" : "rightLocator";
                         if (args["time_format"]?.GetValue<string>() != TimeFormats[key])
                             throw new FakeHostError(ErrorCodes.UnsupportedTimeFormat, "time format mismatch");
+                        // Like the driver, only identical text is a no-op; like Cubase, a time that does not move reports no change.
+                        var currentTime = State[key]?.GetValue<string>();
+                        var desiredTime = args["position_text"]!.GetValue<string>();
+                        if (currentTime == desiredTime)
+                            return Receipt(action, false, new JsonObject { ["state_key"] = key, ["before"] = currentTime, ["desired"] = desiredTime, ["time_format"] = TimeFormats[key] });
                         _revision++;
                         var positionRevision = _revision;
-                        Callback(key, args["position_text"]!.GetValue<string>());
+                        if (currentTime is null || PostconditionVerifier.CanonicalTimeText(currentTime) != PostconditionVerifier.CanonicalTimeText(desiredTime))
+                            Callback(key, desiredTime);
                         return Receipt(action, true, new JsonObject
                         {
-                            ["state_key"] = key, ["desired"] = args["position_text"]!.DeepClone(),
+                            ["state_key"] = key, ["before"] = currentTime, ["desired"] = args["position_text"]!.DeepClone(),
                             ["time_format"] = TimeFormats[key], ["dispatch_revision"] = positionRevision
                         });
                 }
