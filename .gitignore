@@ -4,6 +4,7 @@ obj/
 .idea/
 .vscode/
 TestResults/
+test-results/
 artifacts/
 coverage/
 *.user
