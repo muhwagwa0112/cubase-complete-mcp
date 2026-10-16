@@ -8,7 +8,7 @@ Support levels: **implemented** (code exists), **mock_validated** (offline tests
 | Key Command catalog (69 categories; count per installation) | Generated command bindings | implemented | A binding exists; execution is `Unverified` (no declared postcondition). Unclassified commands require confirmation. Selection-dependent commands need a target guard. |
 | Play / stop / record / cycle / metronome | Transport bindings + callbacks | live_validated | Fresh callback newer than the dispatch; toggles refused while state unknown; record needs confirmation. Record, cycle and metronome are latched presses released on the next idle tick. `record_stop` ends recording; Cubase keeps playing until `stop` |
 | Tempo | Time display | live_validated | Fresh BPM within 0.01 |
-| Position / locators | Time display | mock_validated | `position_text` in the host's reported `time_format`; other formats `UNSUPPORTED_TIME_FORMAT` |
+| Position / locators | Time display | mock_validated | `position_text` in the host's reported `time_format`; other formats `UNSUPPORTED_TIME_FORMAT`. A time already at the target in the host's spelling (`1. 1. 1.  0` for `1.1.1.0`) is confirmed by the read, since Cubase reports no change for it |
 | Track list | DirectAccess `VST Mixer` children | live_validated | Handles bind the unique ID string and object ID; `bank_truncated` beyond 256 channels |
 | Volume / pan / mute / solo / monitor / record enable | DirectAccess on the target channel | live_validated (volume, pan) | Fresh read of the same target (1e-4; MIDI-track volume/pan are 7-bit, half a step); ambiguous/hidden/locked refused |
 | EQ, sends, strip, other channel parameters | DirectAccess `parameter_tag` within the target | mock_validated | Fresh read of the same object/tag |
