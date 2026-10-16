@@ -59,8 +59,12 @@ public interface IWorkflowUi
     Task<UiStageResult> TypeRenameTextAsync(string name, CancellationToken cancellationToken);
     /// <summary>Brings the verified Cubase main window to the foreground; sends no keys.</summary>
     Task<UiStageResult> ActivateCubaseAsync(CancellationToken cancellationToken);
-    /// <summary>Reads the export dialog's settings back and compares them with the request; starts nothing.</summary>
-    Task<UiStageResult> ReadExportSettingsAsync(UiDialogRef dialog, string directory, string fileName,
+    /// <summary>
+    /// Reads the export dialog's settings back and compares them with the request; starts nothing. The file name must
+    /// read as the requested name up to positional OCR confusions; <paramref name="allowSeparatorNoise"/> also accepts
+    /// separator-only differences (see <see cref="ExportDialogReading.Verify(IReadOnlyList{JsonArray}, string, string, bool)"/>).
+    /// </summary>
+    Task<UiStageResult> ReadExportSettingsAsync(UiDialogRef dialog, string directory, string fileName, bool allowSeparatorNoise,
         CancellationToken cancellationToken);
     /// <summary>Types the export file name and closes the dialog, which is when Cubase keeps the name; starts nothing.</summary>
     Task<UiStageResult> CommitExportNameAsync(UiDialogRef dialog, string fileName, CancellationToken cancellationToken);
@@ -104,8 +108,12 @@ public sealed record ControllerTimings(
     ObservationTimings Project,
     ObservationTimings Export,
     TimeSpan DialogStage,
-    TimeSpan MidiImportTotal)
+    TimeSpan MidiImportTotal,
+    ObservationTimings? PluginLoad = null)
 {
+    /// <summary>Observation of a plug-in assignment; a heavy instrument can keep the driver busy while it loads.</summary>
+    public ObservationTimings PluginLoadTimings => PluginLoad ?? ObservationTimings.PluginLoad;
+
     public static readonly ControllerTimings Default = new(ObservationTimings.TransportAndMixer,
         ObservationTimings.TrackAndPlugin, ObservationTimings.Project, ObservationTimings.Export,
         TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(30));

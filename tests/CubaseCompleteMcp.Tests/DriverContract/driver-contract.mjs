@@ -34,11 +34,13 @@ function findParam(entry, tag) {
   return found[0];
 }
 
-function makeChannel(n, title, params) {
+function manyParams(count, prefix) { const list = []; for (let i = 0; i < count; i += 1) { list.push(param(i, prefix + ' ' + i)); } return list; }
+function makeChannel(n, title, params, childParams) {
   const tree = node(2000 + n * 10, title, 'uid-ch-' + n, params || [param(0, 'Volume'), param(1, 'Pan'), param(2, 'Mute')]);
-  tree.children.push(node(2001 + n * 10, 'Channel EQ', 'uid-eq-' + n, [param(0, 'EQ Low Gain')]));
+  tree.children.push(node(2001 + n * 10, 'Channel EQ', 'uid-eq-' + n, childParams || [param(0, 'EQ Low Gain')]));
   return { uid: 'uid-ch-' + n, runtimeId: 700 + n, tree: tree, index: indexTree(tree) };
 }
+function busyWait(ms) { const until = Date.now() + ms; while (Date.now() < until) { /* a slow host call */ } }
 
 function createHost(options) {
   const opts = options || {};
@@ -52,7 +54,10 @@ function createHost(options) {
   // Bank slots hold channels; a reorder moves channels between slots without changing their identity.
   const slots = [];
   const channelCount = opts.channelCount === undefined ? 4 : opts.channelCount;
-  for (let i = 0; i < 64; i += 1) { slots.push({ slot: i, current: i < channelCount ? makeChannel(i, 'Track ' + i) : null }); }
+  for (let i = 0; i < 64; i += 1) {
+    slots.push({ slot: i, current: i < channelCount ? makeChannel(i, 'Track ' + i, opts.channelParams ? manyParams(opts.channelParams, 'Param') : undefined,
+      opts.childParams ? manyParams(opts.childParams, 'EQ') : undefined) : null });
+  }
   const state = { selected: slots[0].current };
 
   const selectedTree = node(100, 'Selected', 'uid-selected-root', [param(0, 'Volume')]);
@@ -75,6 +80,7 @@ function createHost(options) {
   const slotManager = {
     trySetSlotPlugin: function (m, objectId, uid, dontAskDiscard) {
       calls.slotAssignments.push({ objectId: objectId, pluginUid: uid, dontAskDiscard: dontAskDiscard });
+      if (opts.assignThrows) { throw new Error('plug-in failed to load'); }
       const slot = selectedIndex[objectId];
       const loaded = node(nextPluginObject++, 'Plug-in ' + uid, String(uid).replace(/[^0-9A-Fa-f]/g, '').toUpperCase() + '-1', [param(0, 'Gain')]);
       slot.children = [loaded]; selectedIndex[loaded.id] = loaded;
@@ -104,8 +110,8 @@ function createHost(options) {
       getObjectTitle: function (m, objectId) { return entry(objectId).title; },
       getNumberOfParameters: function (m, objectId) { return entry(objectId).params.length; },
       getParameterTagByIndex: function (m, objectId, i) { return entry(objectId).params[i].tag; },
-      getParameterTitle: function (m, objectId, tag, maxLength) { const t = findParam(entry(objectId), tag).title; return maxLength && maxLength < t.length ? t.slice(0, maxLength) : t; },
-      getParameterProcessValue: function (m, objectId, tag) { return findParam(entry(objectId), tag).value; },
+      getParameterTitle: function (m, objectId, tag, maxLength) { if (opts.slowParameterMs) { busyWait(opts.slowParameterMs); } const t = findParam(entry(objectId), tag).title; return maxLength && maxLength < t.length ? t.slice(0, maxLength) : t; },
+      getParameterProcessValue: function (m, objectId, tag) { calls.parameterReads = (calls.parameterReads || 0) + 1; return findParam(entry(objectId), tag).value; },
       getParameterDisplayValue: function (m, objectId, tag) { return findParam(entry(objectId), tag).display; },
       getParameterDisplayUnits: function () { return ''; },
       getParameterEditLockState: function (m, objectId, tag) { return findParam(entry(objectId), tag).locked; },
@@ -215,6 +221,7 @@ function loadDriver(host) {
   new vm.Script(driverSource, { filename: 'CBMCP_CompleteBridge.js' }).runInContext(context);
   host.markLoaded();
   host.context = context;
+  if (host.beforeActivate) { host.beforeActivate(host); }
   context.page.mOnActivate(host.device, host.mapping);
   deliverTitles(host);
   return context;
@@ -277,7 +284,8 @@ function channelTarget(host, slot) { const c = host.slots[slot].current; return 
 function selectedGuard(host) { return { unique_id: host.state.selected.uid, runtime_id: host.state.selected.tree.id }; }
 let runtimeCreations = 0;
 let hostIdGetterCalls = 0;
-function scenario(label, options, body) { const host = createHost(options || {}); loadDriver(host); group(label); body(host); runtimeCreations += host.calls.runtimeHostObjectCreation || 0; hostIdGetterCalls += host.calls.hostIdGetter || 0; }
+function idle(host) { host.context.page.mOnIdle(host.device, host.mapping); }
+function scenario(label, options, body) { const host = createHost(options || {}); host.beforeActivate = (options || {}).beforeActivate; loadDriver(host); group(label); body(host); runtimeCreations += host.calls.runtimeHostObjectCreation || 0; hostIdGetterCalls += host.calls.hostIdGetter || 0; }
 
 scenario('hello and capabilities', { api13: true }, function (host) {
   const hello = ok(host, 'hello', 'system.hello', { client_nonce: 'n1' });
@@ -468,12 +476,27 @@ scenario('plug-in slots on an API 1.3 host', { api13: true }, function (host) {
   refused(host, 'assign after the slot changed', 'plugin.set', { action: 'assign', expected_selected: guard, object_id: 102, plugin_uid: 'u1', expected_slot_unique_id: 'something-else' }, 'TARGET_CHANGED');
   check('nothing was assigned', host.calls.slotAssignments.length === 0);
   const assigned = ok(host, 'assign', 'plugin.set', { action: 'assign', expected_selected: guard, object_id: 102, plugin_uid: 'u1', expected_slot_unique_id: 'uid-selected-insert' });
+  // A heavy instrument loads inside trySetSlotPlugin; live on Cubase 15.0.30 that overran the script's execution budget
+  // before the reply was sent. The reply therefore goes out first and the host call runs on the next idle callback.
+  check('the reply is sent before the host loads the plug-in', host.calls.slotAssignments.length === 0, host.calls.slotAssignments);
+  check('assignment is a deferred receipt, not a verified result', assigned && assigned.deferred === true && assigned.accepted === null
+    && assigned.verified === undefined && assigned.mutation_sent === true && assigned.assignment.state === 'queued', assigned);
+  refused(host, 'a second assignment while the first is queued', 'plugin.set', { action: 'assign', expected_selected: guard, object_id: 102, plugin_uid: 'u9' }, 'ASSIGNMENT_PENDING');
+  idle(host);
   check('assignment keeps the host discard prompt by default', host.calls.slotAssignments.length === 1 && host.calls.slotAssignments[0].dontAskDiscard === false, host.calls.slotAssignments);
-  check('assignment is a receipt, not a verified result', assigned && assigned.accepted === true && assigned.verified === undefined && assigned.mutation_sent === true, assigned);
+  const state = ok(host, 'inspect after the idle callback', 'plugin.get', { action: 'inspect_slot', expected_selected: guard, object_id: 102 });
+  check('inspect_slot reports the completed assignment', state && state.assignment && state.assignment.state === 'completed' && state.assignment.accepted === true
+    && state.assignment.plugin_uid === 'u1', state && state.assignment);
   ok(host, 'assign with confirm_replace', 'plugin.set', { action: 'assign', expected_selected: guard, object_id: 102, plugin_uid: 'u2', confirm_replace: true });
+  idle(host);
   check('confirm_replace is honoured only when given', host.calls.slotAssignments[1].dontAskDiscard === true);
   refused(host, 'assign without a target', 'plugin.set', { action: 'assign', object_id: 102, plugin_uid: 'u3' }, 'TARGET_REQUIRED');
   ok(host, 'assign a catalog UID to an insert slot', 'plugin.set', { action: 'assign', expected_selected: guard, object_id: 111, plugin_uid: '946051208E29496E804F64A825C8A047' });
+  ok(host, 'assign to another slot in the same idle tick', 'plugin.set', { action: 'assign', expected_selected: guard, object_id: 112, plugin_uid: '5B38F28281144FFE80285FF7CCF20483' });
+  idle(host);
+  check('one plug-in load per idle callback', host.calls.slotAssignments.length === 3, host.calls.slotAssignments);
+  idle(host);
+  check('the next idle callback loads the next one', host.calls.slotAssignments.length === 4, host.calls.slotAssignments);
   const loaded = ok(host, 'inspect the assigned slot', 'plugin.get', { action: 'inspect_slot', expected_selected: guard, object_id: 111 });
   check('the loaded plug-in UID is read back from the slot child', loaded && loaded.slot.loaded && loaded.slot.loaded.plugin_uid === '946051208E29496E804F64A825C8A047', loaded);
   refused(host, 'bypass is not offered', 'plugin.set', { action: 'bypass', expected_selected: guard, object_id: 102 }, 'INVALID_ACTION');
@@ -504,6 +527,89 @@ scenario('F08 snapshot truncation', {}, function (host) {
   const targeted = ok(host, 'direct.get fresh parameter read', 'direct.get', { target: channelTarget(host, 0), object_id: 2000, parameter_tag: 0 });
   check('an addressed direct read is fresh', targeted && targeted.fresh === true && targeted.read.parameter_tag === 0, targeted);
   refused(host, 'direct.set without a target', 'direct.set', { root: 'mixer', object_id: 2000, parameter_tag: 0, process_value: 0.1 }, 'TARGET_REQUIRED');
+});
+
+scenario('plug-in load that fails in the host', { api13: true, assignThrows: true }, function (host) {
+  const guard = selectedGuard(host);
+  ok(host, 'assign', 'plugin.set', { action: 'assign', expected_selected: guard, object_id: 111, plugin_uid: '946051208E29496E804F64A825C8A047' });
+  idle(host);
+  const state = ok(host, 'inspect after a failed load', 'plugin.get', { action: 'inspect_slot', expected_selected: guard, object_id: 111 });
+  check('the failure is reported, not hidden', state && state.assignment && state.assignment.state === 'failed' && /failed to load/.test(state.assignment.error), state && state.assignment);
+  check('nothing is reported loaded', state && state.slot && state.slot.loaded === null, state && state.slot);
+  ok(host, 'a new assignment after the failure is accepted', 'plugin.set', { action: 'assign', expected_selected: guard, object_id: 111, plugin_uid: '946051208E29496E804F64A825C8A047' });
+  host.context.page.mOnDeactivate(host.device, host.mapping);
+  host.context.page.mOnActivate(host.device, host.mapping);
+  const assignments = host.calls.slotAssignments.length;
+  idle(host);
+  check('a queued assignment does not survive a re-activation', host.calls.slotAssignments.length === assignments, host.calls.slotAssignments);
+});
+
+scenario('F09 bounded mixer snapshot', { channelCount: 12, channelParams: 200, childParams: 150 }, function (host) {
+  // Live on Cubase 15.0.30: plugin.get root=mixer with parameters on a 12-channel project read every parameter of every
+  // node in one callback, ran past the script budget (DRIVER_TIMEOUT) and took the script offline.
+  const before = host.calls.parameterReads || 0;
+  const first = ok(host, 'mixer snapshot with parameters', 'plugin.get', { root: 'mixer' });
+  const read = (host.calls.parameterReads || 0) - before;
+  check('one call reads at most the parameter budget', first && first.limits && read <= first.limits.max_total_parameters && first.limits.max_total_parameters <= 512 && first.parameters_read === read,
+    { read: read, limits: first && first.limits });
+  check('the budget stop is reported as truncation', first && first.truncated === true && first.truncation && first.truncation.budget_exhausted === 'parameters', first && first.truncation);
+  check('a continuation names the next unread node', first && first.continuation && first.continuation.node_offset === first.nodes.length, first && first.continuation);
+  const second = ok(host, 'the continuation page', 'plugin.get', { root: 'mixer', node_offset: first && first.continuation ? first.continuation.node_offset : 0 });
+  const firstIds = (first ? first.nodes : []).map(function (n) { return n.object_id; });
+  check('the continuation continues after the first page', second && first && first.continuation && second.node_offset === first.continuation.node_offset && second.nodes.length > 0
+    && second.nodes.every(function (n) { return firstIds.indexOf(n.object_id) < 0; }), second && second.nodes && second.nodes.map(function (n) { return n.object_id; }));
+  let offset = 0; let pages = 0; const seen = {};
+  while (pages < 40) {
+    const page = ok(host, 'page ' + pages, 'plugin.get', { root: 'mixer', node_offset: offset });
+    if (!page || !page.nodes) { break; }
+    page.nodes.forEach(function (n) { seen[n.object_id] = (seen[n.object_id] || 0) + 1; });
+    pages += 1;
+    if (!page.continuation) { break; }
+    offset = page.continuation.node_offset;
+  }
+  check('paging reaches every node exactly once', Object.keys(seen).length === 25 && Object.keys(seen).every(function (k) { return seen[k] === 1; }), seen);
+
+  const channel = host.slots[3].current;
+  const scoped = ok(host, 'snapshot scoped to one channel', 'plugin.get', { target: channelTarget(host, 3), include_parameters: false });
+  check('a target-scoped snapshot starts at that channel', scoped && scoped.base_object_id === channel.tree.id && scoped.root === 'mixer' && scoped.target.unique_id === channel.uid, scoped && scoped.base_object_id);
+  check('it contains only that channel subtree', scoped && scoped.nodes.length === 2 && scoped.nodes.every(function (n) { return channel.index[n.object_id]; }), scoped && scoped.nodes.map(function (n) { return n.object_id; }));
+
+  const object = ok(host, 'one object parameters', 'plugin.get', { target: channelTarget(host, 3), object_id: channel.tree.id, max_parameters: 64 });
+  check('object_id without parameter_tag reads that object only', object && object.object && object.object.object_id === channel.tree.id && object.object.parameters.length === 64
+    && object.object.parameter_total === 200 && object.fresh === true, object && object.object && object.object.parameters.length);
+  check('the object read pages by parameter_offset', object && object.continuation && object.continuation.parameter_offset === 64, object && object.continuation);
+  const tail = ok(host, 'the last parameter page', 'plugin.get', { target: channelTarget(host, 3), object_id: channel.tree.id, parameter_offset: 192, max_parameters: 64 });
+  check('the last page ends the continuation', tail && tail.object && tail.object.parameters.length === 8 && tail.object.parameters[0].tag === 192 && tail.continuation === null, tail && tail.object);
+  check('child objects are listed for navigation', object && object.children && object.children.length === 1 && object.children[0].object_id === channel.tree.id + 1, object && object.children);
+  refused(host, 'object outside the target', 'plugin.get', { target: channelTarget(host, 3), object_id: host.slots[4].current.tree.id }, 'TARGET_SCOPE_MISMATCH');
+  const unscoped = ok(host, 'object read on a root without a target (master bus inspection)', 'direct.get', { root: 'mixer', object_id: host.slots[11].current.tree.id + 1, max_parameters: 10 });
+  check('a root object read is bounded too', unscoped && unscoped.object && unscoped.object.parameters.length === 10 && unscoped.target === null, unscoped && unscoped.object);
+});
+
+scenario('F09 snapshot time budget', { channelCount: 4, channelParams: 60, slowParameterMs: 4 }, function (host) {
+  const started = Date.now();
+  const slow = ok(host, 'snapshot on a slow host', 'direct.get', { root: 'mixer', time_budget_ms: 40 });
+  const elapsed = Date.now() - started;
+  check('the time budget stops the read', slow && slow.truncation && slow.truncation.budget_exhausted === 'time' && slow.continuation !== null, slow && slow.truncation);
+  check('the call returns near its budget', elapsed < 400, elapsed);
+});
+
+scenario('VER-06 time format reported while the page activates', {
+  // A script reload: Cubase may report the locators before mOnActivate runs; activation must not discard that report.
+  beforeActivate: function (host) { host.timeDisplay.mPrimary.mCycleLocatorLeft.mOnChange(host.device, host.mapping, '1. 1. 1.  0', 'Bars+Beats'); }
+}, function (host) {
+  const status = ok(host, 'status right after activation', 'transport.get', {});
+  check('the activation-time report is kept', status && status.time_formats && status.time_formats.leftLocator === 'Bars+Beats' && status.state.leftLocator === '1. 1. 1.  0'
+    && status.state_revision.leftLocator > 0, status && status.time_formats);
+  const left = ok(host, 'left locator right after a script reload', 'transport.set', { action: 'left_locator', position_text: '3.1.1.0', time_format: 'Bars+Beats' });
+  check('the write is sent in the reported format', left && left.mutation_sent === true && left.time_format === 'Bars+Beats', left);
+});
+
+scenario('VER-06 unknown time format names the recovery', {}, function (host) {
+  const error = refused(host, 'locator write before any time report', 'transport.set', { action: 'left_locator', position_text: '3.1.1.0', time_format: 'Bars+Beats' }, 'STATE_UNKNOWN');
+  check('the refusal says how to make Cubase report the format', error && error.details && typeof error.details.recovery === 'string'
+    && /Play/.test(error.details.recovery) && /ruler/.test(error.details.recovery) && /Play/.test(error.message), error);
+  check('nothing was sent', host.calls.setTime.length === 0, host.calls.setTime);
 });
 
 group('host object lifetime');

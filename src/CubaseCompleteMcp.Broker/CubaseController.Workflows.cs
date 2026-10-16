@@ -238,10 +238,14 @@ public sealed partial class CubaseController
         {
             var directory = Path.GetDirectoryName(file.Path)!;
             var fileName = Path.GetFileNameWithoutExtension(file.Path);
-            var configure = await _ui.ReadExportSettingsAsync(dialog, directory, fileName, cancellationToken).ConfigureAwait(false);
+            // The name is typed unless the dialog already reads as exactly this name (positional OCR confusions only).
+            var configure = await _ui.ReadExportSettingsAsync(dialog, directory, fileName, false, cancellationToken).ConfigureAwait(false);
             if (!configure.Ok && configure.Evidence?["only_name_differs"]?.GetValue<bool>() == true)
             {
                 // Cubase keeps a typed name only when the dialog closes, so the dialog is reopened and read again.
+                // After typing, a read that differs from the name only by separators is OCR spacing noise, unless the
+                // name shown before already read that way: then the old and the new name cannot be told apart.
+                var allowSeparatorNoise = configure.Evidence?["preview"]?["separator_only_difference"]?.GetValue<bool>() != true;
                 log.Add("export_name_differs", configure.Evidence);
                 var named = await _ui.CommitExportNameAsync(dialog, fileName, cancellationToken).ConfigureAwait(false);
                 log.Add(named.Ok ? "export_name_committed" : "export_name_failed", named.Evidence);
@@ -258,7 +262,7 @@ public sealed partial class CubaseController
                     return WorkflowResult(context, ResultStatus.Error, ExecutionState.NotApplied, data, log, "command+ui", ErrorCodes.StageTimeout,
                         "The export dialog did not reopen after the file name was set. No export was started.");
                 log.Add("dialog_found", new JsonObject { ["kind"] = dialog.Kind, ["title"] = dialog.Title });
-                configure = await _ui.ReadExportSettingsAsync(dialog, directory, fileName, cancellationToken).ConfigureAwait(false);
+                configure = await _ui.ReadExportSettingsAsync(dialog, directory, fileName, allowSeparatorNoise, cancellationToken).ConfigureAwait(false);
             }
             log.Add(configure.Ok ? "export_configured" : "export_configuration_failed", configure.Evidence);
             if (!configure.Ok)
@@ -449,33 +453,82 @@ public sealed partial class CubaseController
         log.Add(reply.Ok ? "assignment_dispatched" : "assignment_refused", new JsonObject { ["error"] = reply.Error?.Code });
         if (!reply.Ok) return DriverFailure(context.Request, reply);
         var data = new JsonObject { ["receipt"] = reply.Data?.DeepClone(), ["requested_plugin_uid"] = uid, ["target"] = target.ToJson() };
+        // The driver replies before the host loads the plug-in (deferred=true) and runs trySetSlotPlugin on its next idle
+        // callback. A heavy instrument keeps the script busy for seconds, so reads that time out meanwhile are repeated
+        // until the plug-in-load deadline; the assignment itself is never sent again.
+        var epoch = _driver.Epoch;
+        var deferred = ReadBool(reply.Data?["deferred"]) == true;
         string? observedUid = null;
+        var assignment = reply.Data?["assignment"]?.DeepClone() as JsonObject;
+        var busyReads = 0;
+        var matched = false;
         var outcome = await PostconditionVerifier.ObserveAsync(async token =>
         {
-            observedUid = await ObserveSlotPluginUidAsync(target, slotId, token).ConfigureAwait(false);
-            return new Observation(observedUid is not null && NormalizePluginUid(observedUid) == NormalizePluginUid(uid),
-                new JsonObject { ["slot_plugin_uid"] = observedUid }, DriverListsPlugins ? "slot_child_unique_name" : "plugin_catalog_provider");
-        }, _timings.TrackAndPlugin, cancellationToken).ConfigureAwait(false);
-        data["verification"] = outcome.ToJson(uid, "exact plug-in UID");
-        if (outcome.Verified)
+            if (_driver.Epoch != epoch)
+                return new Observation(false, new JsonObject { ["driver_epoch"] = _driver.Epoch }, "driver.epoch", ContextChanged: true);
+            SlotObservation slot;
+            try { slot = await ObserveSlotAsync(target, slotId, token).ConfigureAwait(false); }
+            catch (PlanException error) when (error.Code is "DRIVER_TIMEOUT" or ErrorCodes.DriverOffline)
+            {
+                busyReads++;
+                return new Observation(false, new JsonObject { ["driver_busy"] = error.Code, ["assignment"] = assignment?.DeepClone() }, "driver.plugin.get",
+                    Note: "The driver did not answer while the plug-in was loading; the read is repeated, the assignment is not.");
+            }
+            observedUid = slot.Uid;
+            if (slot.Assignment is not null) assignment = slot.Assignment;
+            matched = observedUid is not null && NormalizePluginUid(observedUid) == NormalizePluginUid(uid);
+            // A host answer that rules the requested plug-in out ends the observation early.
+            var slotState = AssignmentState(assignment);
+            var settledWithout = !matched && (slotState == "failed" || (slotState == "completed" && ReadBool(assignment?["accepted"]) == false));
+            return new Observation(matched || settledWithout,
+                new JsonObject { ["slot_plugin_uid"] = observedUid, ["assignment"] = assignment?.DeepClone() },
+                DriverListsPlugins ? "slot_child_unique_name" : "plugin_catalog_provider");
+        }, _timings.PluginLoadTimings, cancellationToken).ConfigureAwait(false);
+        var verification = outcome.ToJson(uid, "exact plug-in UID");
+        verification["verified"] = matched;
+        verification["driver_busy_reads"] = busyReads;
+        data["verification"] = verification;
+        data["assignment"] = assignment?.DeepClone();
+        if (matched)
         {
             log.Add("plugin_uid_verified");
             return WorkflowResult(context, ResultStatus.Ok, ExecutionState.Applied, data, log, "midi_remote_api13+uid_readback");
         }
-        if (observedUid is not null)
+        if (observedUid is not null && AssignmentState(assignment) is not ("queued" or "running"))
         {
             log.Add("different_plugin_loaded");
             return WorkflowResult(context, ResultStatus.Error, ExecutionState.Applied, data, log, "midi_remote_api13+uid_readback",
                 "PLUGIN_MISMATCH", $"The slot holds '{observedUid}', not the requested '{uid}'.");
         }
-        var accepted = ReadBool(reply.Data?["accepted"]) == true;
-        log.Add(accepted ? "host_accepted_uid_unobservable" : "host_rejected_or_unobservable");
-        return WorkflowResult(context, accepted ? ResultStatus.Unverified : ResultStatus.Error,
-            accepted ? ExecutionState.Unknown : ExecutionState.Rejected, data, log, "midi_remote_api13",
-            accepted ? ErrorCodes.PostconditionTimeout : "PLUGIN_ASSIGN_REJECTED",
-            accepted ? "The host accepted the request but the loaded plug-in UID could not be read back; a title change is not treated as proof."
-                : "The host rejected the plug-in assignment.");
+        if (outcome.ContextChanged)
+        {
+            log.Add("driver_session_changed");
+            return WorkflowResult(context, ResultStatus.Unverified, ExecutionState.Unknown, data, log, "midi_remote_api13",
+                ErrorCodes.OutcomeUnknown, "The driver session changed before the assignment could be observed. It was not sent again; inspect the slot.");
+        }
+        var state = AssignmentState(assignment);
+        if (state == "failed")
+        {
+            log.Add("host_load_failed");
+            return WorkflowResult(context, ResultStatus.Error, ExecutionState.Unknown, data, log, "midi_remote_api13",
+                "PLUGIN_ASSIGN_FAILED", $"Cubase raised an error while loading the plug-in: {assignment?["error"]}. Inspect the slot before retrying.");
+        }
+        var accepted = deferred ? state == "completed" && ReadBool(assignment?["accepted"]) == true : ReadBool(reply.Data?["accepted"]) == true;
+        var rejected = deferred ? state == "completed" && ReadBool(assignment?["accepted"]) == false : !accepted;
+        if (rejected)
+        {
+            log.Add("host_rejected");
+            return WorkflowResult(context, ResultStatus.Error, ExecutionState.Rejected, data, log, "midi_remote_api13",
+                "PLUGIN_ASSIGN_REJECTED", "The host rejected the plug-in assignment.");
+        }
+        log.Add(accepted ? "host_accepted_uid_unobservable" : "assignment_still_pending");
+        return WorkflowResult(context, ResultStatus.Unverified, ExecutionState.Unknown, data, log, "midi_remote_api13",
+            ErrorCodes.PostconditionTimeout, accepted
+                ? "The host accepted the request but the loaded plug-in UID could not be read back; a title change is not treated as proof."
+                : $"The plug-in was still loading (assignment state '{state ?? "unknown"}') when the {_timings.PluginLoadTimings.Deadline.TotalSeconds:0} s observation ended. It was not sent again; inspect the slot.");
     }
+
+    private static string? AssignmentState(JsonNode? assignment) => assignment?["state"]?.GetValue<string>();
 
     // ---- W4: causal MIDI import ---------------------------------------------------------------------------------
 

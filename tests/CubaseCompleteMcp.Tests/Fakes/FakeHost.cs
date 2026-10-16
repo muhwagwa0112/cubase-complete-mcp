@@ -46,6 +46,7 @@ public sealed class FakeDriver : ICubaseDriver
     public Action<string, JsonObject>? BeforeWrite { get; set; }
     public List<(string Operation, JsonObject Arguments)> Writes { get; } = [];
     public List<string> Reads { get; } = [];
+    public List<(string Operation, JsonObject Arguments)> ReadArguments { get; } = [];
     public Func<string, JsonObject, DriverReply?>? Override { get; set; }
     public Dictionary<string, Func<JsonObject, FakeDriver, bool>> Commands { get; } = new(StringComparer.Ordinal);
 
@@ -117,7 +118,11 @@ public sealed class FakeDriver : ICubaseDriver
                     BeforeWrite?.Invoke(operation, args);
                     Writes.Add((operation, (JsonObject)args.DeepClone()));
                 }
-                else Reads.Add(operation);
+                else
+                {
+                    Reads.Add(operation);
+                    ReadArguments.Add((operation, (JsonObject)args.DeepClone()));
+                }
                 data = Dispatch(operation, args);
             }
             if (isWrite && LoseReplyAfterApply)
@@ -330,14 +335,22 @@ public sealed class FakeDriver : ICubaseDriver
                 };
             case "plugin.get":
                 return new JsonObject { ["slot"] = new JsonObject { ["object_id"] = args["object_id"]?.DeepClone(), ["unique_id"] = SlotUid, ["title"] = SlotTitle,
-                    ["loaded"] = SlotLoadedUid is null ? null : new JsonObject { ["plugin_uid"] = SlotLoadedUid, ["unique_name"] = SlotLoadedUid + "-1" } } };
+                    ["loaded"] = SlotLoadedUid is null ? null : new JsonObject { ["plugin_uid"] = SlotLoadedUid, ["unique_name"] = SlotLoadedUid + "-1" } },
+                    ["assignment"] = Assignment?.DeepClone() };
             case "plugin.set":
                 if (args["expected_slot_unique_id"]?.GetValue<string>() is { } expectedSlot && expectedSlot != SlotUid)
                     throw new FakeHostError(ErrorCodes.TargetChanged, "slot changed");
                 SlotTitle = "Assigned";
                 if (AssignAccepted && DriverPluginCatalog is not null)
                     SlotLoadedUid = LoadedUidOverride ?? new string(args["plugin_uid"]!.GetValue<string>().Where(Uri.IsHexDigit).ToArray()).ToUpperInvariant();
-                return Receipt("assign", true, new JsonObject { ["accepted"] = AssignAccepted });
+                if (!DeferAssign) return Receipt("assign", true, new JsonObject { ["accepted"] = AssignAccepted });
+                // The current driver queues the host call for its next idle callback and replies first.
+                Assignment = new JsonObject { ["state"] = "completed", ["accepted"] = AssignAccepted, ["plugin_uid"] = args["plugin_uid"]!.DeepClone() };
+                return Receipt("assign", true, new JsonObject
+                {
+                    ["accepted"] = null, ["deferred"] = true,
+                    ["assignment"] = new JsonObject { ["state"] = "queued", ["accepted"] = null, ["plugin_uid"] = args["plugin_uid"]!.DeepClone() }
+                });
             case "command.execute":
                 if (args["expected_selected"] is { } guard) AssertSelected(guard);
                 else if (args["requires_target"]?.GetValue<bool>() == true) throw new FakeHostError(ErrorCodes.TargetContextUnsafe, "unguarded");
@@ -355,6 +368,9 @@ public sealed class FakeDriver : ICubaseDriver
     public string SlotUid { get; set; } = "slot-empty";
     public string SlotTitle { get; set; } = "Empty";
     public bool AssignAccepted { get; set; } = true;
+    /// <summary>Models the current driver: plugin.set replies before the host call, inspect_slot reports its state.</summary>
+    public bool DeferAssign { get; set; }
+    public JsonObject? Assignment { get; set; }
     /// <summary>API 1.3 plug-in catalog served by the driver itself; null models a host without it.</summary>
     public List<JsonObject>? DriverPluginCatalog { get; set; }
     /// <summary>Class UID named by the slot's child object (null: empty slot).</summary>

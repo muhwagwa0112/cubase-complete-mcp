@@ -50,13 +50,17 @@ public sealed partial class CubaseController
         return new PluginCatalogSnapshot(true, source, entries, null, slot);
     }
 
-    private async Task<string?> ObserveSlotPluginUidAsync(TargetIdentity target, long slotObjectId, CancellationToken cancellationToken)
+    /// <summary>The UID loaded in a slot and, on a current driver, the state of the assignment it queued for that slot.</summary>
+    private sealed record SlotObservation(string? Uid, JsonObject? Assignment);
+
+    private async Task<SlotObservation> ObserveSlotAsync(TargetIdentity target, long slotObjectId, CancellationToken cancellationToken)
     {
-        if (!DriverListsPlugins) return await _plugins.ObserveSlotPluginUidAsync(target, slotObjectId, cancellationToken).ConfigureAwait(false);
+        if (!DriverListsPlugins) return new SlotObservation(await _plugins.ObserveSlotPluginUidAsync(target, slotObjectId, cancellationToken).ConfigureAwait(false), null);
         var args = TargetArguments(target);
         args["action"] = "inspect_slot";
         args["object_id"] = slotObjectId;
         var slot = await ReadDriverAsync("plugin.get", args, cancellationToken).ConfigureAwait(false);
-        return slot["slot"]?["loaded"]?["plugin_uid"]?.GetValue<string>() is { } uid ? NormalizePluginUid(uid) : null;
+        var uid = slot["slot"]?["loaded"]?["plugin_uid"]?.GetValue<string>();
+        return new SlotObservation(uid is null ? null : NormalizePluginUid(uid), slot["assignment"]?.DeepClone() as JsonObject);
     }
 }

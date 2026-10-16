@@ -36,7 +36,8 @@ public sealed class ControllerHarness : IDisposable
         new ObservationTimings(TimeSpan.FromMilliseconds(600), TimeSpan.FromMilliseconds(20)),
         new ObservationTimings(TimeSpan.FromMilliseconds(600), TimeSpan.FromMilliseconds(20)),
         new ObservationTimings(TimeSpan.FromMilliseconds(800), TimeSpan.FromMilliseconds(20)),
-        TimeSpan.FromMilliseconds(50), TimeSpan.FromSeconds(10));
+        TimeSpan.FromMilliseconds(50), TimeSpan.FromSeconds(10),
+        PluginLoad: new ObservationTimings(TimeSpan.FromMilliseconds(600), TimeSpan.FromMilliseconds(20)));
 
     public ControllerHarness(IPluginCatalogProvider? plugins = null, ControllerTimings? timings = null,
         MutationCoordinator? coordinator = null)

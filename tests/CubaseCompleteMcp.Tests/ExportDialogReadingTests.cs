@@ -14,7 +14,7 @@ public sealed class ExportDialogReadingTests
     private static JsonObject Line(string text, double x, double y) =>
         new() { ["text"] = text, ["words"] = new JsonArray(new JsonObject { ["text"] = text.Split(' ')[0], ["x"] = x, ["y"] = y, ["width"] = 40, ["height"] = 12 }) };
 
-    private static JsonArray LiveDialog(string fileType = "Wave", string rate = "48.0 kHz", string bits = "24 bit", string preview = "accepta nce.wav",
+    private static JsonArray LiveDialog(string fileType = "Wave", string rate = "48.0 kHz", string bits = "24 bit", string preview = "acceptance.wav",
         string path = @"C:\Users\I ufth\App Data\Loca l\CubaseCom pIeteM CP\Acceptance\fx- b2...") => new(
         Line("Name", 377, 101), Line("acceptance", 501, 101),
         Line("Path", 377, 130), Line(path, 501, 130),
@@ -29,7 +29,7 @@ public sealed class ExportDialogReadingTests
     {
         var result = ExportDialogReading.Verify(LiveDialog(), Directory, "acceptance");
         Assert.True(result.Ok, result.Message);
-        Assert.Equal("accepta nce.wav", result.Evidence["preview"]!["read"]!.GetValue<string>());
+        Assert.Equal("acceptance.wav", result.Evidence["preview"]!["read"]!.GetValue<string>());
         Assert.Equal("Wave", result.Evidence["file_type"]!["read"]!.GetValue<string>()); // not the "Insert Broadcast Wave Chunk" label
     }
 
@@ -65,6 +65,47 @@ public sealed class ExportDialogReadingTests
         Assert.True(ExportDialogReading.Verify(LiveDialog(preview: "other.wav"), Directory, "acceptance").OnlyNameDiffers);
         Assert.False(ExportDialogReading.Verify(LiveDialog(rate: "44.1 kHz", preview: "other.wav"), Directory, "acceptance").OnlyNameDiffers);
         Assert.False(ExportDialogReading.Verify(LiveDialog(), Directory, "acceptance").OnlyNameDiffers);
+    }
+
+    [Fact]
+    public void REGRESSION_AnotherNameReadWithASeparatorAsSpace_IsNotTheRequestedName()
+    {
+        // Live 2026-10-16: the dialog held "YuugureDrive_final"; OCR read it as "YuugureDrive final". Removing spaces
+        // made that equal to the request "YuugureDriveFinal", so the export went to the old file name.
+        var result = ExportDialogReading.Verify(LiveDialog(preview: "YuugureDrive final.wav"), Directory, "YuugureDriveFinal");
+        Assert.False(result.Ok);
+        Assert.True(result.OnlyNameDiffers);
+        Assert.True(result.Evidence["preview"]!["separator_only_difference"]!.GetValue<bool>());
+        Assert.False(ExportDialogReading.SameNameUnderOcrConfusions("YuugureDrive final", "YuugureDriveFinal"));
+    }
+
+    [Theory]
+    [InlineData("YuugureDrive final", "YuugureDrive_final", true)] // '_' read as a space, same position
+    [InlineData("YuugureDrlve_flnaI", "YuugureDrive_final", true)] // l / i / I
+    [InlineData("mlxd0wn", "mixdown", true)] // 0 / o
+    [InlineData("Mixdown", "mixdown", true)] // Windows file names ignore case
+    [InlineData("YuugureDrive final", "YuugureDriveFinal", false)] // inserted separator
+    [InlineData("YuugureDriveFinal", "YuugureDrive_final", false)] // dropped separator
+    [InlineData("accepta nce", "acceptance", false)]
+    [InlineData("mixdown2", "mixdown", false)]
+    [InlineData("mixdovvn", "mixdown", false)]
+    public void NamesMatchOnlyUnderPositionalOcrConfusions(string read, string requested, bool same) =>
+        Assert.Equal(same, ExportDialogReading.SameNameUnderOcrConfusions(read, requested));
+
+    [Fact]
+    public void SeparatorNoise_IsToleratedOnlyWhenTheCallerAllowsIt()
+    {
+        var spaced = LiveDialog(preview: "accepta nce.wav");
+        var strict = ExportDialogReading.Verify(spaced, Directory, "acceptance");
+        Assert.False(strict.Ok);
+        Assert.True(strict.OnlyNameDiffers);
+        var tolerant = ExportDialogReading.Verify([spaced], Directory, "acceptance", allowSeparatorNoise: true);
+        Assert.True(tolerant.Ok, tolerant.Message);
+        Assert.True(tolerant.Evidence["preview"]!["matched_with_separator_noise"]!.GetValue<bool>());
+        // Another name is never accepted, with or without separator tolerance.
+        Assert.False(ExportDialogReading.Verify([LiveDialog(preview: "other.wav")], Directory, "acceptance", allowSeparatorNoise: true).Ok);
+        // Spacing inside the extension does not count against the name.
+        Assert.True(ExportDialogReading.Verify(LiveDialog(preview: "acceptance. wav"), Directory, "acceptance").Ok);
     }
 
     [Fact]
