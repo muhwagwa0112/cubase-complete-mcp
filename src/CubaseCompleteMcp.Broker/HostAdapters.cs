@@ -57,8 +57,13 @@ public interface IWorkflowUi
     Task<UiStageResult> AnswerPromptAsync(UiDialogRef prompt, bool accept, CancellationToken cancellationToken);
     Task<UiStageResult> FillAddTrackDialogAsync(UiDialogRef dialog, string name, CancellationToken cancellationToken);
     Task<UiStageResult> TypeRenameTextAsync(string name, CancellationToken cancellationToken);
-    Task<UiStageResult> ConfigureAndStartExportAsync(UiDialogRef dialog, string directory, string fileName,
+    /// <summary>Brings the verified Cubase main window to the foreground; sends no keys.</summary>
+    Task<UiStageResult> ActivateCubaseAsync(CancellationToken cancellationToken);
+    /// <summary>Reads the export dialog's settings back and compares them with the request; starts nothing.</summary>
+    Task<UiStageResult> ReadExportSettingsAsync(UiDialogRef dialog, string directory, string fileName,
         CancellationToken cancellationToken);
+    /// <summary>Types the export file name and closes the dialog, which is when Cubase keeps the name; starts nothing.</summary>
+    Task<UiStageResult> CommitExportNameAsync(UiDialogRef dialog, string fileName, CancellationToken cancellationToken);
     Task<UiStageResult> CancelDialogAsync(UiDialogRef dialog, CancellationToken cancellationToken);
     /// <summary>Recognized text of a bound dialog (PrintWindow + Windows OCR); null when it cannot be read.</summary>
     Task<string?> ReadDialogTextAsync(UiDialogRef dialog, CancellationToken cancellationToken);
@@ -69,7 +74,7 @@ public interface IWorkflowUi
 public sealed record PluginCatalogEntry(string Uid, string Name, string? Vendor, string? Category, bool Available);
 
 public sealed record PluginCatalogSnapshot(bool Available, string Source, IReadOnlyList<PluginCatalogEntry> Entries,
-    string? UnavailableReason);
+    string? UnavailableReason, long? SlotObjectId = null);
 
 /// <summary>
 /// Installed plug-in UIDs and slot identity read-back. The production provider reports the catalog as unavailable:

@@ -60,14 +60,36 @@ function createHost(options) {
   Object.defineProperty(selectedTree, 'uniqueId', { get: function () { return state.selected ? state.selected.uid : ''; } });
   Object.defineProperty(selectedTree, 'title', { get: function () { return state.selected ? state.selected.tree.title : ''; } });
   selectedTree.children.push(node(102, 'Insert 1', 'uid-selected-insert', [param(0, 'Bypass')]));
+  // Cubase 15.0.30 layout: an "Inserts" folder with one "Slot" per insert; a loaded plug-in is the slot's child
+  // object, named "<class UID>-<instance>".
+  const inserts = node(110, 'Inserts', 'Inserts', []);
+  inserts.children.push(node(111, '1', 'Slot', [param(0, 'Bypass')]), node(112, '2', 'Slot 2', [param(0, 'Bypass')]));
+  selectedTree.children.push(inserts);
   const selectedIndex = indexTree(selectedTree);
+  const catalogEntries = [
+    { mPluginName: 'StudioEQ', mPluginVendor: 'Steinberg Media Technologies', mPluginVersion: '15.0.30', mFormatVersion: 'VST 3.7',
+      mSubCategories: 'Fx|EQ', mPluginUID: '946051208E29496E804F64A825C8A047', mCollectionPath: 'EQ' },
+    { mPluginName: 'Compressor', mPluginVendor: 'Steinberg Media Technologies', mPluginVersion: '15.0.30', mFormatVersion: 'VST 3.7',
+      mSubCategories: 'Fx|Dynamics', mPluginUID: '5B38F28281144FFE80285FF7CCF20483', mCollectionPath: 'Dynamics' }];
+  let nextPluginObject = 500;
   const slotManager = {
     trySetSlotPlugin: function (m, objectId, uid, dontAskDiscard) {
       calls.slotAssignments.push({ objectId: objectId, pluginUid: uid, dontAskDiscard: dontAskDiscard });
-      selectedIndex[objectId].title = 'Assigned ' + uid; selectedIndex[objectId].uniqueId = 'assigned-' + uid;
+      const slot = selectedIndex[objectId];
+      const loaded = node(nextPluginObject++, 'Plug-in ' + uid, String(uid).replace(/[^0-9A-Fa-f]/g, '').toUpperCase() + '-1', [param(0, 'Gain')]);
+      slot.children = [loaded]; selectedIndex[loaded.id] = loaded;
       return true;
     }
   };
+  if (opts.pluginCatalog !== false) {
+    slotManager.getNumberOfPluginCollections = function () { return 1; };
+    slotManager.getIndexOfActivePluginCollection = function () { return 0; };
+    slotManager.getIndexOfDefaultPluginCollection = function () { return 0; };
+    slotManager.getPluginCollectionByIndex = function (m, slotId, index) {
+      calls.catalogReads = (calls.catalogReads || []).concat([{ slotId: slotId, index: index }]);
+      return { mName: 'Default', mEntries: catalogEntries };
+    };
+  }
 
   function accessFor(resolveIndex, baseId, manager) {
     function entry(objectId) { const index = resolveIndex(); if (!index || !index[objectId]) { throw new Error('unknown object ' + objectId); } return index[objectId]; }
@@ -262,7 +284,7 @@ scenario('hello and capabilities', { api13: true }, function (host) {
   check('hello echoes nonce and session', hello && hello.client_nonce === 'n1' && hello.session_id === host.context.runtime.sessionId, hello);
   check('hello declares driver contract 2', hello && hello.driver_contract_version === 2, hello);
   check('hello carries the embedded build id', hello && typeof hello.driver_build_id === 'string' && hello.driver_build_id.length > 0, hello);
-  check('plug-in catalog is not claimed', hello && hello.capabilities.plugin_catalog === false, hello && hello.capabilities);
+  check('the API 1.3 plug-in catalog is reported', hello && hello.capabilities.plugin_catalog === true, hello && hello.capabilities);
 });
 
 scenario('SES-08 activation resets the mirror', { autoToggle: { Record: 'Record' } }, function (host) {
@@ -323,6 +345,11 @@ scenario('VER-06 tempo and positions', {}, function (host) {
   refused(host, 'position in another time format', 'transport.set', { action: 'position', position_text: '0:00:02.000', time_format: 'Seconds' }, 'UNSUPPORTED_TIME_FORMAT');
   const moved = ok(host, 'position in the host format', 'transport.set', { action: 'position', position_text: '2.1.1.0', time_format: 'Bars+Beats' });
   check('position is set once with the given text', host.calls.setTime.length === 1 && host.calls.setTime[0].text === '2.1.1.0' && moved.time_format === 'Bars+Beats', host.calls.setTime);
+  // The left locator has not reported since activation; it shares the primary display, so the position's format applies.
+  const left = ok(host, 'left locator with the shared display format', 'transport.set', { action: 'left_locator', position_text: '1.1.1.0', time_format: 'Bars+Beats' });
+  check('an unreported locator is set once in the shared format', left && left.mutation_sent === true && left.time_format === 'Bars+Beats'
+    && host.calls.setTime[1].name === 'left' && host.calls.setTime[1].text === '1.1.1.0', host.calls.setTime);
+  refused(host, 'left locator in another format', 'transport.set', { action: 'left_locator', position_text: '0:00:02.000', time_format: 'Seconds' }, 'UNSUPPORTED_TIME_FORMAT');
   refused(host, 'unknown transport action', 'transport.set', { action: 'warp' }, 'INVALID_ACTION');
 });
 
@@ -429,7 +456,13 @@ scenario('selected-track mixer path', { autoToggle: {} }, function (host) {
 scenario('plug-in slots on an API 1.3 host', { api13: true }, function (host) {
   const guard = selectedGuard(host);
   const catalog = ok(host, 'catalog', 'plugin.get', { action: 'catalog' });
-  check('no UID catalog is fabricated', catalog && catalog.available === false && catalog.entries.length === 0, catalog);
+  check('the catalog lists the host entries with their UIDs', catalog && catalog.available === true && catalog.total === 2
+    && catalog.entries[0].uid === '946051208E29496E804F64A825C8A047' && catalog.entries[0].name === 'StudioEQ', catalog);
+  check('the catalog is read for the first insert slot', catalog && catalog.slot_object_id === 111 && host.calls.catalogReads[0].slotId === 111, catalog);
+  const paged = ok(host, 'catalog page', 'plugin.get', { action: 'catalog', offset: 1, limit: 1 });
+  check('the catalog pages by offset/limit', paged && paged.entries.length === 1 && paged.entries[0].name === 'Compressor' && paged.offset === 1, paged);
+  const empty = ok(host, 'inspect an empty slot', 'plugin.get', { action: 'inspect_slot', expected_selected: guard, object_id: 111 });
+  check('an empty slot reports no loaded plug-in', empty && empty.slot.loaded === null, empty);
   const inspected = ok(host, 'inspect_slot', 'plugin.get', { action: 'inspect_slot', expected_selected: guard, object_id: 102 });
   check('inspect_slot reports the slot', inspected && inspected.slot.title === 'Insert 1', inspected);
   refused(host, 'assign after the slot changed', 'plugin.set', { action: 'assign', expected_selected: guard, object_id: 102, plugin_uid: 'u1', expected_slot_unique_id: 'something-else' }, 'TARGET_CHANGED');
@@ -440,7 +473,16 @@ scenario('plug-in slots on an API 1.3 host', { api13: true }, function (host) {
   ok(host, 'assign with confirm_replace', 'plugin.set', { action: 'assign', expected_selected: guard, object_id: 102, plugin_uid: 'u2', confirm_replace: true });
   check('confirm_replace is honoured only when given', host.calls.slotAssignments[1].dontAskDiscard === true);
   refused(host, 'assign without a target', 'plugin.set', { action: 'assign', object_id: 102, plugin_uid: 'u3' }, 'TARGET_REQUIRED');
+  ok(host, 'assign a catalog UID to an insert slot', 'plugin.set', { action: 'assign', expected_selected: guard, object_id: 111, plugin_uid: '946051208E29496E804F64A825C8A047' });
+  const loaded = ok(host, 'inspect the assigned slot', 'plugin.get', { action: 'inspect_slot', expected_selected: guard, object_id: 111 });
+  check('the loaded plug-in UID is read back from the slot child', loaded && loaded.slot.loaded && loaded.slot.loaded.plugin_uid === '946051208E29496E804F64A825C8A047', loaded);
   refused(host, 'bypass is not offered', 'plugin.set', { action: 'bypass', expected_selected: guard, object_id: 102 }, 'INVALID_ACTION');
+});
+
+scenario('API 1.3 host without a plug-in catalog', { api13: true, pluginCatalog: false }, function (host) {
+  const catalog = ok(host, 'catalog', 'plugin.get', { action: 'catalog' });
+  check('no UID catalog is fabricated', catalog && catalog.available === false && catalog.entries.length === 0, catalog);
+  check('the catalog is not claimed', host.context.capabilities().plugin_catalog === false);
 });
 
 scenario('API 1.2 host', { api13: false }, function (host) {

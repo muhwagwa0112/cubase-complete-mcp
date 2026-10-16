@@ -247,11 +247,12 @@ public sealed partial class CubaseController
         }
         var uid = args["plugin_uid"]?.GetValue<string>();
         if (string.IsNullOrWhiteSpace(uid)) throw new PlanException(ErrorCodes.InvalidArgument, "plugin_uid is required.");
-        var catalog = await _plugins.GetCatalogAsync(cancellationToken).ConfigureAwait(false);
+        var catalog = await PluginCatalogAsync(plan.Target, ReadLong(args["object_id"]), cancellationToken).ConfigureAwait(false);
         if (!catalog.Available)
             throw new PlanException(ErrorCodes.PluginCatalogUnavailable, catalog.UnavailableReason
                 ?? "No verifiable installed plug-in catalog is available, so plugin_uid cannot be validated.");
-        var entry = catalog.Entries.FirstOrDefault(item => item.Uid.Equals(uid, StringComparison.Ordinal));
+        var entry = catalog.Entries.FirstOrDefault(item => item.Uid.Equals(uid, StringComparison.Ordinal))
+            ?? catalog.Entries.FirstOrDefault(item => NormalizePluginUid(item.Uid) == NormalizePluginUid(uid));
         if (entry is null || !entry.Available)
             throw new PlanException(ErrorCodes.InvalidArgument, "plugin_uid is not an available entry of the installed plug-in catalog.");
         var inspect = TargetArguments(plan.Target);
@@ -363,7 +364,10 @@ public sealed partial class CubaseController
                     throw new PlanException(ErrorCodes.InvalidArgument,
                         "expected_duration_seconds (the locator range length) is required to verify the rendered WAV.");
                 plan.Command = RequireCommand("File", "Export Audio Mixdown");
+                plan.Targets["perform_command"] = RequireCommand("Audio Export", "Perform Audio Export").Id;
                 plan.Targets["profile"] = "wav_pcm_stereo_48000_24";
+                plan.Impact = $"Open Export Audio Mixdown, name the file '{Path.GetFileNameWithoutExtension(wavPath)}', verify by read-back that it is a "
+                    + "48 kHz/24-bit WAV in the project Mixdown folder, then export the locator range once.";
                 break;
             case "new":
                 plan.Command = RequireCommand("File", "New");

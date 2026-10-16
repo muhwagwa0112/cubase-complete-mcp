@@ -160,6 +160,59 @@ async function runCase(id, body) {
     evidence: [{ path: tracePath, sha256: sha256File(join(evidence, tracePath)), kind: spec.required_evidence_kinds.includes('host_trace') ? 'host_trace' : 'protocol_trace' }, ...artifacts] });
 }
 const blockedAuth = reason => ({ outcome: 'BLOCKED_AUTH', reason });
+const sleep = ms => new Promise(done => setTimeout(done, ms));
+
+// Minimal SMF reader: per track, its name and note-on events (tick, note, velocity).
+function readSmfTracks(path) {
+  const bytes = readFileSync(path);
+  if (bytes.toString('ascii', 0, 4) !== 'MThd') throw new Error(`${path} is not a Standard MIDI File`);
+  let at = 8 + bytes.readUInt32BE(4);
+  const tracks = [];
+  while (at + 8 <= bytes.length) {
+    const length = bytes.readUInt32BE(at + 4);
+    const end = at + 8 + length;
+    let p = at + 8, tick = 0, status = 0, name = '';
+    const notes = [];
+    const vlq = () => { let value = 0, byte; do { byte = bytes[p++]; value = (value << 7) | (byte & 0x7f); } while (byte & 0x80); return value; };
+    while (p < end) {
+      tick += vlq();
+      let byte = bytes[p];
+      if (byte < 0x80) byte = status; else { p++; status = byte; }
+      if (byte === 0xff) { const type = bytes[p++]; const size = vlq(); if (type === 0x03) name = bytes.toString('utf8', p, p + size); p += size; }
+      else if (byte === 0xf0 || byte === 0xf7) { p += vlq(); }
+      else {
+        const kind = byte & 0xf0, first = bytes[p++], second = kind === 0xc0 || kind === 0xd0 ? null : bytes[p++];
+        if (kind === 0x90 && second > 0) notes.push({ tick, note: first, velocity: second });
+      }
+    }
+    tracks.push({ name, notes });
+    at = end;
+  }
+  return tracks;
+}
+
+const projectName = title => String(title ?? '').split(' - ').pop().trim();
+
+// "Write MIDI File to Project Folder" writes <project folder>/<project name>.mid without a dialog.
+async function writeProjectMidi(client) {
+  const project = await client.call('cubase_project', { action: 'get' });
+  const file = join(fixture, projectName(project.data?.project_title) + '.mid');
+  if (existsSync(file)) throw new Error(`${file} already exists; the fixture must not hold an earlier project MIDI file`);
+  const wrote = await client.confirm('cubase_command', { category: 'File', name: 'Write MIDI File to Project Folder', action: 'execute' });
+  for (let i = 0; i < 40 && !existsSync(file); i++) await sleep(250);
+  if (!existsSync(file)) throw new Error(`Cubase did not write ${file} (command status ${wrote.status})`);
+  let size = -1;
+  for (let i = 0; i < 20; i++) { const now = readFileSync(file).length; if (now === size) break; size = now; await sleep(200); }
+  return file;
+}
+
+// A locator that already sits at the requested time produces no host callback, so it is first moved to a distinct
+// time; only the final move is the verified one.
+async function setLocator(client, action, text, away) {
+  await client.call('cubase_transport', { action, position_text: away, time_format: 'Bars+Beats' });
+  return client.call('cubase_transport', { action, position_text: text, time_format: 'Bars+Beats' });
+}
+let writtenMidi = null;
 const blockedEnv = reason => ({ outcome: 'BLOCKED_ENV', reason });
 
 // ---- run ----------------------------------------------------------------------------------------------------------
@@ -171,13 +224,19 @@ try {
   await a.init();
   await b.init();
   const status = await a.call('cubase_status', {});
+  // The broker is a singleton that outlives Cubase restarts; a broker of another release would serve this candidate's
+  // requests with other code. Nothing has been changed yet when this refuses.
+  if (status.data?.broker_release_id !== release.manifest.release_id || status.data?.release_mismatch !== false) {
+    throw new Error(`The running broker belongs to release ${status.data?.broker_release_id}, not ${release.manifest.release_id}; stop it and run again. Nothing was changed.`);
+  }
   const project = await a.call('cubase_project', { action: 'get' });
   runtimeFacts = {
     os: process.platform === 'win32' ? 'Windows' : process.platform, candidate_sha: candidateSha,
     interactive_desktop: Boolean(status.data?.window_title), fixture_owned: true, fixture_id: marker.fixture_id,
     authorization_reference: authorization.authorization_reference, cubase_version: status.data?.cubase_version ?? null,
     driver_contract_version: status.data?.driver_contract_version ?? null, driver_build_id: status.data?.driver_build_id ?? null,
-    expected_driver_build_id: installation.expected_driver_build_id, installation_receipt_sha256: sha256File(receiptPath)
+    expected_driver_build_id: installation.expected_driver_build_id, installation_receipt_sha256: sha256File(receiptPath),
+    broker_release_id: status.data?.broker_release_id ?? null
   };
   const projectMatches = String(project.data?.project_title ?? '').includes('acceptance');
   if (!projectMatches) throw new Error(`The open project is not the fixture project (title: ${project.data?.project_title}). Nothing was changed.`);
@@ -198,13 +257,18 @@ try {
     const renamed = await a.call('cubase_track', { action: 'rename', target_scope: 'selected', name: `CBMCP B2 ${tag}` });
     expect(0, 'Ok with created identity and exact names', [createdA.status, createdB.status, renamed.status],
       createdA.status === 'Ok' && createdB.status === 'Ok' && renamed.status === 'Ok');
-    const catalog = await a.call('cubase_plugin', { action: 'catalog' });
+    const catalog = await a.call('cubase_plugin', { action: 'catalog', target_handle: trackB });
     if (catalog.status !== 'Ok' || !catalog.data?.entries?.length) {
       return blockedEnv(`installed plug-in catalog unavailable: ${catalog.error?.code ?? catalog.status}`);
     }
-    const entry = catalog.data.entries[0];
-    const assigned = await a.confirm('cubase_plugin', { action: 'assign', target_scope: 'selected', object_id: 0, plugin_uid: entry.uid });
-    expect(1, `slot UID ${entry.uid}`, assigned.data?.verification ?? assigned.error, assigned.status === 'Ok');
+    // A Steinberg effect that ships with Cubase, so the case does not depend on third-party installations.
+    const effects = catalog.data.entries.filter(item => /^Fx/i.test(item.category ?? ''));
+    const entry = ['StudioEQ', 'Compressor', 'Limiter', 'DeEsser'].map(name => effects.find(item => item.name === name)).find(Boolean)
+      ?? effects.find(item => /steinberg/i.test(item.vendor ?? '')) ?? effects[0];
+    if (!entry || catalog.data.slot_object_id === undefined || catalog.data.slot_object_id === null) return blockedEnv('no effect entry or insert slot in the catalog');
+    const assigned = await a.confirm('cubase_plugin', { action: 'assign', target_handle: trackB, object_id: catalog.data.slot_object_id, plugin_uid: entry.uid });
+    expect(1, `slot UID ${entry.uid} (${entry.name})`, assigned.data?.verification ?? assigned.error, assigned.status === 'Ok'
+      && assigned.data?.verification?.verified === true);
   });
 
   await runCase('LIVE-02', async expect => {
@@ -238,6 +302,9 @@ try {
 
   let importDocument = null;
   await runCase('LIVE-05', async (expect, attach) => {
+    // A track with the source track's name exists before the import; it must never be taken for the imported one.
+    const decoy = await a.call('cubase_track', { action: 'create', track_type: 'midi', name: 'Keys' });
+    if (decoy.status !== 'Ok') return blockedEnv(`decoy track could not be created: ${decoy.error?.code}`);
     const doc = await a.call('cubase_midi', { action: 'create_document', name: `Acceptance ${tag}` });
     importDocument = doc.data?.document?.id;
     const track = await a.call('cubase_midi', { action: 'add_track', document_id: importDocument, name: 'Keys' });
@@ -245,18 +312,28 @@ try {
       options: { events: [{ tick: 0, duration_ticks: 480, note: 60, velocity: 100 }, { tick: 480, duration_ticks: 480, note: 64, velocity: 96 }] } });
     const imported = await a.call('cubase_midi', { action: 'import_to_cubase', document_id: importDocument });
     if (imported.data?.rendered_path) attach(imported.data.rendered_path, 'import.mid', 'file_artifact', imported.data.rendered_sha256 ?? null);
-    expect(0, 'targets_observed with new identities', imported.data?.verification_level, imported.data?.verification_level === 'targets_observed');
-    return imported.data?.verification_level === 'targets_observed'
-      ? blockedEnv('parts cannot be observed through MIDI Remote; export the new track to <fixture>/roundtrip.mid for E2E-02')
-      : undefined;
+    const created = imported.data?.created_tracks ?? [];
+    expect(0, 'targets_observed with new identities', { level: imported.data?.verification_level, created: created.map(item => item.created?.unique_id) },
+      imported.data?.verification_level === 'targets_observed' && created.length === 1
+      && created[0].created?.unique_id !== decoy.data?.created?.unique_id && created[0].target_handle !== decoy.data?.target_handle);
+    // The part is observed in Cubase's own SMF of the project: the notes sit on the tagged new track, none on the decoy.
+    writtenMidi = await writeProjectMidi(a);
+    attach(writtenMidi, 'project.mid');
+    const tracks = readSmfTracks(writtenMidi);
+    const tagged = tracks.filter(item => item.name.includes(imported.data?.verification_tag ?? '\u0000'));
+    const elsewhere = tracks.filter(item => !tagged.includes(item)).reduce((sum, item) => sum + item.notes.length, 0);
+    expect(1, 'part on the new tagged track; the same-named decoy holds nothing', { tagged: tagged.map(item => ({ name: item.name, notes: item.notes })), notes_elsewhere: elsewhere },
+      tagged.length === 1 && tagged[0].notes.length === 2 && tagged[0].notes[0].note === 60 && tagged[0].notes[1].note === 64 && elsewhere === 0);
   });
 
   await runCase('LIVE-07', async (expect, attach) => {
-    const left = await a.call('cubase_transport', { action: 'left_locator', position_text: '1.1.1.0', time_format: 'Bars+Beats' });
-    if (left.status !== 'Ok') return blockedEnv(`left locator could not be set in Bars+Beats: ${left.error?.code ?? left.status}`);
-    const right = await a.call('cubase_transport', { action: 'right_locator', position_text: '3.1.1.0', time_format: 'Bars+Beats' });
+    const right = await setLocator(a, 'right_locator', '3.1.1.0', '4.1.1.0');
     if (right.status !== 'Ok') return blockedEnv(`right locator could not be set in Bars+Beats: ${right.error?.code ?? right.status}`);
-    const wav = join(fixture, 'mixdown.wav');
+    const left = await setLocator(a, 'left_locator', '1.1.1.0', '2.1.1.0');
+    if (left.status !== 'Ok') return blockedEnv(`left locator could not be set in Bars+Beats: ${left.error?.code ?? left.status}`);
+    // Export Audio Mixdown writes to the project Mixdown folder, which Cubase creates only on its first export.
+    mkdirSync(join(fixture, 'Mixdown'), { recursive: true });
+    const wav = join(fixture, 'Mixdown', 'mixdown.wav');
     const exported = await a.call('cubase_project', { action: 'export_audio', path: wav, expected_duration_seconds: 4.0 });
     if (exported.status === 'Ok') attach(wav, 'mixdown.wav');
     expect(0, 'valid WAV header/data', exported.data?.wav, exported.status === 'Ok');
@@ -298,9 +375,34 @@ try {
     expect(1, 'planned identity kept', commit.execution_state, commit.execution_state === 'not_started');
   });
 
-  await runCase('FAULT-03', async () => scope.driver_reconnect_fault_test === true
-    ? blockedEnv('driver reconnect requires an operator to deactivate/reactivate MIDI Remote; not automated')
-    : blockedAuth('driver reconnect fault test was not authorized'));
+  await runCase('FAULT-03', async expect => {
+    if (scope.driver_reconnect_fault_test !== true) return blockedAuth('driver reconnect fault test was not authorized');
+    const before = await a.call('cubase_status', {});
+    const listed = await a.call('cubase_track', { action: 'list' });
+    const old = listed.data?.channels?.find(channel => channel.title === `CBMCP A ${tag}`);
+    if (!old) return blockedEnv('fixture track A was not found before the reconnect');
+    const volumeBefore = (await a.call('cubase_mixer', { action: 'get', target_handle: old.handle, parameter: 'volume' })).data?.process_value;
+    // Cubase deactivates and re-activates the MIDI Remote driver when the active project changes; the driver then
+    // says hello again and the broker adopts a new driver epoch.
+    await a.call('cubase_project', { action: 'save_as', path: join(fixture, 'fault-03.cpr') });
+    await a.confirm('cubase_project', { action: 'open', path: join(fixture, 'acceptance-saved.cpr') });
+    let after = before;
+    for (let i = 0; i < 40; i++) {
+      after = await a.call('cubase_status', {});
+      if ((after.data?.driver_epoch ?? 0) > (before.data?.driver_epoch ?? 0) && after.data?.driver_online === true) break;
+      await sleep(500);
+    }
+    const stale = await a.call('cubase_mixer', { action: 'set', target_handle: old.handle, parameter: 'volume', value: volumeBefore > 0.5 ? 0.3 : 0.7 });
+    const relisted = await a.call('cubase_track', { action: 'list' });
+    const fresh = relisted.data?.channels?.find(channel => channel.title === `CBMCP A ${tag}`);
+    const volumeAfter = fresh ? (await a.call('cubase_mixer', { action: 'get', target_handle: fresh.handle, parameter: 'volume' })).data?.process_value : null;
+    expect(0, 'the pre-reconnect handle is refused before dispatch', { status: stale.status, code: stale.error?.code, execution_state: stale.execution_state },
+      stale.status !== 'Ok' && ['not_started', 'not_applied'].includes(stale.execution_state));
+    expect(1, 'a new driver epoch with the installed build', { epoch_before: before.data?.driver_epoch, epoch_after: after.data?.driver_epoch, build: after.data?.driver_build_id },
+      (after.data?.driver_epoch ?? 0) > (before.data?.driver_epoch ?? 0) && after.data?.driver_build_id === installation.expected_driver_build_id);
+    expect(2, 'nothing replayed onto the reopened track', { before: volumeBefore, after: volumeAfter },
+      typeof volumeAfter === 'number' && Math.abs(volumeAfter - volumeBefore) < 1e-6);
+  });
 
   await runCase('FAULT-04', async expect => {
     const operationId = randomUUID();
@@ -322,21 +424,28 @@ try {
   });
 
   await runCase('E2E-02', async (expect, attach) => {
-    const roundtrip = join(fixture, 'roundtrip.mid');
-    if (!existsSync(roundtrip)) return blockedEnv('operator export of the imported track to <fixture>/roundtrip.mid is required');
-    attach(roundtrip, 'roundtrip.mid');
-    const compared = await a.call('cubase_midi', { action: 'compare_file', document_id: importDocument, path: roundtrip });
+    if (!writtenMidi || !importDocument) return blockedEnv('LIVE-05 did not import and write back the MIDI part');
+    attach(writtenMidi, 'project.mid');
+    const compared = await a.call('cubase_midi', { action: 'compare_file', document_id: importDocument, path: writtenMidi });
     expect(0, 'content_equal', compared.data?.content_equal, compared.data?.content_equal === true);
     expect(1, 'hashes recorded', [compared.data?.source_sha256, compared.data?.exported_sha256], Boolean(compared.data?.exported_sha256));
   });
 
   await runCase('E2E-03', async (expect, attach) => {
     const chain = results.filter(item => ['LIVE-07', 'LIVE-06'].includes(item.case_id)).map(item => item.status);
-    for (const [file, name] of [[join(fixture, 'mixdown.wav'), 'mixdown.wav'], [join(fixture, 'acceptance-saved.cpr'), 'acceptance-saved.cpr']]) {
+    for (const [file, name] of [[join(fixture, 'Mixdown', 'mixdown.wav'), 'mixdown.wav'], [join(fixture, 'acceptance-saved.cpr'), 'acceptance-saved.cpr']]) {
       if (existsSync(file)) attach(file, name);
     }
+    // The reopened project (acceptance-saved, active again after FAULT-03) still holds the imported part.
+    let parts = null;
+    if (importDocument) {
+      const reopenedMidi = await writeProjectMidi(a);
+      attach(reopenedMidi, 'reopened.mid');
+      parts = await a.call('cubase_midi', { action: 'compare_file', document_id: importDocument, path: reopenedMidi });
+    }
     expect(0, 'WAV valid', chain[0], chain[0] === 'PASS');
-    expect(1, 'reopen preserved tracks/values/parts', chain[1], chain[1] === 'PASS');
+    expect(1, 'reopen preserved tracks/values/parts', { save_reopen: chain[1], parts_equal: parts?.data?.content_equal },
+      chain[1] === 'PASS' && parts?.data?.content_equal === true);
   });
 
   await runCase('E2E-04', async expect => {

@@ -171,17 +171,100 @@ public sealed partial class CubaseUiAutomation
     }
 
     /// <summary>
-    /// Cubase's Export Audio Mixdown dialog exposes no controls to UI Automation or Win32, so its path, name and format
-    /// cannot be set reliably. The stage fails explicitly instead of typing into unknown fields.
+    /// Brings the identity-verified Cubase main window to the foreground before a keyboard stage. Windows refuses
+    /// SetForegroundWindow to a background process, so the broker briefly attaches its input queue to the current
+    /// foreground thread; no keystrokes are sent. Fails when Cubase is still not in front afterwards.
     /// </summary>
-    public Task<UiStageResult> ConfigureAndStartExportAsync(UiDialogRef dialog, string directory, string fileName,
+    public async Task<UiStageResult> ActivateCubaseAsync(CancellationToken cancellationToken)
+    {
+        var process = processInspector.Inspect();
+        if (!process.Running || process.ProcessId is null) return UiStageResult.Failure("activate", "CUBASE_NOT_RUNNING", "Cubase is not running.");
+        if (!CreateTarget(process).IdentityVerified || process.WindowHandle == IntPtr.Zero)
+            return UiStageResult.Failure("activate", "FOREGROUND_NOT_CUBASE", "The Cubase main window could not be identified; no focus change was attempted.");
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            var foreground = GetForegroundWindow();
+            var foregroundThread = GetWindowThreadProcessId(foreground, out var foregroundProcess);
+            if (foregroundProcess == process.ProcessId)
+                return UiStageResult.Success("activate", new JsonObject { ["attempts"] = attempt });
+            var current = GetCurrentThreadId();
+            var attached = foregroundThread != 0 && foregroundThread != current && AttachThreadInput(current, foregroundThread, true);
+            try
+            {
+                if (IsIconic(process.WindowHandle)) _ = ShowWindow(process.WindowHandle, 9 /* SW_RESTORE */);
+                _ = BringWindowToTop(process.WindowHandle);
+                _ = SetForegroundWindow(process.WindowHandle);
+            }
+            finally
+            {
+                if (attached) _ = AttachThreadInput(current, foregroundThread, false);
+            }
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        }
+        return UiStageResult.Failure("activate", "FOREGROUND_NOT_CUBASE", "Cubase did not become the foreground window; no keys were sent.");
+    }
+
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr handle);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr handle);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr handle, int command);
+
+    /// <summary>
+    /// Cubase's Export Audio Mixdown dialog exposes no controls to UI Automation or Win32, so its settings are read back
+    /// by OCR of the dialog and compared with a 48 kHz/24-bit WAV at the requested directory (Path follows "Use Project
+    /// Mixdown Folder"). Evidence carries only_name_differs when everything but the file name matches.
+    /// </summary>
+    public async Task<UiStageResult> ReadExportSettingsAsync(UiDialogRef dialog, string directory, string fileName,
         CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(Revalidate(dialog) is null
-            ? UiStageResult.Failure("export_configure", "WORKFLOW_DIALOG_LOST", "The export dialog is no longer open.")
-            : UiStageResult.Failure("export_configure", "WORKFLOW_CONTROL_MISSING",
-                "The Export Audio Mixdown dialog exposes no addressable controls, so the output path and format cannot be set safely; nothing was typed and no export was started."));
+        var owned = Revalidate(dialog);
+        if (owned is null) return UiStageResult.Failure("export_read", "WORKFLOW_DIALOG_LOST", "The export dialog is no longer open.");
+        await Task.Delay(300, cancellationToken).ConfigureAwait(false); // let the dialog finish painting
+        var capture = CaptureWindow(owned.Handle, "export-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(6)).ToLowerInvariant());
+        if (capture is null) return UiStageResult.Failure("export_read", "EXPORT_SETTINGS_UNREADABLE", "The export dialog could not be captured for read-back.");
+        // Short English words on Cubase's grey fields are recognized at some upscales and missed at others.
+        var passes = new List<JsonArray>();
+        ExportDialogReading.Result reading = null!;
+        foreach (var scale in new[] { 2.0, 2.5, 3.0, 4.0 })
+        {
+            passes.Add(await RecognizeTextAsync(capture, scale).ConfigureAwait(false));
+            reading = ExportDialogReading.Verify(passes, directory, fileName);
+            if (reading.Ok) break;
+        }
+        reading.Evidence["capture"] = capture;
+        return reading.Ok
+            ? UiStageResult.Success("export_read", reading.Evidence)
+            : UiStageResult.Failure("export_read", "EXPORT_SETTINGS_MISMATCH", reading.Message!, reading.Evidence);
+    }
+
+    /// <summary>
+    /// Live on Cubase 15.0.30: the dialog opens with its Name field focused and selected, but a typed name takes effect
+    /// only when the dialog closes (Enter and Tab do not commit it while the dialog is open). The name is therefore
+    /// typed while the dialog is the verified foreground window and the dialog is closed; the caller reopens it and
+    /// reads the settings back before anything is exported.
+    /// </summary>
+    public async Task<UiStageResult> CommitExportNameAsync(UiDialogRef dialog, string fileName, CancellationToken cancellationToken)
+    {
+        var owned = Revalidate(dialog);
+        if (owned is null) return UiStageResult.Failure("export_name", "WORKFLOW_DIALOG_LOST", "The export dialog is no longer open.");
+        var typed = await TypeIntoForegroundAsync(owned.Handle, fileName, pressEnter: false, cancellationToken).ConfigureAwait(false);
+        if (!typed.Ok) return typed;
+        await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+        var closed = await CloseOwnedDialogAsync(owned, cancellationToken).ConfigureAwait(false);
+        _dialogs.TryRemove(dialog.Id, out _);
+        return closed
+            ? UiStageResult.Success("export_name", new JsonObject { ["characters"] = fileName.Length })
+            : UiStageResult.Failure("export_name", "WORKFLOW_DIALOG_LEFT_OPEN", "The export dialog did not close after the name was typed.");
+    }
+
+    /// <summary>Closes a Cubase-drawn dialog with WM_CLOSE and waits until its window is gone.</summary>
+    private static async Task<bool> CloseOwnedDialogAsync(OwnedDialog owned, CancellationToken cancellationToken)
+    {
+        _ = PostMessage(owned.Handle, 0x0010 /* WM_CLOSE */, IntPtr.Zero, IntPtr.Zero);
+        for (var attempt = 0; attempt < 30 && IsWindow(owned.Handle) && IsWindowVisible(owned.Handle); attempt++)
+            await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        return !IsWindow(owned.Handle) || !IsWindowVisible(owned.Handle);
     }
 
     /// <summary>Cancels a dialog this workflow bound earlier. Any other window is refused.</summary>
@@ -190,11 +273,9 @@ public sealed partial class CubaseUiAutomation
         var owned = Revalidate(dialog);
         if (owned is null) return UiStageResult.Failure("cancel", "WORKFLOW_DIALOG_LOST", "The bound dialog is no longer open.");
         if (ClassName(owned.Handle) == "#32770" && HasControl(owned.Handle, IdCancel)) PressDialogButton(owned.Handle, IdCancel);
-        else
-        {
-            var escaped = await TypeIntoForegroundAsync(owned.Handle, null, pressEnter: false, cancellationToken, escape: true).ConfigureAwait(false);
-            if (!escaped.Ok) return escaped;
-        }
+        // Escape only abandons a text edit in Cubase's own dialogs; WM_CLOSE closes them without running their action.
+        else if (!await CloseOwnedDialogAsync(owned, cancellationToken).ConfigureAwait(false))
+            return UiStageResult.Failure("cancel", "WORKFLOW_DIALOG_LEFT_OPEN", "The dialog did not close.");
         _dialogs.TryRemove(dialog.Id, out _);
         return UiStageResult.Success("cancel");
     }

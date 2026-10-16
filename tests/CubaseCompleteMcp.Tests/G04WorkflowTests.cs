@@ -56,6 +56,16 @@ public sealed class G04WorkflowTests
         Assert.Equal(ResultStatus.Ok, rename.Status);
         Assert.Equal("Lead 2", created.Title);
         Assert.Equal("Existing", existing.Title);
+        Assert.True(harness.Ui.Actions.IndexOf("activate_cubase") < harness.Ui.Actions.LastIndexOf("rename_text")); // Cubase is brought to front first
+
+        // When Cubase cannot be brought to the front, the rename command is not even sent.
+        harness.Ui.CubaseActivates = false;
+        var commandsBefore = harness.Driver.WriteCount("command.execute");
+        var background = await harness.SendAsync("track", new JsonObject { ["action"] = "rename", ["target_scope"] = "selected", ["name"] = "Lead 3" });
+        Assert.Equal("FOREGROUND_NOT_CUBASE", background.Error!.Code);
+        Assert.Equal(commandsBefore, harness.Driver.WriteCount("command.execute"));
+        Assert.Equal("Lead 2", created.Title);
+        harness.Ui.CubaseActivates = true;
 
         var notSelected = await harness.SendAsync("track", new JsonObject { ["action"] = "rename", ["target_handle"] = await harness.HandleForAsync(existing), ["name"] = "X" });
         Assert.Equal(ErrorCodes.TargetNotSelected, notSelected.Error!.Code);
@@ -157,6 +167,49 @@ public sealed class G04WorkflowTests
         Assert.Equal("Assigned", harness.Driver.SlotTitle); // the title changed in every case; it never decides the result
     }
 
+    [Theory]
+    [InlineData("946051208E29496E804F64A825C8A047", null, ResultStatus.Ok)]
+    [InlineData("94605120-8e29-496e-804f-64a825c8a047", null, ResultStatus.Ok)]
+    [InlineData("946051208E29496E804F64A825C8A047", "5B38F28281144FFE80285FF7CCF20483", ResultStatus.Error)]
+    public async Task WFL05_Api13Host_CatalogAndUidReadBackComeFromTheDriver(string requested, string? hostLoads, ResultStatus expected)
+    {
+        using var harness = new ControllerHarness();
+        harness.Driver.DriverPluginCatalog =
+        [
+            new JsonObject { ["uid"] = "946051208E29496E804F64A825C8A047", ["name"] = "StudioEQ", ["vendor"] = "Steinberg Media Technologies", ["sub_categories"] = "Fx|EQ" },
+            new JsonObject { ["uid"] = "5B38F28281144FFE80285FF7CCF20483", ["name"] = "Compressor", ["vendor"] = "Steinberg Media Technologies", ["sub_categories"] = "Fx|Dynamics" }
+        ];
+        harness.Driver.LoadedUidOverride = hostLoads;
+        var target = harness.Driver.AddChannel("Bus");
+        harness.Driver.Select(target);
+
+        var catalog = await harness.SendAsync("plugin", new JsonObject { ["action"] = "catalog" });
+        Assert.Equal(ResultStatus.Ok, catalog.Status);
+        Assert.Equal("midi_remote_api_1_3_plugin_manager", catalog.Data!["source"]!.GetValue<string>());
+        Assert.Equal(2, catalog.Data["entries"]!.AsArray().Count);
+        Assert.Equal(7, catalog.Data["slot_object_id"]!.GetValue<long>());
+
+        var result = await harness.ConfirmAndCommitAsync("plugin", new JsonObject { ["action"] = "assign", ["target_scope"] = "selected", ["object_id"] = 7, ["plugin_uid"] = requested });
+        Assert.Equal(expected, result.Status);
+        Assert.Equal(1, harness.Driver.WriteCount("plugin.set"));
+        var verification = result.Data!["verification"]!;
+        Assert.Equal("slot_child_unique_name", verification["observation_source"]!.GetValue<string>());
+        Assert.Equal(hostLoads ?? "946051208E29496E804F64A825C8A047", verification["observed"]!["slot_plugin_uid"]!.GetValue<string>());
+        if (expected == ResultStatus.Error) Assert.Equal("PLUGIN_MISMATCH", result.Error!.Code);
+    }
+
+    [Fact]
+    public async Task WFL05_Api13Host_UidOutsideTheDriverCatalog_IsRefusedBeforeDispatch()
+    {
+        using var harness = new ControllerHarness();
+        harness.Driver.DriverPluginCatalog = [new JsonObject { ["uid"] = "946051208E29496E804F64A825C8A047", ["name"] = "StudioEQ" }];
+        var target = harness.Driver.AddChannel("Bus");
+        harness.Driver.Select(target);
+        var unknown = await harness.SendAsync("plugin", new JsonObject { ["action"] = "assign", ["target_scope"] = "selected", ["object_id"] = 7, ["plugin_uid"] = "00000000000000000000000000000000" });
+        Assert.Equal(ErrorCodes.InvalidArgument, unknown.Error!.Code);
+        Assert.Equal(0, harness.Driver.WriteCount("plugin.set"));
+    }
+
     [Fact]
     public async Task WFL05_SlotChangedAfterApproval_IsRefused()
     {
@@ -202,24 +255,47 @@ public sealed class G04WorkflowTests
         using var harness = new ControllerHarness();
         var directory = FixtureDirectory(harness);
         var good = Path.Combine(directory, "mix.wav");
+        var perform = harness.Catalog.Find("Audio Export", "Perform Audio Export")!.Id;
+        // The exporter writes only when "Perform Audio Export" arrives, under the name the dialog shows.
+        Func<byte[]>? render = () => Wav(2.0);
+        harness.Driver.Commands[perform] = (_, _) =>
+        {
+            if (render is not null) File.WriteAllBytes(Path.Combine(harness.Ui.ExportDirectory!, harness.Ui.ExportDialogName + ".wav"), render());
+            return true;
+        };
+
         harness.Ui.AvailableDialogs.Add(DialogKinds.ExportAudio);
-        harness.Ui.OnExport = (dir, name) => { File.WriteAllBytes(Path.Combine(dir, name + ".wav"), Wav(2.0)); return true; };
         var ok = await harness.SendAsync("project", new JsonObject { ["action"] = "export_audio", ["path"] = good, ["expected_duration_seconds"] = 2.0 });
         Assert.Equal(ResultStatus.Ok, ok.Status);
         Assert.Equal(48000, ok.Data!["wav"]!["sample_rate"]!.GetValue<int>());
+        // The dialog showed another name: it was typed, the dialog closed and reopened, and read back before exporting.
+        Assert.Equal(["export_read:acceptance", "export_name:mix", "export_read:mix"],
+            harness.Ui.Actions.Where(action => action.StartsWith("export_", StringComparison.Ordinal)).ToArray());
+        Assert.True(File.Exists(good));
 
         harness.Ui.AvailableDialogs.Add(DialogKinds.ExportAudio);
-        harness.Ui.OnExport = (dir, name) => { File.WriteAllBytes(Path.Combine(dir, name + ".wav"), Wav(2.0, bits: 16)); return true; };
+        render = () => Wav(2.0, bits: 16);
         var wrong = await harness.SendAsync("project", new JsonObject { ["action"] = "export_audio", ["path"] = Path.Combine(directory, "mix16.wav"), ["expected_duration_seconds"] = 2.0 });
         Assert.Equal(ResultStatus.Error, wrong.Status);
         Assert.Equal("EXPORT_FORMAT_MISMATCH", wrong.Error!.Code);
 
         harness.Ui.AvailableDialogs.Add(DialogKinds.ExportAudio);
-        harness.Ui.OnExport = (_, _) => true; // the exporter never writes a file
-        var startsBefore = harness.Ui.Actions.Count(action => action == "export_start");
+        render = null; // the exporter never writes a file
+        var performsBefore = harness.Driver.WriteCount("command.execute");
         var timeout = await harness.SendAsync("project", new JsonObject { ["action"] = "export_audio", ["path"] = Path.Combine(directory, "never.wav"), ["expected_duration_seconds"] = 1.0 });
         Assert.Equal(ResultStatus.Unverified, timeout.Status);
-        Assert.Equal(startsBefore + 1, harness.Ui.Actions.Count(action => action == "export_start"));
+        Assert.Equal(performsBefore + 3, harness.Driver.WriteCount("command.execute")); // open, reopen after naming, perform once; never again
+
+        // Settings that do not read back as the requested WAV start nothing and close the dialog.
+        harness.Ui.AvailableDialogs.Add(DialogKinds.ExportAudio);
+        harness.Ui.ExportFormatMatches = false;
+        render = () => Wav(2.0);
+        var beforeMismatch = harness.Driver.WriteCount("command.execute");
+        var mismatch = await harness.SendAsync("project", new JsonObject { ["action"] = "export_audio", ["path"] = Path.Combine(directory, "mismatch.wav"), ["expected_duration_seconds"] = 2.0 });
+        Assert.Equal("EXPORT_SETTINGS_MISMATCH", mismatch.Error!.Code);
+        Assert.Equal(ExecutionState.NotApplied, mismatch.ExecutionState);
+        Assert.Equal(beforeMismatch + 1, harness.Driver.WriteCount("command.execute")); // only the dialog was opened
+        Assert.False(File.Exists(Path.Combine(directory, "mismatch.wav")));
 
         Assert.True(WavFileValidator.Validate(Wav(2.0), 2.0).Valid);
         Assert.Equal("not_stereo", WavFileValidator.Validate(Wav(2.0, channels: 1), 2.0).Error);

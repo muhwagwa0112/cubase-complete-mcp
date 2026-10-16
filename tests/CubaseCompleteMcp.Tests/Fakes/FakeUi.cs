@@ -14,7 +14,6 @@ public sealed class FakeUi : IWorkflowUi
     public Func<string, string, bool>? OnSubmitPath { get; set; }
     public Func<string, bool>? OnFillAddTrack { get; set; }
     public Func<string, bool>? OnRenameText { get; set; }
-    public Func<string, string, bool>? OnExport { get; set; }
     public bool OverwritePromptOnSave { get; set; }
     public bool? LastPromptAnswer { get; private set; }
     public string MidiStageAfterCommand { get; set; } = "midi_file_dialog";
@@ -135,6 +134,15 @@ public sealed class FakeUi : IWorkflowUi
             : UiStageResult.Failure("add_track", "WORKFLOW_CONTROL_MISSING", "no name field"));
     }
 
+    public bool CubaseActivates { get; set; } = true;
+
+    public Task<UiStageResult> ActivateCubaseAsync(CancellationToken cancellationToken)
+    {
+        Actions.Add("activate_cubase");
+        return Task.FromResult(CubaseActivates ? UiStageResult.Success("activate")
+            : UiStageResult.Failure("activate", "FOREGROUND_NOT_CUBASE", "not foreground"));
+    }
+
     public Task<UiStageResult> TypeRenameTextAsync(string name, CancellationToken cancellationToken)
     {
         Actions.Add("rename_text");
@@ -142,11 +150,29 @@ public sealed class FakeUi : IWorkflowUi
             : UiStageResult.Failure("rename_text", "FOREGROUND_NOT_CUBASE", "not foreground"));
     }
 
-    public Task<UiStageResult> ConfigureAndStartExportAsync(UiDialogRef dialog, string directory, string fileName, CancellationToken cancellationToken)
+    /// <summary>File name the fake Export dialog currently shows; Cubase keeps a typed name only when the dialog closes.</summary>
+    public string ExportDialogName { get; set; } = "acceptance";
+    /// <summary>False models format, rate, depth or path that differ from the request.</summary>
+    public bool ExportFormatMatches { get; set; } = true;
+    public string? ExportDirectory { get; private set; }
+
+    public Task<UiStageResult> ReadExportSettingsAsync(UiDialogRef dialog, string directory, string fileName, CancellationToken cancellationToken)
     {
-        Actions.Add("export_start");
-        return Task.FromResult(OnExport?.Invoke(directory, fileName) != false ? UiStageResult.Success("export_started")
-            : UiStageResult.Failure("export_configure", "WORKFLOW_CONTROL_MISSING", "no fields"));
+        Actions.Add("export_read:" + ExportDialogName);
+        ExportDirectory = directory;
+        var nameMatches = ExportDialogName == fileName;
+        if (ExportFormatMatches && nameMatches) return Task.FromResult(UiStageResult.Success("export_read"));
+        return Task.FromResult(UiStageResult.Failure("export_read", "EXPORT_SETTINGS_MISMATCH", "settings differ",
+            new JsonObject { ["only_name_differs"] = ExportFormatMatches && !nameMatches }));
+    }
+
+    public Task<UiStageResult> CommitExportNameAsync(UiDialogRef dialog, string fileName, CancellationToken cancellationToken)
+    {
+        Actions.Add("export_name:" + fileName);
+        ExportDialogName = fileName;
+        _open.Remove(dialog.Id);
+        AvailableDialogs.Add(DialogKinds.ExportAudio); // the export command opens it again
+        return Task.FromResult(UiStageResult.Success("export_name"));
     }
 
     public string? PromptText { get; set; }

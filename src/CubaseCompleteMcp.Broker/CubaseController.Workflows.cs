@@ -150,6 +150,10 @@ public sealed partial class CubaseController
         WorkflowLog log, CancellationToken cancellationToken)
     {
         var command = RequireCommand("Edit", "Rename First Selected Track");
+        // The rename field opens in Cubase's own window and takes keys only while Cubase is in front.
+        var activated = await _ui.ActivateCubaseAsync(cancellationToken).ConfigureAwait(false);
+        log.Add(activated.Ok ? "cubase_activated" : "cubase_not_activated", activated.Evidence);
+        if (!activated.Ok) return activated;
         var reply = await _driver.SendAsync("command.execute", new JsonObject
         {
             ["id"] = command.Id, ["requires_target"] = true,
@@ -232,12 +236,47 @@ public sealed partial class CubaseController
 
         if (action == "export_audio")
         {
-            var configure = await _ui.ConfigureAndStartExportAsync(dialog, Path.GetDirectoryName(file.Path)!,
-                Path.GetFileNameWithoutExtension(file.Path), cancellationToken).ConfigureAwait(false);
-            log.Add(configure.Ok ? "export_started" : "export_configuration_failed", configure.Evidence);
+            var directory = Path.GetDirectoryName(file.Path)!;
+            var fileName = Path.GetFileNameWithoutExtension(file.Path);
+            var configure = await _ui.ReadExportSettingsAsync(dialog, directory, fileName, cancellationToken).ConfigureAwait(false);
+            if (!configure.Ok && configure.Evidence?["only_name_differs"]?.GetValue<bool>() == true)
+            {
+                // Cubase keeps a typed name only when the dialog closes, so the dialog is reopened and read again.
+                log.Add("export_name_differs", configure.Evidence);
+                var named = await _ui.CommitExportNameAsync(dialog, fileName, cancellationToken).ConfigureAwait(false);
+                log.Add(named.Ok ? "export_name_committed" : "export_name_failed", named.Evidence);
+                if (!named.Ok)
+                {
+                    if (_ui.IsDialogOpen(dialog)) await _ui.CancelDialogAsync(dialog, cancellationToken).ConfigureAwait(false);
+                    return WorkflowResult(context, ResultStatus.Error, ExecutionState.NotApplied, data, log, "command+ui",
+                        named.ErrorCode, named.Message + " No export was started.");
+                }
+                var reopened = await DispatchCommandOnceAsync(context, new JsonObject { ["id"] = context.Plan.Command!.Id }, log, cancellationToken).ConfigureAwait(false);
+                if (!reopened.Ok) return DriverFailure(context.Request, reopened);
+                dialog = await _ui.WaitForDialogAsync(DialogKinds.ExportAudio, _timings.DialogStage, cancellationToken).ConfigureAwait(false);
+                if (dialog is null)
+                    return WorkflowResult(context, ResultStatus.Error, ExecutionState.NotApplied, data, log, "command+ui", ErrorCodes.StageTimeout,
+                        "The export dialog did not reopen after the file name was set. No export was started.");
+                log.Add("dialog_found", new JsonObject { ["kind"] = dialog.Kind, ["title"] = dialog.Title });
+                configure = await _ui.ReadExportSettingsAsync(dialog, directory, fileName, cancellationToken).ConfigureAwait(false);
+            }
+            log.Add(configure.Ok ? "export_configured" : "export_configuration_failed", configure.Evidence);
             if (!configure.Ok)
+            {
+                var closed = _ui.IsDialogOpen(dialog) ? await _ui.CancelDialogAsync(dialog, cancellationToken).ConfigureAwait(false) : null;
+                if (closed is not null) log.Add(closed.Ok ? "export_dialog_cancelled" : "export_dialog_left_open", closed.Evidence);
                 return WorkflowResult(context, ResultStatus.Error, ExecutionState.NotApplied, data, log, "command+ui",
-                    configure.ErrorCode, configure.Message + " The export dialog was left open; no export was started.");
+                    configure.ErrorCode, configure.Message + " No export was started.");
+            }
+            // "Perform Audio Export" runs the export of the open dialog with the settings just read back.
+            var perform = await _driver.SendAsync("command.execute", new JsonObject { ["id"] = context.Plan.Targets["perform_command"]!.GetValue<string>() },
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            log.Add(perform.Ok ? "export_started" : "export_start_refused", new JsonObject { ["error"] = perform.Error?.Code });
+            if (!perform.Ok)
+            {
+                if (_ui.IsDialogOpen(dialog)) await _ui.CancelDialogAsync(dialog, cancellationToken).ConfigureAwait(false);
+                return DriverFailure(context.Request, perform);
+            }
             return await ObserveExportAsync(context, file, started, data, log, cancellationToken).ConfigureAwait(false);
         }
 
@@ -413,8 +452,9 @@ public sealed partial class CubaseController
         string? observedUid = null;
         var outcome = await PostconditionVerifier.ObserveAsync(async token =>
         {
-            observedUid = await _plugins.ObserveSlotPluginUidAsync(target, slotId, token).ConfigureAwait(false);
-            return new Observation(observedUid is not null && observedUid == uid, new JsonObject { ["slot_plugin_uid"] = observedUid }, "plugin_catalog_provider");
+            observedUid = await ObserveSlotPluginUidAsync(target, slotId, token).ConfigureAwait(false);
+            return new Observation(observedUid is not null && NormalizePluginUid(observedUid) == NormalizePluginUid(uid),
+                new JsonObject { ["slot_plugin_uid"] = observedUid }, DriverListsPlugins ? "slot_child_unique_name" : "plugin_catalog_provider");
         }, _timings.TrackAndPlugin, cancellationToken).ConfigureAwait(false);
         data["verification"] = outcome.ToJson(uid, "exact plug-in UID");
         if (outcome.Verified)

@@ -319,12 +319,24 @@ public sealed class FakeDriver : ICubaseDriver
                 var directTarget = args["target"] is { } dt ? Resolve(dt) : Channels.First(item => item.UniqueId == SelectedUniqueId);
                 var directName = ParameterName(args);
                 return new JsonObject { ["target"] = Identity(directTarget), ["read"] = new JsonObject { ["process_value"] = directTarget.Parameters.GetValueOrDefault(directName) }, ["fresh"] = true };
+            case "plugin.get" when args["action"]?.GetValue<string>() == "catalog":
+                if (DriverPluginCatalog is null) return new JsonObject { ["available"] = false, ["reason"] = ErrorCodes.PluginCatalogUnavailable, ["entries"] = new JsonArray() };
+                var offset = args["offset"]?.GetValue<int>() ?? 0;
+                var limit = args["limit"]?.GetValue<int>() ?? 100;
+                return new JsonObject
+                {
+                    ["available"] = true, ["total"] = DriverPluginCatalog.Count, ["offset"] = offset, ["slot_object_id"] = args["object_id"]?.DeepClone() ?? 7,
+                    ["entries"] = new JsonArray(DriverPluginCatalog.Skip(offset).Take(limit).Select(entry => (JsonNode?)entry.DeepClone()).ToArray())
+                };
             case "plugin.get":
-                return new JsonObject { ["slot"] = new JsonObject { ["object_id"] = args["object_id"]?.DeepClone(), ["unique_id"] = SlotUid, ["title"] = SlotTitle } };
+                return new JsonObject { ["slot"] = new JsonObject { ["object_id"] = args["object_id"]?.DeepClone(), ["unique_id"] = SlotUid, ["title"] = SlotTitle,
+                    ["loaded"] = SlotLoadedUid is null ? null : new JsonObject { ["plugin_uid"] = SlotLoadedUid, ["unique_name"] = SlotLoadedUid + "-1" } } };
             case "plugin.set":
                 if (args["expected_slot_unique_id"]?.GetValue<string>() is { } expectedSlot && expectedSlot != SlotUid)
                     throw new FakeHostError(ErrorCodes.TargetChanged, "slot changed");
                 SlotTitle = "Assigned";
+                if (AssignAccepted && DriverPluginCatalog is not null)
+                    SlotLoadedUid = LoadedUidOverride ?? new string(args["plugin_uid"]!.GetValue<string>().Where(Uri.IsHexDigit).ToArray()).ToUpperInvariant();
                 return Receipt("assign", true, new JsonObject { ["accepted"] = AssignAccepted });
             case "command.execute":
                 if (args["expected_selected"] is { } guard) AssertSelected(guard);
@@ -343,11 +355,18 @@ public sealed class FakeDriver : ICubaseDriver
     public string SlotUid { get; set; } = "slot-empty";
     public string SlotTitle { get; set; } = "Empty";
     public bool AssignAccepted { get; set; } = true;
+    /// <summary>API 1.3 plug-in catalog served by the driver itself; null models a host without it.</summary>
+    public List<JsonObject>? DriverPluginCatalog { get; set; }
+    /// <summary>Class UID named by the slot's child object (null: empty slot).</summary>
+    public string? SlotLoadedUid { get; set; }
+    /// <summary>When set, the host loads this UID instead of the requested one.</summary>
+    public string? LoadedUidOverride { get; set; }
 
     public Task<bool> TryHandshakeAsync(TimeSpan timeout, CancellationToken cancellationToken = default) => Task.FromResult(!Offline);
     public long Revision => _revision;
     public JsonObject EventState => State;
-    public DriverHelloInfo? Hello => new(ContractVersion, "fake-build", "15.0.20", new JsonObject { ["api_1_3_plugin_manager"] = false }, SessionId, Epoch);
+    public DriverHelloInfo? Hello => new(ContractVersion, "fake-build", "15.0.20",
+        new JsonObject { ["api_1_3_plugin_manager"] = DriverPluginCatalog is not null, ["plugin_catalog"] = DriverPluginCatalog is not null }, SessionId, Epoch);
     public LoopMidiRuntimeSnapshot? LoopMidiSnapshot => null;
     public long StaleFramesDiscarded => 0;
     public string? LastTransportError => null;

@@ -410,8 +410,12 @@ public sealed partial class CubaseUiAutomation(CubaseProcessInspector processIns
 
     private AutomationElement? FindFileDialog(CubaseWindowTarget target)
     {
+        // Windows file dialogs are native top-level #32770 windows. Plug-in editors that Cubase opens after loading a
+        // plug-in (SteinbergWindowClass, e.g. "01 - <channel>") can host #32770 child panes with an edit field and buttons;
+        // their top-level root is not a dialog, so they are not file dialogs.
         var candidates = FindProcessWindowCandidates(target, CubaseDialogStage.FileDialog, [],
-            window => FindFileNameEdit(window) is not null && FindAcceptButton(window) is not null);
+            window => ClassName(GetAncestor(new IntPtr(window.Current.NativeWindowHandle), 2 /* GA_ROOT */)) == "#32770"
+                && FindFileNameEdit(window) is not null && FindAcceptButton(window) is not null);
         return candidates.Count == 0 ? null : candidates[^1];
     }
 
@@ -984,7 +988,7 @@ public sealed partial class CubaseUiAutomation(CubaseProcessInspector processIns
     private static bool IsUnavailableElement(Exception exception) => exception is ElementNotAvailableException
         or InvalidOperationException or COMException;
 
-    private static async Task<JsonArray> RecognizeTextAsync(string path)
+    private static async Task<JsonArray> RecognizeTextAsync(string path, double scale = 1)
     {
         var output = new JsonArray();
         var engine = OcrEngine.TryCreateFromUserProfileLanguages();
@@ -994,7 +998,14 @@ public sealed partial class CubaseUiAutomation(CubaseProcessInspector processIns
             var file = await StorageFile.GetFileFromPathAsync(path);
             using var stream = await file.OpenReadAsync();
             var decoder = await BitmapDecoder.CreateAsync(stream);
-            using var bitmap = await decoder.GetSoftwareBitmapAsync(BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied);
+            // Small UI text is recognized far better when upscaled; word boxes are reported in window pixels.
+            var transform = new BitmapTransform
+            {
+                ScaledWidth = (uint)Math.Round(decoder.PixelWidth * scale), ScaledHeight = (uint)Math.Round(decoder.PixelHeight * scale),
+                InterpolationMode = BitmapInterpolationMode.Fant
+            };
+            using var bitmap = await decoder.GetSoftwareBitmapAsync(BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied, transform,
+                ExifOrientationMode.IgnoreExifOrientation, ColorManagementMode.DoNotColorManage);
             var result = await engine.RecognizeAsync(bitmap);
             foreach (var line in result.Lines)
             {
@@ -1005,10 +1016,10 @@ public sealed partial class CubaseUiAutomation(CubaseProcessInspector processIns
                     words.Add(new JsonObject
                     {
                         ["text"] = word.Text,
-                        ["x"] = box.X,
-                        ["y"] = box.Y,
-                        ["width"] = box.Width,
-                        ["height"] = box.Height
+                        ["x"] = box.X / scale,
+                        ["y"] = box.Y / scale,
+                        ["width"] = box.Width / scale,
+                        ["height"] = box.Height / scale
                     });
                 }
                 output.Add(new JsonObject { ["text"] = line.Text, ["words"] = words });
